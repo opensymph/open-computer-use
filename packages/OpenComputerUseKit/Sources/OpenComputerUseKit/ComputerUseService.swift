@@ -221,6 +221,24 @@ func screenshotPixelToWindowPoint(
     )
 }
 
+// mouseButtonKindForToolArgument resolves the official MouseButton aliases
+// (left/right/middle plus the l/r/m short names) and rejects anything else —
+// an unknown value must be a visible argument error, not a silent left click.
+func mouseButtonKindForToolArgument(_ value: String) throws -> MouseButtonKind {
+    switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "left", "l":
+        return .left
+    case "right", "r":
+        return .right
+    case "middle", "m":
+        return .middle
+    default:
+        throw ComputerUseError.invalidArguments(
+            "Invalid mouse_button '\(value)'. Expected one of: left, right, middle, l, r, m"
+        )
+    }
+}
+
 let nonSettableSetValueErrorMessage = "Cannot set a value for an element that is not settable"
 
 func setValueAttributeIsSettable(result: AXError, settable: Bool, attribute: String) throws -> Bool {
@@ -414,6 +432,11 @@ func shouldPreferContainingWebRowAXClickCandidate(
 
 public final class ComputerUseService {
     private var snapshotsByApp: [String: AppSnapshot] = [:]
+    // Insertion order of the cache keys above, for FIFO eviction.
+    private var snapshotCacheOrder: [String] = []
+    // Cached snapshots exist for element_index resolution only; the base64
+    // screenshot is stripped (see refreshSnapshot) and the cache is bounded.
+    private static let maxCachedSnapshots = 8
 
     public init() {}
 
@@ -454,7 +477,7 @@ public final class ComputerUseService {
         )
 
         let snapshot = try currentSnapshot(for: query)
-        let button = MouseButtonKind(rawValue: mouseButton.lowercased()) ?? .left
+        let button = try mouseButtonKindForToolArgument(mouseButton)
         if snapshot.mode == .fixture {
             guard clickMethod == .auto else {
                 throw ComputerUseError.message(
@@ -817,11 +840,40 @@ public final class ComputerUseService {
             (app.bundleIdentifier ?? "").lowercased(),
         ].filter { !$0.isEmpty })
 
+        let cached = cacheableSnapshot(snapshot)
         for key in keys {
-            snapshotsByApp[key] = snapshot
+            if snapshotsByApp[key] == nil {
+                snapshotCacheOrder.append(key)
+            }
+            snapshotsByApp[key] = cached
+        }
+        while snapshotCacheOrder.count > Self.maxCachedSnapshots {
+            let oldest = snapshotCacheOrder.removeFirst()
+            snapshotsByApp.removeValue(forKey: oldest)
         }
 
         return snapshot
+    }
+
+    /// Cache copy of a snapshot: elements and window bounds survive for
+    /// element_index resolution, the full-size PNG does not (one base64
+    /// screenshot per observed app would otherwise stay resident for the
+    /// lifetime of the service).
+    private func cacheableSnapshot(_ snapshot: AppSnapshot) -> AppSnapshot {
+        AppSnapshot(
+            app: snapshot.app,
+            windowTitle: snapshot.windowTitle,
+            windowBounds: snapshot.windowBounds,
+            targetWindowID: snapshot.targetWindowID,
+            targetWindowLayer: snapshot.targetWindowLayer,
+            screenshotPNGData: nil,
+            mode: snapshot.mode,
+            treeLines: snapshot.treeLines,
+            focusedSummary: snapshot.focusedSummary,
+            focusedElement: snapshot.focusedElement,
+            selectedText: snapshot.selectedText,
+            elements: snapshot.elements
+        )
     }
 
     private func lookupElement(snapshot: AppSnapshot, index: String) throws -> ElementRecord {
@@ -1128,7 +1180,12 @@ public final class ComputerUseService {
 
     private func hitTestElement(at point: CGPoint, in snapshot: AppSnapshot) throws -> ElementRecord? {
         let appElement = AXUIElementCreateApplication(snapshot.app.pid)
-        let globalPoint = try screenshotToGlobalPoint(snapshot: snapshot, x: Double(point.x), y: Double(point.y))
+        // `point` is already window-relative (callers convert screenshot
+        // pixels or element frames before calling); only the window origin
+        // is added here. Re-running the screenshot→window conversion would
+        // divide by the pixel scale a second time and hit-test the wrong
+        // spot on Retina displays.
+        let globalPoint = try windowPointToGlobalPoint(snapshot: snapshot, point: point)
         var hitElement: AXUIElement?
         let result = AXUIElementCopyElementAtPosition(appElement, Float(globalPoint.x), Float(globalPoint.y), &hitElement)
         guard result == .success, let hitElement else {
@@ -1544,7 +1601,10 @@ public final class ComputerUseService {
             return nil
         }
 
-        return (value as! AXUIElement)
+        // The attribute payload comes from the target app; a success HRESULT
+        // does not guarantee the advertised CF type, so a forced cast here
+        // would trap on malformed providers.
+        return value as? AXUIElement
     }
 
     private func stringValue(of element: AXUIElement, attribute: String) -> String? {
@@ -1572,8 +1632,14 @@ public final class ComputerUseService {
             return nil
         }
 
-        let positionAXValue = positionValue as! AXValue
-        let sizeAXValue = sizeValue as! AXValue
+        // Position/size payloads come from the target app; guard the CF type
+        // instead of force-casting (a malformed provider would trap here and
+        // take the whole server down).
+        guard let positionAXValue = positionValue as? AXValue,
+              let sizeAXValue = sizeValue as? AXValue
+        else {
+            return nil
+        }
         var position = CGPoint.zero
         var size = CGSize.zero
         guard AXValueGetValue(positionAXValue, .cgPoint, &position), AXValueGetValue(sizeAXValue, .cgSize, &size) else {

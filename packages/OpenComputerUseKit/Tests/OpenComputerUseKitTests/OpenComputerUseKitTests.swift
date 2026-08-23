@@ -2233,6 +2233,70 @@ final class OpenComputerUseKitTests: XCTestCase {
         return try makeTestImage(width: width, height: height, pixels: pixels)
     }
 
+    // --- review-fix regression tests --------------------------------------
+
+    // Pins the M1 fix chain: screenshot pixels -> window point -> global hit
+    // point must divide by the pixel scale exactly once. A Retina screenshot
+    // is 2x the window's point size; dividing twice would hit-test at a
+    // quarter of the intended offset.
+    func testScreenshotPixelToWindowPointAppliesScaleExactlyOnce() {
+        let pixelSize = CGSize(width: 2000, height: 1000) // 2x Retina capture
+        let windowBounds = CGRect(x: 100, y: 50, width: 1000, height: 500)
+
+        let windowPoint = screenshotPixelToWindowPoint(
+            CGPoint(x: 1000, y: 500),
+            screenshotPixelSize: pixelSize,
+            windowBounds: windowBounds
+        )
+        XCTAssertEqual(windowPoint.x, 500, accuracy: 0.001)
+        XCTAssertEqual(windowPoint.y, 250, accuracy: 0.001)
+
+        // The hit-test global point is the window origin plus the window
+        // point — nothing else. (hitTestElement previously re-ran this
+        // conversion on the already-scaled point.)
+        let globalX = windowBounds.minX + windowPoint.x
+        let globalY = windowBounds.minY + windowPoint.y
+        XCTAssertEqual(globalX, 600, accuracy: 0.001)
+        XCTAssertEqual(globalY, 300, accuracy: 0.001)
+
+        // Degenerate metadata falls back to identity scaling.
+        let identity = screenshotPixelToWindowPoint(
+            CGPoint(x: 123, y: 45),
+            screenshotPixelSize: nil,
+            windowBounds: windowBounds
+        )
+        XCTAssertEqual(identity, CGPoint(x: 123, y: 45))
+
+        XCTAssertEqual(screenshotPixelScale(screenshotPixelSize: nil, windowBounds: nil), CGSize(width: 1, height: 1))
+    }
+
+    // Pins the P1#3 fix: mouse_button values resolve to real buttons or fail
+    // loudly instead of silently clicking the left button.
+    func testMouseButtonArgumentAliasesAndRejection() throws {
+        XCTAssertEqual(try mouseButtonKindForToolArgument("left"), .left)
+        XCTAssertEqual(try mouseButtonKindForToolArgument("L"), .left)
+        XCTAssertEqual(try mouseButtonKindForToolArgument(" r "), .right)
+        XCTAssertEqual(try mouseButtonKindForToolArgument("m"), .middle)
+
+        for bad in ["", "side", "lef", "0"] {
+            XCTAssertThrowsError(try mouseButtonKindForToolArgument(bad), "expected error for \(bad)")
+        }
+    }
+
+    // Pins the P1#2 fix: absurd click_count/pages are clamped at the service
+    // layer instead of looping input injection unboundedly.
+    func testClickCountAndPagesAreClamped() {
+        XCTAssertEqual(clampedClickCount(nil), 1)
+        XCTAssertEqual(clampedClickCount(0), 1)
+        XCTAssertEqual(clampedClickCount(-5), 1)
+        XCTAssertEqual(clampedClickCount(3), 3)
+        XCTAssertEqual(clampedClickCount(100), 100)
+        XCTAssertEqual(clampedClickCount(1e9), maxToolClickCount)
+        XCTAssertEqual(clampedScrollPages(0.5), 0.5, accuracy: 0.0001)
+        XCTAssertEqual(clampedScrollPages(1001), maxToolScrollPages, accuracy: 0.0001)
+        XCTAssertEqual(clampedScrollPages(1e9), maxToolScrollPages, accuracy: 0.0001)
+    }
+
     private func makeTestImage(width: Int, height: Int, pixels: [UInt8]) throws -> CGImage {
         let data = Data(pixels)
         let provider = try XCTUnwrap(CGDataProvider(data: data as CFData))

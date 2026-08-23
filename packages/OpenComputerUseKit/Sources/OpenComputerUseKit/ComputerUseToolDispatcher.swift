@@ -36,6 +36,20 @@ private func normalizedElementIndexNumber(_ value: Double) -> String? {
     return String(Int(value))
 }
 
+// Service-layer safety ceilings: clamp absurd click_count/pages instead of
+// looping input injection or scrolling for effectively unbounded time.
+let maxToolClickCount = 100
+let maxToolScrollPages = 1000.0
+
+func clampedClickCount(_ rawValue: Double?) -> Int {
+    let value = Int(rawValue ?? 1)
+    return min(max(value, 1), maxToolClickCount)
+}
+
+func clampedScrollPages(_ value: Double) -> Double {
+    min(value, maxToolScrollPages)
+}
+
 public final class ComputerUseToolDispatcher {
     private let service: ComputerUseService
 
@@ -78,7 +92,7 @@ public final class ComputerUseToolDispatcher {
                 elementIndex: optionalElementIndex(in: arguments),
                 x: optionalDouble("x", in: arguments),
                 y: optionalDouble("y", in: arguments),
-                clickCount: Int(optionalDouble("click_count", in: arguments) ?? 1),
+                clickCount: clampedClickCount(optionalDouble("click_count", in: arguments)),
                 mouseButton: optionalString("mouse_button", in: arguments) ?? "left",
                 clickMethod: try parseClickMethod(optionalString("click_method", in: arguments))
             )
@@ -99,7 +113,7 @@ public final class ComputerUseToolDispatcher {
                 app: requireString("app", in: arguments),
                 direction: requireString("direction", in: arguments),
                 elementIndex: requireElementIndex(in: arguments),
-                pages: optionalDouble("pages", in: arguments) ?? 1
+                pages: clampedScrollPages(optionalDouble("pages", in: arguments) ?? 1)
             )
         case "drag":
             if hasWindow2Arguments(arguments) {

@@ -326,7 +326,9 @@ enum InputSimulation {
             return nil
         }
 
-        return (value as! AXUIElement)
+        // Untrusted payload from the target app: cast conditionally so a
+        // malformed provider cannot trap the process.
+        return value as? AXUIElement
     }
 
     private static func copyArray(_ element: AXUIElement, attribute: String) -> [AXUIElement]? {

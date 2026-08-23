@@ -269,7 +269,21 @@ private final class AppAgentSocketListener: @unchecked Sendable {
 
     func stop() {
         running = false
+        // Capture the bound socket's identity before closing: a replacement
+        // agent may already have re-bound the same path, and unlinking it
+        // would orphan the new agent's listener.
+        var bound = stat()
+        let haveBound = fstat(socketFD, &bound) == 0
+        // close(2) alone does not wake a thread blocked in accept(2).
+        shutdown(socketFD, SHUT_RDWR)
         close(socketFD)
+        guard haveBound else { return }
+        var current = stat()
+        guard lstat(path, &current) == 0,
+              current.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK),
+              current.st_dev == bound.st_dev,
+              current.st_ino == bound.st_ino
+        else { return } // path no longer belongs to this listener
         unlink(path)
     }
 
@@ -283,11 +297,23 @@ private final class AppAgentSocketListener: @unchecked Sendable {
                 continue
             }
 
+            applyConnectionSocketOptions(clientFD)
             Thread.detachNewThread {
                 AppAgentConnection(fileDescriptor: clientFD).run()
             }
         }
     }
+}
+
+// Socket hygiene shared by the agent listener's accepted connections and the
+// proxy's client sockets: writes must fail with EPIPE instead of raising
+// SIGPIPE (the default disposition terminates the process), and reads must
+// time out instead of hanging forever on a dead peer.
+private func applyConnectionSocketOptions(_ fd: Int32) {
+    var noSigPipe: Int32 = 1
+    _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+    var receiveTimeout = timeval(tv_sec: 300, tv_usec: 0)
+    _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout, socklen_t(MemoryLayout<timeval>.size))
 }
 
 private final class AppAgentConnection: @unchecked Sendable {
@@ -462,6 +488,17 @@ private final class AppAgentSocketClient: @unchecked Sendable {
         guard fd >= 0 else {
             return nil
         }
+
+        // Writes to a peer that closed its end must fail with EPIPE instead
+        // of raising SIGPIPE (which terminates the process by default), and
+        // request/response round-trips must time out instead of hanging
+        // forever on a wedged agent.
+        var noSigPipe: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        var receiveTimeout = timeval(tv_sec: 120, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout, socklen_t(MemoryLayout<timeval>.size))
+        var sendTimeout = timeval(tv_sec: 30, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)

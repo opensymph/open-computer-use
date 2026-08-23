@@ -1036,7 +1036,9 @@ private func copyElement(_ element: AXUIElement, attribute: String) -> AXUIEleme
         return nil
     }
 
-    return (value as! AXUIElement)
+    // The payload comes from the target app; a success error code does not
+    // guarantee the advertised CF type, so cast conditionally.
+    return value as? AXUIElement
 }
 
 private func copyArray(_ element: AXUIElement, attribute: String) -> [AXUIElement]? {
@@ -1413,8 +1415,13 @@ private func resolveLocalFrame(of element: AXUIElement, windowBounds: CGRect?) -
         return nil
     }
 
-    let positionAXValue = positionValue as! AXValue
-    let sizeAXValue = sizeValue as! AXValue
+    // Position/size payloads come from the target app; guard the CF type
+    // instead of force-casting (a malformed provider would trap the process).
+    guard let positionAXValue = positionValue as? AXValue,
+          let sizeAXValue = sizeValue as? AXValue
+    else {
+        return nil
+    }
     var position = CGPoint.zero
     var size = CGSize.zero
     guard AXValueGetValue(positionAXValue, .cgPoint, &position), AXValueGetValue(sizeAXValue, .cgSize, &size) else {
