@@ -1,0 +1,33 @@
+name: docs-check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - "**/*.md"
+      - "scripts/check-docs.sh"
+      - ".markdownlint.json"
+
+permissions:
+  contents: read
+
+jobs:
+  docs-check:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "24"
+
+      - name: Check docs skeleton
+        run: ./scripts/check-docs.sh
+
+      - name: Lint markdown
+        run: npx --yes markdownlint-cli "README.md" "README.zh-CN.md" "docs/**/*.md"

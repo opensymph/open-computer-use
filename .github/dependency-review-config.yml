@@ -1,0 +1,13 @@
+# Configuration for actions/dependency-review-action
+# https://github.com/actions/dependency-review-action#configuration-options
+allow-licenses:
+  - MIT
+  - Apache-2.0
+  - BSD-2-Clause
+  - BSD-3-Clause
+  - ISC
+  - MPL-2.0
+deny-licenses: []
+allow-dependencies-licenses: []
+deny-dependencies-licenses: []
+fail-on-scopes: ""

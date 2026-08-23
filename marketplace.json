@@ -1,0 +1,27 @@
+{
+  "name": "open-computer-use",
+  "description": "open-computer-use: open-source Computer Use MCP server and agent skill for macOS, Linux, and Windows.",
+  "plugins": [
+    {
+      "name": "open-computer-use",
+      "version": "1.0.2",
+      "description": "Open-source Computer Use MCP server and skill: control desktop apps on macOS, Linux, and Windows from AI agents via accessibility-first automation.",
+      "source": "./plugins/open-computer-use",
+      "author": {
+        "name": "Leo",
+        "url": "https://github.com/opensymph"
+      },
+      "category": "developer-tools",
+      "displayName": "Open Computer Use",
+      "displayName_i18n": {
+        "zh-CN": "Open Computer Use"
+      },
+      "icon": "./assets/logo/open-computer-use-256.png",
+      "examplePrompts": [
+        "Inspect the current UI state of this desktop app without stealing focus",
+        "Open a new document with keyboard shortcuts, then type content into it",
+        "Check why open-computer-use cannot control this app and fix the setup"
+      ]
+    }
+  ]
+}

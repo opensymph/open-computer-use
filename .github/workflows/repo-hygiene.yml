@@ -1,0 +1,24 @@
+name: repo-hygiene
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  repo-hygiene:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Check repo hygiene
+        run: ./scripts/check-repo-hygiene.sh
+
+      - name: Check action pinning
+        run: ./scripts/check-action-pinning.sh
