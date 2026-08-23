@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest an idea for open-computer-use
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the task or workflow that is hard today.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like to happen?
+      description: Describe the behavior or capability you want.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What alternatives have you considered?
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform (if platform-specific)
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - Not platform-specific
