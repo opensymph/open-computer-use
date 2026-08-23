@@ -87,7 +87,8 @@ const (
 	mouseeventfMiddleUp   = 0x0040
 	mouseeventfWheel      = 0x0800
 	mouseeventfHWheel     = 0x1000
-	mouseeventfAbsolute   = 0x8000
+	mouseeventfVirtualDesk = 0x4000
+	mouseeventfAbsolute    = 0x8000
 	keyeventfKeyUp        = 0x0002
 	keyeventfUnicode      = 0x0004
 	keyeventfScancode     = 0x0008
@@ -96,6 +97,12 @@ const (
 	pwRenderFullContent   = 2
 	biRGB                 = 0
 	dibRGBColors          = 0
+
+	// GetSystemMetrics virtual-desktop indices (winuser.h).
+	smXVirtualScreen  = 76
+	smYVirtualScreen  = 77
+	smCXVirtualScreen = 78
+	smCYVirtualScreen = 79
 )
 
 type tagINPUT struct {
@@ -121,21 +128,34 @@ type keybdInput struct {
 	dwExtraInfo uintptr
 }
 
-func sendInputs(inputs []tagINPUT) {
+// sendInputs injects one batch and verifies every event landed: SendInput
+// returns the count of events actually inserted (0 when blocked by UIPI or
+// another thread), so a short count must surface as an error instead of a
+// silently dropped keystroke.
+func sendInputs(inputs []tagINPUT) error {
 	if len(inputs) == 0 {
-		return
+		return nil
 	}
-	procSendInput.Call(uintptr(len(inputs)), uintptr(unsafe.Pointer(&inputs[0])), unsafe.Sizeof(tagINPUT{}))
+	injected, _, _ := procSendInput.Call(uintptr(len(inputs)), uintptr(unsafe.Pointer(&inputs[0])), unsafe.Sizeof(tagINPUT{}))
+	if injected != uintptr(len(inputs)) {
+		return fmt.Errorf("SendInput injected %d of %d events", injected, len(inputs))
+	}
+	return nil
 }
 
 func mouseEvent(flags uint32, dx, dy int32, data uint32) tagINPUT {
 	return tagINPUT{inputType: inputMouse, mi: mouseInput{dx: dx, dy: dy, mouseData: data, dwFlags: flags}}
 }
 
+// keyEvent packs a KEYBDINPUT through the MOUSEINPUT-shaped union member.
+// In the x64 INPUT union ki.wVk/ki.wScan overlay mi.dx (offsets 0/2) and
+// ki.dwFlags overlays mi.dy (offset 4); anything placed in mi.dwFlags lands
+// in KEYBDINPUT padding and is lost.
 func keyEvent(vk, scan uint16, flags uint32) tagINPUT {
-	// keybdInput overlays mouseInput from the same offset; wVk/wScan occupy
-	// the dx/dy slots.
-	return tagINPUT{inputType: inputKeyboard, mi: mouseInput{dx: int32(vk), dy: int32(scan), dwFlags: flags}}
+	return tagINPUT{inputType: inputKeyboard, mi: mouseInput{
+		dx: int32(vk) | int32(scan)<<16,
+		dy: int32(flags),
+	}}
 }
 
 // mapVirtualKey wraps MapVirtualKeyW(vk, MAPVK_VK_TO_VSC).
@@ -149,24 +169,38 @@ func systemMetrics(index int) int {
 	return int(ret)
 }
 
-// normalizeScreen maps a screen coordinate onto the 0..65535 virtual-desktop
-// range used by MOUSEEVENTF_ABSOLUTE (OCUInput.Normalize).
-func normalizeScreen(value, screenExtent int) int32 {
-	return int32((float64(value) * 65535.0) / float64(screenExtent))
+// normalizeVirtualScreen maps a screen coordinate onto the 0..65535 range of
+// the entire virtual desktop, as MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_VIRTUALDESK
+// expects (OCUInput.Normalize widened to multi-monitor: the virtual-screen
+// origin can be negative for monitors placed left of/above the primary).
+func normalizeVirtualScreen(value, origin, extent int) int32 {
+	if extent <= 0 {
+		return 0
+	}
+	return int32((float64(value-origin) * 65535.0) / float64(extent))
+}
+
+// virtualScreenNormalizedPoint normalizes a screen point against the virtual
+// desktop (origin + extent from GetSystemMetrics).
+func virtualScreenNormalizedPoint(x, y int) (int32, int32) {
+	return normalizeVirtualScreen(x, systemMetrics(smXVirtualScreen), systemMetrics(smCXVirtualScreen)),
+		normalizeVirtualScreen(y, systemMetrics(smYVirtualScreen), systemMetrics(smCYVirtualScreen))
 }
 
 // --- Foreground (SendInput) input layer, byte-for-byte with OCUInput -------
 
 // realMouseMove moves the real pointer to absolute screen coordinates.
-func realMouseMove(x, y int) {
-	input := mouseEvent(mouseeventfMove|mouseeventfAbsolute,
-		normalizeScreen(x, systemMetrics(0)), normalizeScreen(y, systemMetrics(1)), 0)
-	sendInputs([]tagINPUT{input})
+func realMouseMove(x, y int) error {
+	nx, ny := virtualScreenNormalizedPoint(x, y)
+	if err := sendInputs([]tagINPUT{mouseEvent(mouseeventfMove|mouseeventfAbsolute|mouseeventfVirtualDesk, nx, ny, 0)}); err != nil {
+		return err
+	}
 	sleepMs(20)
+	return nil
 }
 
 // realMouseClick presses the physical mouse button count times.
-func realMouseClick(button string, count int) {
+func realMouseClick(button string, count int) error {
 	var down, up uint32 = mouseeventfLeftDown, mouseeventfLeftUp
 	switch button {
 	case "right":
@@ -179,66 +213,93 @@ func realMouseClick(button string, count int) {
 		repeat = 1
 	}
 	for i := 0; i < repeat; i++ {
-		sendInputs([]tagINPUT{mouseEvent(down, 0, 0, 0)})
+		if err := sendInputs([]tagINPUT{mouseEvent(down, 0, 0, 0)}); err != nil {
+			return err
+		}
 		sleepMs(35)
-		sendInputs([]tagINPUT{mouseEvent(up, 0, 0, 0)})
+		if err := sendInputs([]tagINPUT{mouseEvent(up, 0, 0, 0)}); err != nil {
+			return err
+		}
 		sleepMs(60)
 	}
+	return nil
 }
 
 // realMouseDrag drags the physical pointer across 12 interpolated steps.
-func realMouseDrag(fromX, fromY, toX, toY int) {
-	realMouseMove(fromX, fromY)
-	sendInputs([]tagINPUT{mouseEvent(mouseeventfLeftDown, 0, 0, 0)})
+func realMouseDrag(fromX, fromY, toX, toY int) error {
+	if err := realMouseMove(fromX, fromY); err != nil {
+		return err
+	}
+	if err := sendInputs([]tagINPUT{mouseEvent(mouseeventfLeftDown, 0, 0, 0)}); err != nil {
+		return err
+	}
 	sleepMs(30)
 	const steps = 12
 	for i := 1; i <= steps; i++ {
 		x := fromX + int(mathRound(float64(toX-fromX)*(float64(i)/float64(steps))))
 		y := fromY + int(mathRound(float64(toY-fromY)*(float64(i)/float64(steps))))
-		input := mouseEvent(mouseeventfMove|mouseeventfAbsolute,
-			normalizeScreen(x, systemMetrics(0)), normalizeScreen(y, systemMetrics(1)), 0)
-		sendInputs([]tagINPUT{input})
+		nx, ny := virtualScreenNormalizedPoint(x, y)
+		if err := sendInputs([]tagINPUT{mouseEvent(mouseeventfMove|mouseeventfAbsolute|mouseeventfVirtualDesk, nx, ny, 0)}); err != nil {
+			return err
+		}
 		sleepMs(20)
 	}
-	sendInputs([]tagINPUT{mouseEvent(mouseeventfLeftUp, 0, 0, 0)})
+	return sendInputs([]tagINPUT{mouseEvent(mouseeventfLeftUp, 0, 0, 0)})
 }
 
 // realWheel scrolls the physical wheel: dy positive scrolls up (WHEEL_DELTA
 // units), dx positive scrolls right.
-func realWheel(dy, dx int) {
+func realWheel(dy, dx int) error {
 	if dy != 0 {
-		sendInputs([]tagINPUT{mouseEvent(mouseeventfWheel, 0, 0, uint32(int32(dy)))})
+		if err := sendInputs([]tagINPUT{mouseEvent(mouseeventfWheel, 0, 0, uint32(int32(dy)))}); err != nil {
+			return err
+		}
 	}
 	if dx != 0 {
-		sendInputs([]tagINPUT{mouseEvent(mouseeventfHWheel, 0, 0, uint32(int32(dx)))})
+		if err := sendInputs([]tagINPUT{mouseEvent(mouseeventfHWheel, 0, 0, uint32(int32(dx)))}); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // realKeyChord presses a chord via virtual keys + mapped scan codes: all keys
 // down, then everything up in reverse order.
-func realKeyChord(modifierVks []uint16, vk uint16) {
+func realKeyChord(modifierVks []uint16, vk uint16) error {
+	chord := make([]struct{ vk, scan uint16 }, 0, len(modifierVks)+1)
 	downs := make([]tagINPUT, 0, len(modifierVks)+1)
 	for _, modifier := range modifierVks {
+		chord = append(chord, struct{ vk, scan uint16 }{modifier, mapVirtualKey(modifier)})
 		downs = append(downs, keyEvent(modifier, mapVirtualKey(modifier), keyeventfScancode))
 	}
+	chord = append(chord, struct{ vk, scan uint16 }{vk, mapVirtualKey(vk)})
 	downs = append(downs, keyEvent(vk, mapVirtualKey(vk), keyeventfScancode))
-	sendInputs(downs)
-	sleepMs(40)
-	for j := len(downs) - 1; j >= 0; j-- {
-		down := downs[j]
-		sendInputs([]tagINPUT{keyEvent(uint16(down.mi.dx), uint16(down.mi.dy), keyeventfScancode|keyeventfKeyUp)})
+	if err := sendInputs(downs); err != nil {
+		return err
 	}
+	sleepMs(40)
+	for j := len(chord) - 1; j >= 0; j-- {
+		if err := sendInputs([]tagINPUT{keyEvent(chord[j].vk, chord[j].scan, keyeventfScancode|keyeventfKeyUp)}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // realTypeText types text via KEYEVENTF_UNICODE, one event pair per UTF-16
 // code unit so surrogate pairs survive as two events.
-func realTypeText(text string) {
+func realTypeText(text string) error {
 	for _, unit := range utf16Units(text) {
-		sendInputs([]tagINPUT{keyEvent(0, unit, keyeventfUnicode)})
+		if err := sendInputs([]tagINPUT{keyEvent(0, unit, keyeventfUnicode)}); err != nil {
+			return err
+		}
 		sleepMs(5)
-		sendInputs([]tagINPUT{keyEvent(0, unit, keyeventfUnicode|keyeventfKeyUp)})
+		if err := sendInputs([]tagINPUT{keyEvent(0, unit, keyeventfUnicode|keyeventfKeyUp)}); err != nil {
+			return err
+		}
 		sleepMs(5)
 	}
+	return nil
 }
 
 // --- Background (window-message) input layer -------------------------------

@@ -610,8 +610,7 @@ func dispatchNativeAction(req psRequest, context nativeActionContext, element ui
 				return err
 			}
 			enableForegroundWindow(hwnd)
-			realMouseDrag(fromX, fromY, toX, toY)
-			return nil
+			return realMouseDrag(fromX, fromY, toX, toY)
 		}
 		postDrag(hwnd, fromX, fromY, toX, toY)
 		return nil
@@ -621,8 +620,7 @@ func dispatchNativeAction(req psRequest, context nativeActionContext, element ui
 				return err
 			}
 			enableForegroundWindow(hwnd)
-			realTypeText(req.Text)
-			return nil
+			return realTypeText(req.Text)
 		}
 		root := context.windowRoot
 		if !context.hasWindowRoot {
@@ -651,8 +649,7 @@ func dispatchNativeAction(req psRequest, context nativeActionContext, element ui
 			if err != nil {
 				return err
 			}
-			realKeyChord(modifiers, vk)
-			return nil
+			return realKeyChord(modifiers, vk)
 		}
 		return postKeyChord(hwnd, req.Key)
 	case "set_value":
@@ -700,8 +697,7 @@ func dispatchNativeClick(req psRequest, context nativeActionContext, element uia
 			return err
 		}
 		x, y := clickPointFromRequest(req, bounds)
-		sendRealClick(hwnd, x, y, req.MouseButton, req.ClickCount)
-		return nil
+		return sendRealClick(hwnd, x, y, req.MouseButton, req.ClickCount)
 	case "sky_click":
 		return errors.New("click_method 'sky_click' is not supported on Windows")
 	case "auto":
@@ -726,7 +722,7 @@ func dispatchNativeClick(req psRequest, context nativeActionContext, element uia
 				if !pointResolved {
 					x, y = clickPointFromRequest(req, bounds)
 				}
-				sendRealClick(hwnd, x, y, req.MouseButton, req.ClickCount)
+				return sendRealClick(hwnd, x, y, req.MouseButton, req.ClickCount)
 			}
 		}
 		return nil
@@ -735,10 +731,12 @@ func dispatchNativeClick(req psRequest, context nativeActionContext, element uia
 }
 
 // sendRealClick mirrors Send-RealClick: activate, move the pointer, click.
-func sendRealClick(hwnd windows.HWND, x, y int, button string, count int) {
+func sendRealClick(hwnd windows.HWND, x, y int, button string, count int) error {
 	enableForegroundWindow(hwnd)
-	realMouseMove(x, y)
-	realMouseClick(mouseButtonForInput(button), count)
+	if err := realMouseMove(x, y); err != nil {
+		return err
+	}
+	return realMouseClick(mouseButtonForInput(button), count)
 }
 
 func mouseButtonForInput(button string) string {
@@ -763,12 +761,10 @@ func dispatchNativeScroll(req psRequest, context nativeActionContext, element ui
 			}
 			x := windowCoord(bounds, "x", req.X)
 			y := windowCoord(bounds, "y", req.Y)
-			sendRealScrollDelta(hwnd, x, y, scrollX, scrollY)
-			return nil
+			return sendRealScrollDelta(hwnd, x, y, scrollX, scrollY)
 		}
 		x, y := clickPointFromRequest(req, bounds)
-		sendRealScroll(hwnd, x, y, req.Direction, req.Pages)
-		return nil
+		return sendRealScroll(hwnd, x, y, req.Direction, req.Pages)
 	}
 	if req.ScrollX != nil || req.ScrollY != nil {
 		// Official window2 coordinate scroll: window-relative x/y plus pixel
@@ -797,9 +793,11 @@ func dispatchNativeScroll(req psRequest, context nativeActionContext, element ui
 }
 
 // sendRealScrollDelta mirrors Send-RealScrollDelta.
-func sendRealScrollDelta(hwnd windows.HWND, screenX, screenY int, scrollX, scrollY float64) {
+func sendRealScrollDelta(hwnd windows.HWND, screenX, screenY int, scrollX, scrollY float64) error {
 	enableForegroundWindow(hwnd)
-	realMouseMove(screenX, screenY)
+	if err := realMouseMove(screenX, screenY); err != nil {
+		return err
+	}
 	dy, dx := 0, 0
 	if scrollY != 0 {
 		dy = int(-1 * mathRound(scrollY*120/40))
@@ -807,23 +805,24 @@ func sendRealScrollDelta(hwnd windows.HWND, screenX, screenY int, scrollX, scrol
 	if scrollX != 0 {
 		dx = int(mathRound(scrollX * 120 / 40))
 	}
-	realWheel(dy, dx)
+	return realWheel(dy, dx)
 }
 
 // sendRealScroll mirrors Send-RealScroll.
-func sendRealScroll(hwnd windows.HWND, screenX, screenY int, direction string, pages float64) {
+func sendRealScroll(hwnd windows.HWND, screenX, screenY int, direction string, pages float64) error {
 	enableForegroundWindow(hwnd)
-	realMouseMove(screenX, screenY)
+	if err := realMouseMove(screenX, screenY); err != nil {
+		return err
+	}
 	delta := int(mathRound(120 * pages))
 	horizontal := direction == "left" || direction == "right"
 	if direction == "down" || direction == "right" {
 		delta = -delta
 	}
 	if horizontal {
-		realWheel(0, delta)
-	} else {
-		realWheel(delta, 0)
+		return realWheel(0, delta)
 	}
+	return realWheel(delta, 0)
 }
 
 // nativeActionTool routes one action request: perform the action on the UIA

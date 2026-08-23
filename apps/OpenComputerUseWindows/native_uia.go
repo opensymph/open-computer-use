@@ -147,6 +147,22 @@ var (
 	uiaThreadID   uint32
 )
 
+// runUIAJob executes fn on the UIA thread, converting a panic inside the job
+// (e.g. a malformed provider tripping a nil dereference) into an error so a
+// single bad element cannot take down the whole server process.
+func runUIAJob(fn func()) error {
+	var jobErr error
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				jobErr = fmt.Errorf("UIA operation panicked: %v", recovered)
+			}
+		}()
+		fn()
+	}()
+	return jobErr
+}
+
 func uiaOnThread(fn func()) error {
 	uiaThreadOnce.Do(func() {
 		uiaJobs = make(chan func())
@@ -157,7 +173,7 @@ func uiaOnThread(fn func()) error {
 			uiaThreadID = windows.GetCurrentThreadId()
 			close(ready)
 			for job := range uiaJobs {
-				job()
+				_ = runUIAJob(job)
 			}
 		}()
 		<-ready
@@ -167,15 +183,13 @@ func uiaOnThread(fn func()) error {
 		return uiaClientErr
 	}
 	if windows.GetCurrentThreadId() == uiaThreadID {
-		fn() // already on the UIA thread; avoid self-deadlock
-		return nil
+		return runUIAJob(fn) // already on the UIA thread; avoid self-deadlock
 	}
 	// Flat node-API calls (UiaNavigate & co.) require COM to be initialized
 	// on the calling thread; dispatch every job to the dedicated UIA thread.
-	done := make(chan struct{})
-	uiaJobs <- func() { fn(); close(done) }
-	<-done
-	return nil
+	done := make(chan error, 1)
+	uiaJobs <- func() { done <- runUIAJob(fn) }
+	return <-done
 }
 
 // uiaPtr converts a raw address to unsafe.Pointer through a pointer round
@@ -478,13 +492,17 @@ func uiaTrueCondition() (unsafe.Pointer, error) {
 	return out, nil
 }
 
-// oleVariant is the x64 VARIANT layout (24 bytes).
+// oleVariant is the x64 VARIANT layout (24 bytes): vt + 3 reserved WORDs,
+// then the 16-byte payload union (largest member is the {pvRecord, pRecInfo}
+// pointer pair), which places scalar/pointer values at offset 8. COM callees
+// and VariantClear copy sizeof(VARIANT) bytes, so a shorter struct would be
+// written past its end.
 type oleVariant struct {
 	vt    uint16
 	r1    uint16
 	r2    uint16
 	r3    uint16
-	value [8]byte
+	value [16]byte
 }
 
 func uiaPropertyConditionInt(propertyId int32, value int32) (unsafe.Pointer, error) {
@@ -576,6 +594,12 @@ func uiaPatternActions(e uiaElement) []string {
 			continue
 		}
 		pattern := e.currentPattern(candidate.id)
+		if pattern == nil {
+			// GetCurrentPattern can return a NULL out-param (with a success
+			// HRESULT) even when the availability property says supported;
+			// vtableCall would dereference it and crash the process.
+			continue
+		}
 		if candidate.id == uiaPatternExpand {
 			var state int32
 			hr, _, _ := vtableCall(pattern, expandCollapseSlotState, uintptr(unsafe.Pointer(&state)))

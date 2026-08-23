@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -267,16 +268,43 @@ type screenshotMeta struct {
 	DimsOK     bool
 }
 
+// maxCachedSnapshots bounds the element-lookup cache. Snapshots are cached
+// for element_index resolution only; the base64 screenshot is stripped from
+// cached copies (full-size PNGs would otherwise accumulate for every observed
+// window for the lifetime of the process).
+const maxCachedSnapshots = 16
+
 type service struct {
 	snapshots   map[string]*appSnapshot
 	screenshots map[int64]screenshotMeta
 	nextShotID  int
+	cacheOrder  []string
 }
 
 func newService() *service {
 	return &service{
 		snapshots:   map[string]*appSnapshot{},
 		screenshots: map[int64]screenshotMeta{},
+	}
+}
+
+// cacheSnapshot stores a screenshot-free shallow copy under key. The caller's
+// snapshot keeps its image for the tool result being built.
+func (s *service) cacheSnapshot(key string, snapshot *appSnapshot) {
+	key = strings.ToLower(strings.TrimSpace(key))
+	if key == "" {
+		return
+	}
+	if _, exists := s.snapshots[key]; !exists {
+		s.cacheOrder = append(s.cacheOrder, key)
+	}
+	cached := *snapshot
+	cached.ScreenshotPNGBase64 = ""
+	s.snapshots[key] = &cached
+	for len(s.cacheOrder) > maxCachedSnapshots {
+		oldest := s.cacheOrder[0]
+		s.cacheOrder = s.cacheOrder[1:]
+		delete(s.snapshots, oldest)
 	}
 }
 
@@ -352,7 +380,7 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			optionalElementIndex(args),
 			optionalFloat(args, "x"),
 			optionalFloat(args, "y"),
-			intValue(optionalFloat(args, "click_count"), 1),
+			clampClickCount(intValue(optionalFloat(args, "click_count"), 1)),
 			mouseButton,
 			clickMethod,
 		)
@@ -397,7 +425,7 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			app,
 			requiredString(args, "direction"),
 			requiredElementIndex(args),
-			floatValue(optionalFloat(args, "pages"), 1),
+			clampScrollPages(floatValue(optionalFloat(args, "pages"), 1)),
 			inputMethod,
 		)
 	case "drag":
@@ -695,7 +723,7 @@ func (s *service) getWindowState(args map[string]any) toolCallResult {
 	}
 	snapshot.WindowHandle = window.ID
 	s.rememberSnapshot(window.App, snapshot)
-	s.snapshots[windowKey(window.ID)] = snapshot
+	s.cacheSnapshot(windowKey(window.ID), snapshot)
 
 	state := windowState{
 		Window: windowRef{App: snapshot.App.Name, ID: window.ID, Title: snapshot.WindowTitle},
@@ -1045,10 +1073,7 @@ func (s *service) rememberSnapshot(query string, snapshot *appSnapshot) {
 		keys = append(keys, windowKey(snapshot.WindowHandle))
 	}
 	for _, key := range keys {
-		key = strings.ToLower(strings.TrimSpace(key))
-		if key != "" {
-			s.snapshots[key] = snapshot
-		}
+		s.cacheSnapshot(key, snapshot)
 	}
 }
 
@@ -1305,6 +1330,34 @@ var inputMethodValues = []string{"auto", "global"}
 
 // maxSendInputUTF16Units is the official SendInput ceiling for type_text.
 const maxSendInputUTF16Units = 8192
+
+// Service-layer safety ceilings: clamp absurd click_count/pages instead of
+// looping input injection or scrolling for effectively unbounded time.
+const (
+	maxClickCount      = 100
+	maxScrollPages     = 1000
+	maxMCPRequestBytes = 64 << 20 // set_value/type payloads ride JSON-RPC lines
+)
+
+// clampClickCount bounds click_count to 1..maxClickCount.
+func clampClickCount(value int) int {
+	if value < 1 {
+		return 1
+	}
+	if value > maxClickCount {
+		return maxClickCount
+	}
+	return value
+}
+
+// clampScrollPages bounds pages to at most maxScrollPages (>0 is validated
+// separately by the scroll tools).
+func clampScrollPages(value float64) float64 {
+	if value > maxScrollPages {
+		return maxScrollPages
+	}
+	return value
+}
 
 // parseInputMethod validates the optional input_method parameter on the
 // action tools (auto = UIA/PostMessage background chain, global = real
@@ -2109,14 +2162,19 @@ func runCaptureCommand(args []string, stdout io.Writer) error {
 
 func runMCP(stdin io.Reader, stdout io.Writer) error {
 	svc := newService()
-	decoder := json.NewDecoder(stdin)
+	// One JSON-RPC request per line. A streaming json.Decoder cannot recover
+	// from a malformed frame: the bad bytes are never consumed, so Decode
+	// fails in a hot loop and every subsequent request is starved.
+	scanner := bufio.NewScanner(stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxMCPRequestBytes)
 	encoder := json.NewEncoder(stdout)
-	for {
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
 		var request map[string]any
-		if err := decoder.Decode(&request); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
+		if err := json.Unmarshal([]byte(line), &request); err != nil {
 			_ = encoder.Encode(jsonRPCError(nil, -32700, "Invalid JSON-RPC payload"))
 			continue
 		}
@@ -2127,6 +2185,7 @@ func runMCP(stdin io.Reader, stdout io.Writer) error {
 			}
 		}
 	}
+	return scanner.Err()
 }
 
 func handleMCPRequest(request map[string]any, svc *service) map[string]any {
