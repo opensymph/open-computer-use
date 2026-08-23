@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,7 +14,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -22,6 +22,35 @@ var version = "1.0.4"
 var clickMethodValues = []string{"auto", "accessibility", "app_post", "sky_click", "global"}
 
 var mouseButtonValues = []string{"left", "right", "middle", "l", "r", "m"}
+
+// Service-layer safety ceilings: clamp absurd click_count/pages instead of
+// looping input injection or scrolling for effectively unbounded time, and
+// bound the JSON-RPC line size (set_value/type payloads ride MCP lines).
+const (
+	maxClickCount      = 100
+	maxScrollPages     = 1000
+	maxMCPRequestBytes = 64 << 20
+)
+
+// clampClickCount bounds click_count to 1..maxClickCount.
+func clampClickCount(value int) int {
+	if value < 1 {
+		return 1
+	}
+	if value > maxClickCount {
+		return maxClickCount
+	}
+	return value
+}
+
+// clampScrollPages bounds pages to at most maxScrollPages (>0 is validated
+// separately by the scroll tool).
+func clampScrollPages(value float64) float64 {
+	if value > maxScrollPages {
+		return maxScrollPages
+	}
+	return value
+}
 
 const serverInstructions = "Computer Use tools let you interact with Linux desktop apps by performing UI actions.\n\nBegin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. The available tools are list_apps, get_app_state, click, perform_secondary_action, scroll, drag, type_text, press_key, and set_value.\n\nPrefer element-targeted interactions over coordinate clicks when an index for the targeted element is available. Linux actions use AT-SPI2 semantic actions and editable text APIs first. Coordinate mouse and key synthesis are best-effort fallbacks and are not a universal Wayland background input model."
 
@@ -174,12 +203,39 @@ type linuxResponse struct {
 	Snapshot *appSnapshot `json:"snapshot,omitempty"`
 }
 
+// maxCachedSnapshots bounds the element-lookup cache. Snapshots are cached
+// for element_index resolution only; the base64 screenshot is stripped from
+// cached copies (full-size PNGs would otherwise accumulate for every observed
+// app for the lifetime of the process).
+const maxCachedSnapshots = 8
+
 type service struct {
-	snapshots map[string]*appSnapshot
+	snapshots  map[string]*appSnapshot
+	cacheOrder []string
 }
 
 func newService() *service {
 	return &service{snapshots: map[string]*appSnapshot{}}
+}
+
+// cacheSnapshot stores a screenshot-free shallow copy under key. The caller's
+// snapshot keeps its image for the tool result being built.
+func (s *service) cacheSnapshot(key string, snapshot *appSnapshot) {
+	key = strings.ToLower(strings.TrimSpace(key))
+	if key == "" {
+		return
+	}
+	if _, exists := s.snapshots[key]; !exists {
+		s.cacheOrder = append(s.cacheOrder, key)
+	}
+	cached := *snapshot
+	cached.ScreenshotPNGBase64 = ""
+	s.snapshots[key] = &cached
+	for len(s.cacheOrder) > maxCachedSnapshots {
+		oldest := s.cacheOrder[0]
+		s.cacheOrder = s.cacheOrder[1:]
+		delete(s.snapshots, oldest)
+	}
 }
 
 func (s *service) callTool(name string, args map[string]any) toolCallResult {
@@ -216,13 +272,17 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return textResult(err.Error(), true)
 		}
+		mouseButton, err := parseMouseButton(optionalString(args, "mouse_button"))
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
 		return s.click(
 			requiredString(args, "app"),
 			optionalElementIndex(args),
 			optionalFloat(args, "x"),
 			optionalFloat(args, "y"),
-			intValue(optionalFloat(args, "click_count"), 1),
-			defaultString(optionalString(args, "mouse_button"), "left"),
+			clampClickCount(intValue(optionalFloat(args, "click_count"), 1)),
+			mouseButton,
 			clickMethod,
 		)
 	case "perform_secondary_action":
@@ -236,7 +296,7 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			requiredString(args, "app"),
 			requiredString(args, "direction"),
 			requiredElementIndex(args),
-			floatValue(optionalFloat(args, "pages"), 1),
+			clampScrollPages(floatValue(optionalFloat(args, "pages"), 1)),
 		)
 	case "drag":
 		return s.drag(
@@ -478,10 +538,7 @@ func (s *service) refreshSnapshot(app string, request linuxRequest) (*appSnapsho
 func (s *service) rememberSnapshot(query string, snapshot *appSnapshot) {
 	keys := []string{query, snapshot.App.Name, snapshot.App.BundleIdentifier, strconv.Itoa(snapshot.App.PID)}
 	for _, key := range keys {
-		key = strings.ToLower(strings.TrimSpace(key))
-		if key != "" {
-			s.snapshots[key] = snapshot
-		}
+		s.cacheSnapshot(key, snapshot)
 	}
 }
 
@@ -918,11 +975,7 @@ func validRuntimeDir(path string, uid int) bool {
 	if err != nil || !info.IsDir() {
 		return false
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
-	}
-	return int(stat.Uid) == uid
+	return pathOwnedByUIDStat(info, uid)
 }
 
 func pathOwnedByUID(path string, uid int) bool {
@@ -930,11 +983,7 @@ func pathOwnedByUID(path string, uid int) bool {
 	if err != nil {
 		return false
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
-	}
-	return int(stat.Uid) == uid
+	return pathOwnedByUIDStat(info, uid)
 }
 
 func isSocket(path string) bool {
@@ -1114,6 +1163,25 @@ func parseClickMethod(value string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("Invalid click_method %q. Expected one of: %s", value, strings.Join(clickMethodValues, ", "))
+}
+
+// parseMouseButton normalizes the official MouseButton aliases (l/r/m).
+// Anything else is rejected instead of silently clicking the left button.
+func parseMouseButton(value string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
+	case "":
+		return "left", nil
+	case "l":
+		return "left", nil
+	case "r":
+		return "right", nil
+	case "m":
+		return "middle", nil
+	case "left", "right", "middle":
+		return normalized, nil
+	}
+	return "", fmt.Errorf("Invalid mouse_button %q. Expected one of: %s", value, strings.Join(mouseButtonValues, ", "))
 }
 
 func globalPointerFallbacksEnabled() bool {
@@ -1661,14 +1729,19 @@ func readJSONSource(inline, file string) (string, error) {
 
 func runMCP(stdin io.Reader, stdout io.Writer) error {
 	svc := newService()
-	decoder := json.NewDecoder(stdin)
+	// One JSON-RPC request per line. A streaming json.Decoder cannot recover
+	// from a malformed frame: the bad bytes are never consumed, so Decode
+	// fails in a hot loop and every subsequent request is starved.
+	scanner := bufio.NewScanner(stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxMCPRequestBytes)
 	encoder := json.NewEncoder(stdout)
-	for {
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
 		var request map[string]any
-		if err := decoder.Decode(&request); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
+		if err := json.Unmarshal([]byte(line), &request); err != nil {
 			_ = encoder.Encode(jsonRPCError(nil, -32700, "Invalid JSON-RPC payload"))
 			continue
 		}
@@ -1679,6 +1752,7 @@ func runMCP(stdin io.Reader, stdout io.Writer) error {
 			}
 		}
 	}
+	return scanner.Err()
 }
 
 func handleMCPRequest(request map[string]any, svc *service) map[string]any {

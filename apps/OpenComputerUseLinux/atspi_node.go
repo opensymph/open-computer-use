@@ -782,18 +782,18 @@ func screenPoint(windowBounds *frame, element *elementRecord, x, y *float64) (fl
 	return windowBounds.X + *x, windowBounds.Y + *y, nil
 }
 
-// mouseButtonEvents mirrors mouse_button_events, including the quirk that
-// any value other than "right"/"middle" (e.g. the l/r/m short names)
-// resolves to the left button.
+// mouseButtonEvents mirrors mouse_button_events, resolving the official
+// l/r/m short names to their real buttons; anything else resolves to the
+// left button (the service layer rejects values outside the schema enum).
 func mouseButtonEvents(button string) (down, up string) {
 	normalized := button
 	if normalized == "" {
 		normalized = "left"
 	}
 	switch strings.ToLower(normalized) {
-	case "right":
+	case "right", "r":
 		return "b3p", "b3r"
-	case "middle":
+	case "middle", "m":
 		return "b2p", "b2r"
 	default:
 		return "b1p", "b1r"
@@ -834,7 +834,10 @@ func (rt *atspiRuntime) sendDrag(fromX, fromY, toX, toY float64) {
 
 // sendKey mirrors send_key: "<mod>+<mod>+<key>" chords, unknown modifiers
 // silently skipped, single characters synthesized as STRING events, named
-// keys as PRESSRELEASE, modifiers released in reverse order.
+// keys as PRESSRELEASE, modifiers released in reverse order. The main key is
+// resolved BEFORE any modifier is pressed and any later failure releases the
+// already-pressed modifiers in reverse, so a bad key can never leave the
+// keyboard with stuck modifiers.
 func (rt *atspiRuntime) sendKey(key string) error {
 	var parts []string
 	for _, part := range strings.Split(key, "+") {
@@ -847,7 +850,27 @@ func (rt *atspiRuntime) sendKey(key string) error {
 	}
 	mainKey := parts[len(parts)-1]
 	modifiers := parts[:len(parts)-1]
+
+	normalized := mainKey
+	if alias, ok := keyAliases[strings.ToLower(mainKey)]; ok {
+		normalized = alias
+	}
+	var mainKeyval uint32
+	mainIsString := utf8.RuneCountInString(normalized) == 1
+	if !mainIsString {
+		var err error
+		mainKeyval, err = keyvalForName(normalized)
+		if err != nil {
+			return err
+		}
+	}
+
 	var pressed []uint32
+	releasePressed := func() {
+		for index := len(pressed) - 1; index >= 0; index-- {
+			rt.keyEvent(pressed[index], "", atspiKeyRelease)
+		}
+	}
 	for _, modifier := range modifiers {
 		name, ok := modifierKeys[strings.ToLower(modifier)]
 		if !ok {
@@ -855,27 +878,18 @@ func (rt *atspiRuntime) sendKey(key string) error {
 		}
 		value, err := keyvalForName(name)
 		if err != nil {
+			releasePressed()
 			return err
 		}
 		rt.keyEvent(value, "", atspiKeyPress)
 		pressed = append(pressed, value)
 	}
-	normalized := mainKey
-	if alias, ok := keyAliases[strings.ToLower(mainKey)]; ok {
-		normalized = alias
-	}
-	if utf8.RuneCountInString(normalized) == 1 {
+	if mainIsString {
 		rt.keyEvent(0, normalized, atspiKeyString)
 	} else {
-		value, err := keyvalForName(normalized)
-		if err != nil {
-			return err
-		}
-		rt.keyEvent(value, "", atspiKeyPressRelease)
+		rt.keyEvent(mainKeyval, "", atspiKeyPressRelease)
 	}
-	for index := len(pressed) - 1; index >= 0; index-- {
-		rt.keyEvent(pressed[index], "", atspiKeyRelease)
-	}
+	releasePressed()
 	return nil
 }
 

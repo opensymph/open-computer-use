@@ -813,23 +813,23 @@ func TestClickAutoSkipsActionForNonLeftButton(t *testing.T) {
 	}
 }
 
-func TestMouseButtonShortNamesFallBackToLeft(t *testing.T) {
+func TestMouseButtonShortNamesMapToRealButtons(t *testing.T) {
 	desktop := editorFixture()
 	fr := newFakeRuntime(desktop)
 	x, y := 1.0, 2.0
 	resp := performOperation(fr.rt, &linuxRequest{Tool: "click", App: "Text Editor", ClickMethod: "global",
-		X: &x, Y: &y, MouseButton: "r"}) // "r" is NOT right; quirk: unknown -> left
+		X: &x, Y: &y, MouseButton: "r"})
 	if !resp.OK {
 		t.Fatalf("short name click = %q", resp.Error)
 	}
-	want := []recordedMouseEvent{{101, 102, "abs"}, {101, 102, "b1p"}, {101, 102, "b1r"}}
+	want := []recordedMouseEvent{{101, 102, "abs"}, {101, 102, "b3p"}, {101, 102, "b3r"}}
 	if fmt.Sprint(fr.mouseEvents) != fmt.Sprint(want) {
-		t.Fatalf("mouse events = %v (short name must map to b1)", fr.mouseEvents)
+		t.Fatalf("mouse events = %v (r must map to the right button)", fr.mouseEvents)
 	}
-	// middle works
+	// "m" maps to the middle button
 	fr2 := newFakeRuntime(editorFixture())
 	resp = performOperation(fr2.rt, &linuxRequest{Tool: "click", App: "Text Editor", ClickMethod: "global",
-		X: &x, Y: &y, MouseButton: "middle"})
+		X: &x, Y: &y, MouseButton: "m"})
 	if !resp.OK || fmt.Sprint(fr2.mouseEvents[1].event) != "b2p" {
 		t.Fatalf("middle click = %v %q", fr2.mouseEvents, resp.Error)
 	}

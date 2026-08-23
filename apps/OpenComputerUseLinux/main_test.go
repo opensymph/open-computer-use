@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -330,6 +331,9 @@ func TestLinuxRuntimeTreeBudgetDefaultsMatchMacOS(t *testing.T) {
 }
 
 func TestLinuxRuntimeEnvironmentDiscoversDesktopSession(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("session/env discovery relies on unix sockets and /proc ownership (Linux-only)")
+	}
 	runtimeDir := shortTempDir(t)
 	listenUnixSocket(t, filepath.Join(runtimeDir, "bus"))
 	listenUnixSocket(t, filepath.Join(runtimeDir, "wayland-0"))
@@ -364,6 +368,9 @@ func TestLinuxRuntimeEnvironmentDiscoversDesktopSession(t *testing.T) {
 }
 
 func TestLinuxRuntimeEnvironmentCanonicalizesRuntimeBus(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("session/env discovery relies on unix sockets and /proc ownership (Linux-only)")
+	}
 	runtimeDir := shortTempDir(t)
 	listenUnixSocket(t, filepath.Join(runtimeDir, "bus"))
 
