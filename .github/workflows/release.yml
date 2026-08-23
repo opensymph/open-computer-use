@@ -1,0 +1,190 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "*.*.*"
+  workflow_dispatch:
+    inputs:
+      publish_to_npm:
+        description: "Publish the staged npm packages to npmjs.org"
+        required: true
+        default: false
+        type: boolean
+      npm_tag:
+        description: "npm dist-tag to use when publish_to_npm is enabled"
+        required: true
+        default: latest
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release-metadata:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "24"
+
+      - name: Validate reviewed GitHub Release notes
+        if: ${{ github.event_name == 'push' }}
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node ./scripts/validate-github-release-notes.mjs --tag "${RELEASE_TAG}"
+
+  package-npm:
+    needs: release-metadata
+    runs-on: macos-26
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "24"
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.25.x"
+
+      - name: Check npm trusted publishing CLI
+        run: |
+          node --version
+          go version
+          npm_version="$(npm --version)"
+          echo "npm ${npm_version}"
+          node -e 'const [major, minor] = process.argv[1].split(".").map(Number); if (major < 11 || (major === 11 && minor < 5)) { console.error(`npm ${process.argv[1]} is too old for trusted publishing; need 11.5.1+`); process.exit(1); }' "${npm_version}"
+
+      - name: Prepare Open Computer Use signing config
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          echo "OPEN_COMPUTER_USE_CODESIGN_MODE=adhoc" >> "${GITHUB_ENV}"
+
+          if [ -z "${APPLE_CERTIFICATE}" ] || [ -z "${APPLE_CERTIFICATE_PASSWORD}" ]; then
+            echo "No signing certificate configured (APPLE_CERTIFICATE secrets missing); release artifacts will fall back to ad-hoc signing and may create install-specific macOS permission identities."
+            exit 0
+          fi
+
+          keychain_password="open-computer-use-ci-${RUNNER_TEMP}"
+          cert_path="${RUNNER_TEMP}/open-computer-use-signing.p12"
+          keychain_path="${RUNNER_TEMP}/open-computer-use-signing.keychain-db"
+
+          printf '%s' "${APPLE_CERTIFICATE}" | base64 -d > "${cert_path}"
+
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          security import "${cert_path}" -k "${keychain_path}" -P "${APPLE_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${keychain_password}" "${keychain_path}"
+
+          resolved_identity="${APPLE_SIGNING_IDENTITY:-}"
+          if [ -z "${resolved_identity}" ]; then
+            resolved_identity="$(security find-identity -v -p codesigning "${keychain_path}" | sed -n 's/.*\"\\(.*\\)\"/\\1/p' | head -n 1)"
+          fi
+          if [ -z "${resolved_identity}" ]; then
+            echo "Imported signing certificate, but no usable codesigning identity was found in ${keychain_path}." >&2
+            exit 1
+          fi
+
+          echo "Resolved Open Computer Use signing identity: ${resolved_identity}"
+
+          {
+            echo "OPEN_COMPUTER_USE_CODESIGN_MODE=identity"
+            echo "OPEN_COMPUTER_USE_CODESIGN_IDENTITY=${resolved_identity}"
+            echo "OPEN_COMPUTER_USE_CODESIGN_KEYCHAIN=${keychain_path}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Build npm release artifacts
+        run: npm run npm:pack
+
+      - name: Upload npm release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: npm-release-artifacts
+          path: |
+            dist/release/npm/*.tgz
+            dist/release/release-manifest.json
+          if-no-files-found: error
+
+      - name: Configure npm token fallback
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "${NPM_TOKEN}" ]; then
+            printf '%s\n%s\n' \
+              "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" \
+              "registry=https://registry.npmjs.org/" \
+              > "${RUNNER_TEMP}/npm-token-fallback.npmrc"
+            echo "NPM_CONFIG_USERCONFIG=${RUNNER_TEMP}/npm-token-fallback.npmrc" >> "${GITHUB_ENV}"
+            echo "NODE_AUTH_TOKEN=${NPM_TOKEN}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Check npm publish credentials
+        id: npm_auth
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "${NPM_TOKEN}" ]; then
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+            echo "NPM_TOKEN not configured; skipping npm publish. Tarballs stay attached to the workflow run and the GitHub Release. To publish with OIDC trusted publishing only, rerun via workflow_dispatch with publish_to_npm=true."
+          fi
+
+      - name: Publish packages to npm
+        if: ${{ (github.event_name == 'push' && steps.npm_auth.outputs.available == 'true') || inputs.publish_to_npm }}
+        env:
+          NPM_DIST_TAG: ${{ github.event_name == 'push' && 'latest' || inputs.npm_tag }}
+        run: |
+          node ./scripts/npm/publish-packages.mjs \
+            --skip-build \
+            --out-dir dist/release/npm-staging \
+            --tag "${NPM_DIST_TAG}"
+
+  github-release:
+    needs: [release-metadata, package-npm]
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Download npm release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: npm-release-artifacts
+          path: dist/release/out
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          notes_path="docs/releases/github/${RELEASE_TAG}.md"
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/release/out/npm/*.tgz dist/release/out/release-manifest.json --clobber
+            gh release edit "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes-file "${notes_path}"
+          else
+            gh release create "${RELEASE_TAG}" dist/release/out/npm/*.tgz dist/release/out/release-manifest.json \
+              --title "${RELEASE_TAG}" \
+              --notes-file "${notes_path}"
+          fi

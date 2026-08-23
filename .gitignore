@@ -1,0 +1,11 @@
+.idea/
+.DS_Store
+.build/
+.swiftpm/
+dist/
+.gemini/
+__pycache__/
+*.pyc
+apps/OpenComputerUseWindows/opencomputerusewindows.exe
+scripts/releasetool/releasetool.exe
+apps/OpenComputerUseLinux/opencomputeruselinux
