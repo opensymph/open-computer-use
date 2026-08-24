@@ -125,6 +125,12 @@
 - `get_app_state` 的 accessibility tree 在 GTK/GNOME app 上可能很深，Linux bridge 使用与 macOS / Windows 一致的 1200 节点、64 层默认 tree budget，并支持显式提高 `max_tree_nodes` / `max_tree_depth`。截图是 X11 root window 的 best-effort capture；GNOME Wayland / rootless XWayland 下读取会失败或返回黑图，bridge 会静默省略 image block（黑图经 16×16 网格采样判定）。
 - 这 9 个 tool 的协议面与 macOS / Windows 保持一致：`list_apps`、`get_app_state`、`click`、`perform_secondary_action`、`scroll`、`drag`、`type_text`、`press_key`、`set_value`。其中 element-targeted action 会优先复用上一轮 `get_app_state` 的 runtime path metadata，coordinate action 使用 screenshot/window-relative 坐标。
 - Linux `click_method=accessibility` 映射到 AT-SPI action，`global` 映射到 AT-SPI mouse synthesis 并要求全局指针环境变量；AT-SPI 没有等价的进程定向 mouse dispatch，因此 `app_post` 和 macOS-only 的 `sky_click` 会在 snapshot lookup 前明确返回 unsupported。`auto` 仍保持 AT-SPI action 优先、mouse synthesis fallback 的现有行为。
+- 除了 9 个 AT-SPI2 工具外，Linux runtime 还提供一组 **display 级 X11 命令**，对齐 Cloud Agent / VNC 宿主那套「xdotool + ffmpeg + x11grab」栈，用来补齐 AT-SPI 覆盖不到的整屏操控与录制能力（AT-SPI 工具仍保持按 app、非侵入）：
+  - `open-computer-use screenshot [--display :N] [--output x.png]`：纯 Go（xgb）读取整个 X11 root window（含所有显示器）为 PNG，复用与按窗口截图相同的 ZPixmap 解码；不带 `--output` 时向 stdout 打印 base64 PNG。
+  - `open-computer-use cursor-position [--display :N]`：纯 Go（xgb `QueryPointer`）返回指针坐标与屏幕尺寸的 JSON。
+  - `open-computer-use input <move|click|drag|scroll|type|key|wait> [--display :N]`：通过 `xdotool` 做**全局**合成输入（会移动真实指针 / 键盘、可能改变前台焦点）。除 `wait` 外都需要 `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`，与既有 `click_method=global` 共用同一道进程级安全门；命令构造是纯函数、单测覆盖，`xdotool` 缺失时明确报错而不是静默成功。
+  - `open-computer-use record <start|stop|status> [--display :N] [--output x.mp4] [--fps N] [--pidfile p]`：通过 `ffmpeg -f x11grab`（libx264 / yuv420p）录制整屏为 mp4。`start` detach 后台 ffmpeg 并把 `{pid,output,display}` 写入 pidfile，`stop` 发 SIGINT 让 ffmpeg 收尾出可播放的 mp4，`status` 读 pidfile 报运行态；`ffmpeg` 缺失时明确报错。
+  - `display` 解析顺序为 `--display` > `$DISPLAY` > `:0`（VNC/AnyOS 桌面通常是 `:1`）。这几条命令只在 Linux 生效：纯逻辑放在 `desktop.go`，X11/xdotool/ffmpeg 原生实现放在 `//go:build linux` 的 `desktop_linux.go`，`desktop_other.go` 提供非 Linux stub，保证包在任意宿主可编译、纯逻辑单测可跑。它们是 CLI-only，不进入官方对齐的 14 个 MCP tool 面。
 - 当前 Linux 侧仍是功能性第一版：没有 visual cursor overlay、没有 installer/desktop entry，也没有独立 Linux fixture。
 
 - 2026-08-23 修复（评审驱动）：`send_key` 主键解析提前到按下修饰键之前、出错路径倒序释放已按修饰键（`ctrl+bogus` 从「Ctrl 卡死」变为零事件报错）；MCP stdio 改逐行读帧（坏帧 -32700 后继续，`json.Decoder` 流式坏帧 100% CPU 空转）；`mouse_button` 短名 `r`/`m` 正确映射右/中键、非法值显式报错（对齐 schema enum，原实现静默按左键）；快照缓存去截图副本并限 8 条；`click_count`/`pages` clamp（≤100/≤1000）。uid 归属检查拆分到 `uid_linux.go`（非 Linux 宿主编译 stub），纯逻辑测试可任意宿主运行。
@@ -155,3 +161,8 @@
   - `open-computer-use snapshot <app>`
   - `open-computer-use call list_apps`
   - `open-computer-use call --calls '[{"tool":"get_app_state","args":{"app":"TextEdit"}}]'`
+- Linux display 级命令手工验证（需要一个 X11 桌面，VNC/AnyOS 通常是 `:1`）：
+  - `open-computer-use screenshot --display :1 --output /tmp/shot.png`
+  - `open-computer-use cursor-position --display :1`
+  - `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 open-computer-use input move 960 600 --display :1`（再用 `cursor-position` 验证指针已移动）
+  - `open-computer-use record start --display :1 --output /tmp/rec.mp4 && sleep 2 && open-computer-use record stop`（用 `ffprobe /tmp/rec.mp4` 验证产物）
