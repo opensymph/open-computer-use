@@ -1843,6 +1843,14 @@ func runCLI(args []string, stdout io.Writer) error {
 			return errors.New("tool call returned isError=true")
 		}
 		return nil
+	case "screenshot":
+		return runScreenshotCommand(args[1:], stdout)
+	case "cursor-position":
+		return runCursorPositionCommand(args[1:], stdout)
+	case "input":
+		return runInputCommand(args[1:], stdout)
+	case "record":
+		return runRecordCommand(args[1:], stdout)
 	default:
 		return fmt.Errorf("unknown command: %s\n\n%s", args[0], helpText(""))
 	}
@@ -2244,6 +2252,14 @@ func helpText(command string) string {
 		return "Usage:\n  open-computer-use.exe call <tool> [--args '<json-object>']\n  open-computer-use.exe call --calls '<json-array>'\n\nThe JSON array form keeps all calls in one process so element_index state can be reused.\n"
 	case "snapshot":
 		return "Usage:\n  open-computer-use.exe snapshot [--text-limit <positive-int|max>] [--max-tree-nodes <positive-int>] [--max-tree-depth <positive-int>] <app>\n\nPrint the current Windows UI Automation snapshot for the target app.\n"
+	case "screenshot":
+		return "Usage:\n  open-computer-use.exe screenshot [--output <path.png>]\n\nCapture the whole Windows virtual desktop (all monitors) to PNG via a GDI\nscreen read. With --output the PNG is written to that path; otherwise base64\nPNG is printed.\n"
+	case "cursor-position":
+		return "Usage:\n  open-computer-use.exe cursor-position\n\nPrint the mouse pointer position (virtual-screen coordinates) and the desktop\nsize as JSON, mirroring the Linux runtime's cursor-position output.\n"
+	case "input":
+		return "Usage:\n  open-computer-use.exe input <action> [options]\n\nActions (global synthetic input via SendInput):\n  move <x> <y>\n  click [--button left|right|middle] [--count N] [--x X --y Y]\n  drag <from_x> <from_y> <to_x> <to_y> [--button left]\n  scroll <up|down|left|right> [--amount N]\n  type <text>\n  key <key-or-chord>          e.g. ctrl+s, Return, Page_Up (Windows/Meta denied)\n  wait <seconds>\n\nEvery action except wait moves the real pointer/keyboard and requires\nOPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1.\n"
+	case "record":
+		return "Usage:\n  open-computer-use.exe record start [--output <path.mp4>] [--fps N] [--pidfile <path>]\n  open-computer-use.exe record stop  [--pidfile <path>]\n  open-computer-use.exe record status [--pidfile <path>]\n\nRecord the desktop with ffmpeg gdigrab (H.264 mp4); ffmpeg must be on PATH\n(experimental). start runs ffmpeg detached; stop raises Ctrl+Break so the mp4\nis finalized. Defaults: fps 30, output in %TEMP%, pidfile\n%TEMP%\\open-computer-use-record.pid.\n"
 	default:
 		return `Open Computer Use for Windows
 
@@ -2256,12 +2272,19 @@ Commands:
   list-apps            Print running apps with top-level windows.
   snapshot <app>       Print the current UI Automation snapshot for an app.
   call <tool>           Call one tool, or run a JSON array of tool calls.
+  screenshot           Capture the whole virtual desktop to PNG.
+  cursor-position      Print the mouse pointer position as JSON.
+  input <action>       Global SendInput input: move/click/drag/scroll/type/key/wait.
+  record <start|stop|status>  Record the desktop with ffmpeg gdigrab.
   help [command]       Show general or command-specific help.
   version              Print the CLI version.
 
 Notes:
   The Windows runtime uses UI Automation first, then Win32 window messages for
   fallback input. Run it in the signed-in desktop session, not as a service.
+  The screenshot/cursor-position/input/record commands operate on the whole
+  desktop; input requires OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1
+  and record requires ffmpeg on PATH.
 `
 	}
 }
