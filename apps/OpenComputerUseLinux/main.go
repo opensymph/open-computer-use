@@ -1496,6 +1496,14 @@ func runCLI(args []string, stdout io.Writer) error {
 			return errors.New("tool call returned isError=true")
 		}
 		return nil
+	case "screenshot":
+		return runScreenshotCommand(args[1:], stdout)
+	case "cursor-position":
+		return runCursorPositionCommand(args[1:], stdout)
+	case "input":
+		return runInputCommand(args[1:], stdout)
+	case "record":
+		return runRecordCommand(args[1:], stdout)
 	default:
 		return fmt.Errorf("unknown command: %s\n\n%s", args[0], helpText(""))
 	}
@@ -1811,6 +1819,14 @@ func helpText(command string) string {
 		return "Usage:\n  open-computer-use call <tool> [--args '<json-object>']\n  open-computer-use call --calls '<json-array>'\n\nThe JSON array form keeps all calls in one process so element_index state can be reused.\n"
 	case "snapshot":
 		return "Usage:\n  open-computer-use snapshot [--text-limit <positive-int|max>] [--max-tree-nodes <positive-int>] [--max-tree-depth <positive-int>] <app>\n\nPrint the current Linux AT-SPI snapshot for the target app.\n"
+	case "screenshot":
+		return "Usage:\n  open-computer-use screenshot [--display <:N>] [--output <path.png>]\n\nCapture the whole X11 display (all monitors) via a pure-Go X11 read.\nWith --output the PNG is written to that path; otherwise base64 PNG is printed.\nThe display defaults to $DISPLAY, then :0 (a VNC/AnyOS desktop is usually :1).\n"
+	case "cursor-position":
+		return "Usage:\n  open-computer-use cursor-position [--display <:N>]\n\nPrint the X11 pointer position and screen size as JSON.\n"
+	case "input":
+		return "Usage:\n  open-computer-use input <action> [--display <:N>] [options]\n\nActions (backed by xdotool; global synthetic input):\n  move <x> <y>\n  click [--button left|right|middle] [--count N] [--x X --y Y]\n  drag <from_x> <from_y> <to_x> <to_y> [--button left]\n  scroll <up|down|left|right> [--amount N]\n  type <text>\n  key <key-or-chord>          e.g. ctrl+s, Return, Page_Up\n  wait <seconds>\n\nEvery action except wait moves the real pointer/keyboard and requires\nOPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1.\n"
+	case "record":
+		return "Usage:\n  open-computer-use record start [--display <:N>] [--output <path.mp4>] [--fps N] [--pidfile <path>]\n  open-computer-use record stop  [--pidfile <path>]\n  open-computer-use record status [--pidfile <path>]\n\nRecord the X11 display with ffmpeg x11grab (H.264 mp4). start runs ffmpeg\ndetached; stop signals it so the mp4 is finalized. Defaults: fps 30, output in\n$TMPDIR, pidfile /tmp/open-computer-use-record.pid.\n"
 	default:
 		return `Open Computer Use for Linux
 
@@ -1823,12 +1839,18 @@ Commands:
   list-apps            Print running apps with top-level windows.
   snapshot <app>       Print the current AT-SPI snapshot for an app.
   call <tool>           Call one tool, or run a JSON array of tool calls.
+  screenshot           Capture the whole X11 display to PNG.
+  cursor-position      Print the X11 pointer position as JSON.
+  input <action>       Global xdotool input: move/click/drag/scroll/type/key/wait.
+  record <start|stop|status>  Record the X11 display with ffmpeg x11grab.
   help [command]       Show general or command-specific help.
   version              Print the CLI version.
 
 Notes:
-  The Linux runtime uses AT-SPI2 semantic actions first, then best-effort
-  coordinate/key synthesis. Run it in the signed-in desktop session.
+  The AT-SPI2 tools (mcp/snapshot/call) stay per-app and non-intrusive. The
+  screenshot/cursor-position/input/record commands operate on the whole X11
+  display (like xdotool/ffmpeg); input and record need xdotool/ffmpeg on PATH.
+  Run it in the signed-in desktop session.
 `
 	}
 }
