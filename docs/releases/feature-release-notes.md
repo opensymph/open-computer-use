@@ -4,6 +4,7 @@
 
 | 日期 | 功能域 | 用户价值 | 变更摘要 |
 | --- | --- | --- | --- |
+| 2026-08-25 | 三端显示级桌面命令 | Windows 与 macOS 补齐与 Linux 对齐的整屏 CLI：跨平台可用同一套 `screenshot` / `cursor-position` / `input` / `record` 观察、操控与录制整个桌面，脚本无需按平台分支。 | 发布 `1.1.0`：Windows 端 `screenshot`（GDI 虚拟桌面整屏）、`cursor-position`（GetCursorPos JSON）、`input`（复用 SendInput 层，`OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1` 门控，Windows/Meta 键硬拒）、`record`（ffmpeg gdigrab + Ctrl+Break 优雅收尾，实验性）；macOS 端同名命令走 CGEvent / `CGDisplayCreateImage` 多屏合成 / `screencapture -v`，新增 `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1` 门控并复用 app agent 的 TCC 权限身份；三端命令名、参数与输出 JSON 结构对齐，均为 CLI-only，14 个 MCP tool 面不变；顺手修复 dependency-review `fail-on-scopes` 空值导致 supply-chain CI 常挂的问题。 |
 | 2026-08-24 | 三端可靠性与输入修复 | Windows 全局键盘/多屏鼠标输入恢复正确，三端 MCP server 不再被坏帧打成 100% CPU 死循环，Linux 无效按键组合不再卡住修饰键，macOS Retina 命中测试归位且畸形辅助功能元素不再崩掉 server。 | 发布 `1.0.5`：修复 Windows `INPUT` 联合体键盘打包与 `VARIANT` 24 字节布局、UIA 空 pattern/panic 防护、虚拟屏绝对坐标归一化；Linux `send_key` 主键前置解析并倒序释放修饰键；两端 MCP stdio 改逐行读帧；macOS hit-test 去掉二次缩放、AX 返回值条件转换、agent socket SO_NOSIGPIPE/超时/unlink inode 校验；三端快照缓存去截图并加上限，click_count/pages clamp，mouse_button 非法值显式报错。 |
 | 2026-08-08 | Linux AT-SPI 文本能力检测 | Ubuntu 24.04 等 PyGObject 环境中的 `get_app_state`、`type_text` 和 `set_value` 不再因缺少非标准 `Accessible.is_text` / `is_editable_text` 属性而崩溃。 | Linux bridge 改为通过标准 `Accessible.get_interfaces()` 检测 `Text` / `EditableText`，并新增不依赖真实桌面的 Python 回归测试。 |
 
