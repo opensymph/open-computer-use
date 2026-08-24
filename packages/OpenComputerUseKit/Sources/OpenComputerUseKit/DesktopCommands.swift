@@ -291,8 +291,8 @@ public enum DesktopCommandRunner {
             } catch {
                 throw ComputerUseError.message("cannot write screenshot: \(error.localizedDescription)")
             }
-            let width = pngPixelWidth(pngData) ?? 0
-            let height = pngPixelHeight(pngData) ?? 0
+            let width = DesktopScreenshot.pngPixelWidth(pngData) ?? 0
+            let height = DesktopScreenshot.pngPixelHeight(pngData) ?? 0
             return "Saved \(width)x\(height) screenshot to \(url.path)"
         }
         return pngData.base64EncodedString()

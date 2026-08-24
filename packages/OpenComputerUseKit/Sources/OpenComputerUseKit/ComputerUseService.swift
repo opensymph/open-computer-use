@@ -1604,7 +1604,7 @@ public final class ComputerUseService {
         // The attribute payload comes from the target app; a success HRESULT
         // does not guarantee the advertised CF type, so a forced cast here
         // would trap on malformed providers.
-        return value as? AXUIElement
+        return axUIElement(from: value)
     }
 
     private func stringValue(of element: AXUIElement, attribute: String) -> String? {
@@ -1635,8 +1635,8 @@ public final class ComputerUseService {
         // Position/size payloads come from the target app; guard the CF type
         // instead of force-casting (a malformed provider would trap here and
         // take the whole server down).
-        guard let positionAXValue = positionValue as? AXValue,
-              let sizeAXValue = sizeValue as? AXValue
+        guard let positionAXValue = axValue(from: positionValue),
+              let sizeAXValue = axValue(from: sizeValue)
         else {
             return nil
         }
