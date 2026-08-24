@@ -72,6 +72,14 @@ enum OpenComputerUseMain {
         case .turnEnded:
             postOpenComputerUseTurnEndedNotification()
             print("turn-ended acknowledged")
+        case let .screenshot(output):
+            print(try DesktopCommandRunner.runScreenshot(outputPath: output))
+        case .cursorPosition:
+            print(try DesktopCommandRunner.runCursorPosition())
+        case let .input(action):
+            print(try DesktopCommandRunner.runInput(action))
+        case let .record(request):
+            print(try DesktopCommandRunner.runRecord(request))
         case let .help(command):
             print(openComputerUseHelpText(command: command))
         case .version:

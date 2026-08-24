@@ -428,6 +428,18 @@ private final class AppAgentConnection: @unchecked Sendable {
                     exitCode: output.hasToolError ? EXIT_FAILURE : EXIT_SUCCESS
                 )
 
+            case let .screenshot(output):
+                return CLIProxyResponse(stdout: try DesktopCommandRunner.runScreenshot(outputPath: output) + "\n", stderr: "", exitCode: EXIT_SUCCESS)
+
+            case .cursorPosition:
+                return CLIProxyResponse(stdout: try DesktopCommandRunner.runCursorPosition() + "\n", stderr: "", exitCode: EXIT_SUCCESS)
+
+            case let .input(action):
+                return CLIProxyResponse(stdout: try DesktopCommandRunner.runInput(action) + "\n", stderr: "", exitCode: EXIT_SUCCESS)
+
+            case let .record(request):
+                return CLIProxyResponse(stdout: try DesktopCommandRunner.runRecord(request) + "\n", stderr: "", exitCode: EXIT_SUCCESS)
+
             default:
                 return CLIProxyResponse(stdout: "", stderr: "Unsupported proxied command.\n", exitCode: EXIT_FAILURE)
             }

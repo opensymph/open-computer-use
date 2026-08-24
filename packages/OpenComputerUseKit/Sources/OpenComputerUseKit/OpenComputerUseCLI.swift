@@ -8,6 +8,10 @@ public enum OpenComputerUseCLICommand: Equatable {
     case snapshot(app: String, textLimit: SnapshotTextLimit = .defaults, treeLimits: AccessibilityTreeLimits = .defaults)
     case call(OpenComputerUseCallInvocation)
     case turnEnded(payload: String?)
+    case screenshot(output: String?)
+    case cursorPosition
+    case input(DesktopInputAction)
+    case record(DesktopRecordRequest)
     case help(command: String?)
     case version
 }
@@ -29,14 +33,18 @@ public func shouldUseMacOSAppAgentProxy(
         return false
     }
 
-    switch command {
-    case .launchOnboarding:
-        return !runningFromLaunchServicesAppInstance
-    case .mcp, .doctor, .listApps, .snapshot, .call:
-        return true
-    case .turnEnded, .help, .version:
-        return false
-    }
+        switch command {
+        case .launchOnboarding:
+            return !runningFromLaunchServicesAppInstance
+        case .mcp, .doctor, .listApps, .snapshot, .call:
+            return true
+        case .screenshot, .cursorPosition, .input, .record:
+            // Display-level commands ride the app agent too: the Screen
+            // Recording / Accessibility TCC grants belong to the app bundle.
+            return true
+        case .turnEnded, .help, .version:
+            return false
+        }
 }
 
 public struct OpenComputerUseCLIError: LocalizedError, Equatable {
@@ -86,6 +94,14 @@ public func parseOpenComputerUseCLI(arguments: [String]) throws -> OpenComputerU
         return try parseTurnEnded(arguments: Array(arguments.dropFirst()))
     case "snapshot":
         return try parseSnapshot(arguments: Array(arguments.dropFirst()))
+    case "screenshot":
+        return try parseScreenshot(arguments: Array(arguments.dropFirst()))
+    case "cursor-position":
+        return try parseSimpleCommand(name: "cursor-position", arguments: Array(arguments.dropFirst()), result: .cursorPosition)
+    case "input":
+        return try parseDesktopInput(arguments: Array(arguments.dropFirst()))
+    case "record":
+        return try parseDesktopRecord(arguments: Array(arguments.dropFirst()))
     default:
         if first.hasPrefix("-") {
             throw OpenComputerUseCLIError(message: "Unknown option: \(first)", helpCommand: nil)
@@ -112,6 +128,10 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
           snapshot <app>       Print the current accessibility snapshot for an app.
           call <tool>           Call one tool, or run a JSON array of tool calls.
           turn-ended           Notify the running MCP process that the host turn ended.
+          screenshot           Capture the whole desktop to PNG (Screen Recording permission).
+          cursor-position      Print the pointer position and desktop size as JSON.
+          input <action>       Global CGEvent input: move/click/drag/scroll/type/key/wait.
+          record <start|stop|status>  Record the screen with screencapture (experimental).
           help [command]       Show general or command-specific help.
           version              Print the CLI version.
 
@@ -122,6 +142,9 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
         Notes:
           Running without a command launches the permission onboarding app.
           Use `open-computer-use help <command>` for command-specific help.
+          The screenshot/cursor-position/input/record commands operate on the
+          whole desktop; input requires OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1
+          and the Accessibility permission, screenshot requires Screen Recording.
         """
     case "mcp":
         return """
@@ -186,6 +209,54 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
 
         Notify a running local MCP process that the current host turn has ended.
         Codex legacy notify appends the after-agent JSON payload as the last argument.
+        """
+    case "screenshot":
+        return """
+        Usage:
+          open-computer-use screenshot [--output <path.png>]
+
+        Capture the whole desktop (all displays) to PNG. With --output the PNG
+        is written to that path; otherwise base64 PNG is printed. Requires the
+        Screen Recording permission (run `open-computer-use doctor` to grant).
+        """
+    case "cursor-position":
+        return """
+        Usage:
+          open-computer-use cursor-position
+
+        Print the pointer position (top-left-origin desktop coordinates) and the
+        desktop size as JSON, mirroring the Linux/Windows runtimes' output.
+        """
+    case "input":
+        return """
+        Usage:
+          open-computer-use input <action> [options]
+
+        Actions (global synthetic input via CGEvent):
+          move <x> <y>
+          click [--button left|right|middle] [--count N] [--x X --y Y]
+          drag <from_x> <from_y> <to_x> <to_y> [--button left]
+          scroll <up|down|left|right> [--amount N]
+          type <text>
+          key <key-or-chord>          e.g. ctrl+s, Return, Page_Up
+          wait <seconds>
+
+        Every action except wait moves the real pointer/keyboard and requires
+        OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1 plus the Accessibility
+        permission (run `open-computer-use doctor` to grant).
+        """
+    case "record":
+        return """
+        Usage:
+          open-computer-use record start [--output <path.mov>] [--fps N] [--pidfile <path>]
+          open-computer-use record stop  [--pidfile <path>]
+          open-computer-use record status [--pidfile <path>]
+
+        Record the screen with /usr/sbin/screencapture (experimental; --fps is
+        accepted for parity but ignored). start runs screencapture detached;
+        stop sends SIGINT so the movie is finalized. Defaults: output in $TMPDIR,
+        pidfile $TMPDIR/open-computer-use-record.pid. Requires the Screen
+        Recording permission (run `open-computer-use doctor` to grant).
         """
     case "version":
         return """
@@ -329,6 +400,44 @@ private func parseSnapshot(arguments: [String]) throws -> OpenComputerUseCLIComm
             maxDepth: maxTreeDepth
         )
     )
+}
+
+private func parseScreenshot(arguments: [String]) throws -> OpenComputerUseCLICommand {
+    if arguments.count == 1, let option = arguments.first, option == "-h" || option == "--help" {
+        return .help(command: "screenshot")
+    }
+
+    var output: String?
+    var index = 0
+    while index < arguments.count {
+        let argument = arguments[index]
+        switch argument {
+        case "--output", "-o":
+            index += 1
+            guard index < arguments.count else {
+                throw OpenComputerUseCLIError(message: "--output requires a value", helpCommand: "screenshot")
+            }
+            output = arguments[index]
+        default:
+            throw OpenComputerUseCLIError(message: "unknown screenshot option: \(argument)", helpCommand: "screenshot")
+        }
+        index += 1
+    }
+    return .screenshot(output: output)
+}
+
+private func parseDesktopInput(arguments: [String]) throws -> OpenComputerUseCLICommand {
+    if arguments.count == 1, let option = arguments.first, option == "-h" || option == "--help" {
+        return .help(command: "input")
+    }
+    return .input(try parseDesktopInputArguments(arguments))
+}
+
+private func parseDesktopRecord(arguments: [String]) throws -> OpenComputerUseCLICommand {
+    if arguments.count == 1, let option = arguments.first, option == "-h" || option == "--help" {
+        return .help(command: "record")
+    }
+    return .record(try parseDesktopRecordArguments(arguments))
 }
 
 private func parseTextLimitOption(_ value: String, option: String) throws -> SnapshotTextLimit {
