@@ -38,6 +38,11 @@
 - `OpenComputerUse` 默认 app 模式会拉起 `PermissionOnboardingApp`。
 - app bundle 以 `LSUIElement` agent-style 形态运行，默认不在 Dock 暴露常驻图标，但仍可按需显示权限窗口。
 - 当用户从终端执行 macOS 版 `open-computer-use mcp`、`doctor`、`call`、`snapshot` 或 `list-apps` 时，CLI 会先通过 LaunchServices 启动同一个 `.app` bundle 的隐藏 app agent，并通过用户临时目录下的 Unix domain socket 转发请求；真正调用 Accessibility、ScreenCaptureKit 和动作 tools 的进程始终是 `Open Computer Use.app`，不是 iTerm / Terminal / Node launcher。
+- 2026-08-25 起 macOS 提供 **display 级命令**（`screenshot` / `cursor-position` / `input` / `record`，命令名、参数、输出结构与 Linux/Windows 端对齐，实现于 Kit 的 `DesktopCommands.swift`，解析为纯函数并有单测 `DesktopCommandTests.swift`）。这四条命令同样走 app agent 代理执行，因此 Screen Recording / Accessibility 的 TCC 授权落在 `.app` bundle 身份上；裸 CLI 构建则进程内执行并在权限缺失时报清晰错误（指引 `open-computer-use doctor` 或系统设置）。平台细节：
+  - `screenshot [--output x.png]`：逐显示器 `CGDisplayCreateImage` 后按 Quartz global bounds 合成到整桌面画布（多屏合成、1x 输出），PNG 写文件或 base64 打印；执行前 `CGPreflightScreenCaptureAccess()` 预检。
+  - `cursor-position`：`CGEvent(source: nil).location` 报告指针在左上原点桌面坐标系的位置 + 桌面联合尺寸，输出与 Linux/Windows 端同构 JSON。
+  - `input <move|click|drag|scroll|type|key|wait>`：CGEvent 投递到 `.cghidEventTap`（复用 `KeyPressParser`/`keyboardUnicodeChunks`）；新增独立门控 `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1`（默认关闭，语义对齐 Linux `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS` / Windows `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT`），开启后还要求 Accessibility 权限；`wait` 免门控。
+  - `record <start|stop|status>`（实验性）：`/usr/sbin/screencapture -v` detach 录屏（`.mov`），pidfile + SIGINT 停止收尾；`--fps` 仅为跨平台一致性接受、macOS 忽略。
 - CLI 与 MCP proxy 会把调用进程中 `OPEN_COMPUTER_USE_*` 前缀的环境变量随请求转发给 app agent，并只在该请求执行期间临时覆盖 agent 环境；这让 `click_method=global` 的进程级安全门和 debug 开关在 app-agent 架构下仍按调用方配置生效。
 - 主窗口负责渲染 `Accessibility` / `Screen & System Audio Recording` 两类权限卡片、`Allow` / `Done` 状态和 relaunch 后的状态收敛；当两项权限都已完成时会自动关闭，不再要求用户手动退出。
 - 辅助 drag panel 会跳转到对应的 `System Settings` 页面；点击 `Allow` 后，panel 会从主窗口里的按钮位置做一段 spring + curved frame 的入场，再落到 `System Settings` 内容区下沿。panel 默认保持在窗口右侧内容区下方居中并固定贴近窗口底边，不再依赖实时扫描权限页内部 `+ / -` 控件行；窗口层级上会显式排在当前 `System Settings` 窗口之上，避免被权限列表内容盖住，同时尽量减少对系统设置自身滚动区域的干扰。panel 内也补了显式返回按钮，允许用户中断当前 guidance、回到 onboarding 主窗口重新选择权限步骤。
@@ -112,6 +117,11 @@
 - 2026-08-23 ABI/可靠性修复（评审驱动）：`INPUT` 联合体键盘打包修正（x64 下 `ki.wVk/wScan` 叠在 `mi.dx`、`ki.dwFlags` 叠在 `mi.dy`，旧写法把 scan 写进 flags 且真 flags 落进 padding 丢失，`input_method=global` 的 `press_key`/`type_text` 静默失效）；`SendInput` 返回注入条数并校验（不足即报 `SendInput injected N of M events`，不再静默丢弃）；`oleVariant` 补齐到 x64 VARIANT 的 24 字节（原 16 字节会被 COM 出参越界写 8 字节）；UIA `GetCurrentPattern` 空指针分支补 nil 检查 + UIA 线程 job 加 recover（panic 降级为 error）；绝对坐标归一化改用虚拟屏幕（`SM_X/Y/CX/CYVIRTUALSCREEN` + `MOUSEEVENTF_VIRTUALDESK`，多屏/负坐标原点正确，原实现按主屏归一化导致副屏坐标错位）；MCP stdio 改逐行读帧（坏帧回一条 -32700 后继续服务，流式 `json.Decoder` 坏帧后永不消费输入、100% CPU 空转）；快照缓存只存去截图副本并限 16 条；`click_count`/`pages` 服务层 clamp（≤100/≤1000）。以上均有单测钉住（`native_abi_test.go`）。
 - 截图链：`Windows.Graphics.Capture`（native_capture.go 纯 Go 实现，D3D11 staging texture 读取，per-HWND FramePool/session 缓存 + 尺寸变化重建 + 失效窗口清理，1903+ 起 `put_IsCursorCaptureEnabled(false)` 使截图不含系统光标）→ `PrintWindow(PW_RENDERFULLCONTENT)` → GDI `CopyFromScreen`；生产路径在牺牲子进程中执行（隐藏 `capture` 子命令）。WGC 可截取被遮挡窗口的本体内容（与官方行为对齐；GDI 路径截到的是遮挡物）。`OPEN_COMPUTER_USE_WINDOWS_CAPTURE=wgc|print|gdi|auto`（默认 auto）可强制单一模式，强制模式失败直接报错；auto 链逐级降级，全黑采样帧视为失败（参考 Linux runtime 的省略 image 行为）。
 - 官方文档实档对齐（2026-08-23，参照本机 Windows Store 版 Codex app 内置插件的 docs/api.md 与 docs/guidance.md）：`get_window_state` 的 `accessibility.document_text`（最相关 Document 元素的值，回退 Edit，走 text_limit 管线）与 `accessibility.selected_elements`（当前处于选中态的 SelectionItem 元素的树格式行，实机验证能抓到 Notepad 选中的 tab 项）已实现；方法面 13/13 全命中（我们另多 legacy get_app_state）。`list_apps` 的 `lastUsedDate`/`useCount` 为官方可选字段（"when available"），Windows 无对应数据源，选择省略。尚未对齐（留档）：输入方法自动激活目标窗口（官方为前台 SendInput 模型，我们默认后台不抢焦点）、多张有界截图（transient UI/模态分层）、SnapshotLease 事件式失效、官方 guidance 硬拒清单中的 Run 对话框/认证对话框/设置页 deny。
+- 2026-08-25 起 Windows runtime 提供与 Linux 端同名的 **display 级命令**（命令名、参数、输出 JSON 结构逐项对齐，见 Linux Runtime 一节的命令面说明）：
+  - `open-computer-use.exe screenshot [--output x.png]`：GDI `BitBlt` 读取整个虚拟桌面（`SM_X/Y/CX/CYVIRTUALSCREEN`，含所有显示器）为 PNG；复用按窗口截图链的 `captureGDIRegion`，BGRA→NRGBA 转换后 `png.Encode`。
+  - `open-computer-use.exe cursor-position`：`GetCursorPos` + 虚拟桌面尺寸，输出与 Linux 端同构的 `{x, y, screen_width, screen_height}` JSON。
+  - `open-computer-use.exe input <move|click|drag|scroll|type|key|wait>`：复用 `input_method=global` 的 SendInput 层（`realMouseMove`/`realMouseClick`/`realKeyChord` 等），与 tool 面共用 `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1` 门禁；`input key` 同样执行 Windows/Meta 键硬拒。命令构造在 `desktop.go` 纯函数化并有单测。
+  - `open-computer-use.exe record <start|stop|status>`（实验性）：`ffmpeg -f gdigrab` 录整屏为 H.264 mp4。`start` 以 `CREATE_NEW_CONSOLE|CREATE_NEW_PROCESS_GROUP`（隐藏窗口）detach ffmpeg 并写 pidfile；`stop` 通过 `AttachConsole` + `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` 让 ffmpeg 优雅收尾（mp4 moov 落盘可播放），console 舞步不可行时硬终止并明确警告产物可能不可播放；`ffmpeg` 缺失时明确报错。
 - Windows UI Automation 需要运行在已登录用户的桌面 session 里。通过 SSH 作为脱离桌面的后台进程运行时，`open-computer-use.exe` 可以启动并返回 JSON，但系统可能不给它暴露顶层窗口；这种情况下 `list_apps` 会是空，`get_app_state` 可能返回 `appNotFound(...)`。
 - 当前 Windows 侧仍是功能性第一版：没有 visual cursor overlay、没有 installer/onboarding、没有 code signing，也没有独立的 Windows smoke fixture。
 
@@ -125,7 +135,7 @@
 - `get_app_state` 的 accessibility tree 在 GTK/GNOME app 上可能很深，Linux bridge 使用与 macOS / Windows 一致的 1200 节点、64 层默认 tree budget，并支持显式提高 `max_tree_nodes` / `max_tree_depth`。截图是 X11 root window 的 best-effort capture；GNOME Wayland / rootless XWayland 下读取会失败或返回黑图，bridge 会静默省略 image block（黑图经 16×16 网格采样判定）。
 - 这 9 个 tool 的协议面与 macOS / Windows 保持一致：`list_apps`、`get_app_state`、`click`、`perform_secondary_action`、`scroll`、`drag`、`type_text`、`press_key`、`set_value`。其中 element-targeted action 会优先复用上一轮 `get_app_state` 的 runtime path metadata，coordinate action 使用 screenshot/window-relative 坐标。
 - Linux `click_method=accessibility` 映射到 AT-SPI action，`global` 映射到 AT-SPI mouse synthesis 并要求全局指针环境变量；AT-SPI 没有等价的进程定向 mouse dispatch，因此 `app_post` 和 macOS-only 的 `sky_click` 会在 snapshot lookup 前明确返回 unsupported。`auto` 仍保持 AT-SPI action 优先、mouse synthesis fallback 的现有行为。
-- 除了 9 个 AT-SPI2 工具外，Linux runtime 还提供一组 **display 级 X11 命令**，对齐 Cloud Agent / VNC 宿主那套「xdotool + ffmpeg + x11grab」栈，用来补齐 AT-SPI 覆盖不到的整屏操控与录制能力（AT-SPI 工具仍保持按 app、非侵入）：
+- 除了 9 个 AT-SPI2 工具外，Linux runtime 还提供一组 **display 级 X11 命令**，对齐 Cloud Agent / VNC 宿主那套「xdotool + ffmpeg + x11grab」栈，用来补齐 AT-SPI 覆盖不到的整屏操控与录制能力（AT-SPI 工具仍保持按 app、非侵入）。2026-08-25 起这套命令面（`screenshot`/`cursor-position`/`input`/`record` 的命令名、参数与输出 JSON 结构）已由 Windows 与 macOS runtime 对齐实现（各平台后端差异见上文 Windows Runtime 与 App Mode 层小节）：
   - `open-computer-use screenshot [--display :N] [--output x.png]`：纯 Go（xgb）读取整个 X11 root window（含所有显示器）为 PNG，复用与按窗口截图相同的 ZPixmap 解码；不带 `--output` 时向 stdout 打印 base64 PNG。
   - `open-computer-use cursor-position [--display :N]`：纯 Go（xgb `QueryPointer`）返回指针坐标与屏幕尺寸的 JSON。
   - `open-computer-use input <move|click|drag|scroll|type|key|wait> [--display :N]`：通过 `xdotool` 做**全局**合成输入（会移动真实指针 / 键盘、可能改变前台焦点）。除 `wait` 外都需要 `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`，与既有 `click_method=global` 共用同一道进程级安全门；命令构造是纯函数、单测覆盖，`xdotool` 缺失时明确报错而不是静默成功。
@@ -166,3 +176,11 @@
   - `open-computer-use cursor-position --display :1`
   - `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 open-computer-use input move 960 600 --display :1`（再用 `cursor-position` 验证指针已移动）
   - `open-computer-use record start --display :1 --output /tmp/rec.mp4 && sleep 2 && open-computer-use record stop`（用 `ffprobe /tmp/rec.mp4` 验证产物）
+- Windows display 级命令手工验证（2026-08-25 本机已跑通）：
+  - `open-computer-use.exe screenshot --output %TEMP%\shot.png`、`open-computer-use.exe cursor-position`
+  - `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1 open-computer-use.exe input move 200 300`（`cursor-position` 验证指针移动）
+  - `open-computer-use.exe record start --fps 10 --output %TEMP%\rec.mp4 && sleep 4 && open-computer-use.exe record stop`（`ffprobe` 验证 mp4 时长/moov 落盘）
+- macOS display 级命令手工验证（需要 macOS 桌面 + Screen Recording / Accessibility 授权）：
+  - `open-computer-use screenshot --output /tmp/shot.png`、`open-computer-use cursor-position`
+  - `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1 open-computer-use input move 960 600`（再用 `cursor-position` 验证指针已移动）
+  - `open-computer-use record start --output /tmp/rec.mov && sleep 2 && open-computer-use record stop`

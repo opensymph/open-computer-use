@@ -97,27 +97,41 @@ npx skills add opensymph/open-computer-use -g -a claude-code --skill open-comput
 
 | Platform | Runtime | Notes |
 | --- | --- | --- |
-| macOS | Swift | Visual cursor, permission onboarding, `sky_click` background clicks. |
-| Windows | Go, single exe | UI Automation + Win32, process-isolated operations, full window2 API. |
-| Linux | Go, single binary | Native AT-SPI2 over D-Bus; plus display-level X11 commands (see below). |
+| macOS | Swift | Visual cursor, permission onboarding, `sky_click` background clicks; display-level desktop commands (see below). |
+| Windows | Go, single exe | UI Automation + Win32, process-isolated operations, full window2 API; display-level desktop commands (see below). |
+| Linux | Go, single binary | Native AT-SPI2 over D-Bus; display-level X11 commands (see below). |
 
-### Linux display-level commands
+### Display-level desktop commands (all platforms)
 
-Beyond the AT-SPI tools, the Linux runtime ships a few whole-display X11 commands that mirror the classic `xdotool` / `ffmpeg x11grab` desktop stack — handy for headless VNC desktops where you want to capture or drive the entire screen rather than a single app:
+Every runtime ships the same whole-desktop CLI commands that mirror the classic `xdotool` / `ffmpeg` desktop stack — same command names, flags, and JSON output on macOS, Windows, and Linux — handy for headless VNC desktops or full-screen observation where you want to capture or drive the entire screen rather than a single app:
 
 ```bash
-open-computer-use screenshot --display :1 --output shot.png   # full-screen PNG (pure Go X11)
-open-computer-use cursor-position --display :1                # pointer x/y + screen size (JSON)
-open-computer-use record start --display :1 --output rec.mp4  # ffmpeg x11grab → H.264 mp4
+open-computer-use screenshot --output shot.png   # whole-desktop PNG (base64 to stdout without --output)
+open-computer-use cursor-position                # pointer x/y + desktop size (JSON, identical shape)
+open-computer-use record start --output rec.mp4  # screen recording → H.264 mp4 (Linux/Windows) / .mov (macOS)
 open-computer-use record stop
-# global synthetic input (moves the real pointer/keyboard) — opt-in gate required:
-OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 \
-  open-computer-use input click --x 960 --y 600 --display :1
-OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 \
-  open-computer-use input type "hello" --display :1
+open-computer-use record status
 ```
 
-`screenshot` and `cursor-position` are read-only pure-Go X11. `input` needs `xdotool` and `record` needs `ffmpeg` on `PATH`; `input` also requires `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` because it drives the real pointer/keyboard. These are CLI-only and Linux-only; the AT-SPI MCP tool surface is unchanged.
+`screenshot` and `cursor-position` are read-only. Per-platform notes:
+
+| | Linux | Windows | macOS |
+| --- | --- | --- | --- |
+| screenshot | pure-Go X11 read, `--display :N` | GDI read of the whole virtual desktop | per-display capture composited over the desktop bounds (Screen Recording permission) |
+| cursor-position | X11 `QueryPointer` | `GetCursorPos` + virtual screen | CGEvent pointer in top-left desktop coordinates |
+| input backend | `xdotool` (needs PATH) | SendInput | CGEvent to the HID tap (Accessibility permission) |
+| input gate | `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` | `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1` | `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1` |
+| record backend | `ffmpeg x11grab` (needs PATH) | `ffmpeg gdigrab` (needs PATH, experimental) | `/usr/sbin/screencapture -v` (experimental; `--fps` ignored) |
+
+The Linux commands accept `--display` (defaults `$DISPLAY`, then `:0`; a VNC/AnyOS desktop is usually `:1`); Windows and macOS operate on the whole desktop and have no `--display`. Global synthetic input moves the real pointer/keyboard, so each platform gates it behind its own opt-in flag (default off):
+
+```bash
+OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 open-computer-use input click --x 960 --y 600   # Linux
+OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1 open-computer-use.exe input type "hello"       # Windows
+OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1 open-computer-use input key ctrl+s                # macOS
+```
+
+These commands are CLI-only and never touch the official 14-tool MCP surface.
 
 ## Documentation
 

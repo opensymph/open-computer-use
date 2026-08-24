@@ -97,9 +97,13 @@ npx skills add opensymph/open-computer-use -g -a claude-code --skill open-comput
 
 | 平台 | 运行时 | 说明 |
 | --- | --- | --- |
-| macOS | Swift | 视觉光标、权限引导、`sky_click` 后台点击。 |
-| Windows | Go 单 exe | UI Automation + Win32，操作进程隔离，完整 window2 API。 |
-| Linux | Go 单二进制 | 原生 AT-SPI2 over D-Bus，零运行时依赖。 |
+| macOS | Swift | 视觉光标、权限引导、`sky_click` 后台点击；含显示级桌面命令（见英文 README）。 |
+| Windows | Go 单 exe | UI Automation + Win32，操作进程隔离，完整 window2 API；含显示级桌面命令（见英文 README）。 |
+| Linux | Go 单二进制 | 原生 AT-SPI2 over D-Bus，零运行时依赖；含显示级 X11 命令（见英文 README）。 |
+
+### 显示级桌面命令（三平台）
+
+三个运行时提供同一套整屏 CLI 命令（命令名、参数、JSON 输出对齐，详见英文 README 的 "Display-level desktop commands"）：`screenshot` 整屏 PNG、`cursor-position` 指针坐标 JSON、`input` 全局合成输入（每平台独立环境变量门控，默认关闭：Linux `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`、Windows `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1`、macOS `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1`）、`record start/stop/status` 录屏（Linux/Windows 走 ffmpeg x11grab/gdigrab，macOS 走 `screencapture -v`，实验性）。这些是 CLI-only，不进入官方对齐的 14 个 MCP tool 面。
 
 ## 文档
 
