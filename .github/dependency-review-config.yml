@@ -10,4 +10,5 @@ allow-licenses:
 deny-licenses: []
 allow-dependencies-licenses: []
 deny-dependencies-licenses: []
-fail-on-scopes: ""
+# fail-on-scopes omitted: the empty string is not a valid scope and made
+# dependency-review fail; the action default (runtime) applies.
