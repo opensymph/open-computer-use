@@ -131,7 +131,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
           screenshot           Capture the whole desktop to PNG (Screen Recording permission).
           cursor-position      Print the pointer position and desktop size as JSON.
           input <action>       Global CGEvent input: move/click/drag/scroll/type/key/wait.
-          record <start|stop|status>  Record the screen with screencapture (experimental).
+          record <start|stop|discard|status>  Record the screen with ffmpeg (preferred) or screencapture.
           help [command]       Show general or command-specific help.
           version              Print the CLI version.
 
@@ -248,15 +248,20 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
     case "record":
         return """
         Usage:
-          open-computer-use record start [--output <path.mov>] [--fps N] [--pidfile <path>]
-          open-computer-use record stop  [--pidfile <path>]
+          open-computer-use record start [--output <path.mp4|.mov>] [--fps N]
+                                         [--quality demo|draft|proxy] [--draw-mouse 0|1] [--pidfile <path>]
+          open-computer-use record stop  [--pidfile <path>] [--save-as <name-or-path>]
+          open-computer-use record discard [--pidfile <path>]
           open-computer-use record status [--pidfile <path>]
 
-        Record the screen with /usr/sbin/screencapture (experimental; --fps is
-        accepted for parity but ignored). start runs screencapture detached;
-        stop sends SIGINT so the movie is finalized. Defaults: output in $TMPDIR,
-        pidfile $TMPDIR/open-computer-use-record.pid. Requires the Screen
-        Recording permission (run `open-computer-use doctor` to grant).
+        Record the screen. Prefers ffmpeg avfoundation when ffmpeg is on PATH
+        (same demo-quality H.264 mp4 encode as Linux/Windows / Cursor RecordScreen:
+        veryfast + crf 17 + High + faststart). Falls back to /usr/sbin/screencapture
+        -v (.mov; --fps/--quality/--draw-mouse ignored). discard stops and deletes
+        the output. Defaults: fps 30, quality demo, draw-mouse 1, output in $TMPDIR,
+        pidfile $TMPDIR/open-computer-use-record.pid. Requires Screen Recording
+        permission (run `open-computer-use doctor` to grant). Override the
+        avfoundation device with OPEN_COMPUTER_USE_AVFOUNDATION_SCREEN.
         """
     case "version":
         return """

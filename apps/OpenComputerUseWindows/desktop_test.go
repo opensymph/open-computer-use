@@ -2,6 +2,7 @@ package main
 
 import (
 	"image/color"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -175,18 +176,68 @@ func TestRunInputCommandGate(t *testing.T) {
 }
 
 func TestBuildFfmpegRecordArgs(t *testing.T) {
-	got := buildFfmpegRecordArgs("C:\\tmp\\out.mp4", 60)
+	got := buildFfmpegRecordArgs(`C:\tmp\out.mp4`, recordOptions{
+		fps: 60, quality: "demo", drawMouse: 0, videoSize: "1920x1080",
+	})
 	want := []string{
-		"-nostdin", "-y", "-f", "gdigrab",
-		"-framerate", "60", "-i", "desktop",
-		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-		"C:\\tmp\\out.mp4",
+		"-nostdin", "-y",
+		"-video_size", "1920x1080",
+		"-framerate", "60",
+		"-draw_mouse", "0",
+		"-f", "gdigrab",
+		"-i", "desktop",
+		"-vf", "scale=1920:-2:flags=lanczos,fps=60",
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-crf", "17",
+		"-pix_fmt", "yuv420p",
+		"-profile:v", "high",
+		"-movflags", "+faststart",
+		"-tune", "fastdecode",
+		`C:\tmp\out.mp4`,
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("ffmpeg args = %v, want %v", got, want)
+		t.Fatalf("demo ffmpeg args = %#v, want %#v", got, want)
 	}
-	if got := buildFfmpegRecordArgs("x.mp4", 0); got[5] != "30" {
-		t.Fatalf("fps<=0 should default to 30, got framerate %q", got[5])
+
+	draft := buildFfmpegRecordArgs("x.mp4", recordOptions{fps: 0, quality: "draft", drawMouse: 1})
+	if !reflect.DeepEqual(draft, []string{
+		"-nostdin", "-y",
+		"-framerate", "30",
+		"-draw_mouse", "1",
+		"-f", "gdigrab",
+		"-i", "desktop",
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-pix_fmt", "yuv420p",
+		"x.mp4",
+	}) {
+		t.Fatalf("draft ffmpeg args = %#v", draft)
+	}
+}
+
+func TestNormalizeRecordQuality(t *testing.T) {
+	got, err := normalizeRecordQuality("")
+	if err != nil || got != "demo" {
+		t.Fatalf("default quality = %q, %v", got, err)
+	}
+	if _, err := normalizeRecordQuality("nope"); err == nil {
+		t.Fatal("expected invalid quality to fail")
+	}
+}
+
+func TestRelocateRecordOutput(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "raw.mp4")
+	if err := os.WriteFile(src, []byte("mp4"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := relocateRecordOutput(src, "saved")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(dst) != "saved.mp4" {
+		t.Fatalf("dst = %q", dst)
 	}
 }
 

@@ -108,8 +108,9 @@ Every runtime ships the same whole-desktop CLI commands that mirror the classic 
 ```bash
 open-computer-use screenshot --output shot.png   # whole-desktop PNG (base64 to stdout without --output)
 open-computer-use cursor-position                # pointer x/y + desktop size (JSON, identical shape)
-open-computer-use record start --output rec.mp4  # screen recording → H.264 mp4 (Linux/Windows) / .mov (macOS)
-open-computer-use record stop
+open-computer-use record start --output rec.mp4 --fps 60 --quality demo  # H.264 mp4 (RecordScreen-aligned encode)
+open-computer-use record stop --save-as demo-take
+open-computer-use record discard                 # stop + delete (Cursor RecordScreen DISCARD parity)
 open-computer-use record status
 ```
 
@@ -121,7 +122,8 @@ open-computer-use record status
 | cursor-position | X11 `QueryPointer` | `GetCursorPos` + virtual screen | CGEvent pointer in top-left desktop coordinates |
 | input backend | `xdotool` (needs PATH) | SendInput | CGEvent to the HID tap (Accessibility permission) |
 | input gate | `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` | `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1` | `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1` |
-| record backend | `ffmpeg x11grab` (needs PATH) | `ffmpeg gdigrab` (needs PATH, experimental) | `/usr/sbin/screencapture -v` (experimental; `--fps` ignored) |
+| record backend | `ffmpeg x11grab` (needs PATH) | `ffmpeg gdigrab` (needs PATH) | prefers `ffmpeg avfoundation` when on PATH; falls back to `/usr/sbin/screencapture -v` |
+| record quality | `--quality demo` (default: veryfast/crf17/High/faststart, RecordScreen-aligned) or `draft` (ultrafast); `--fps`, `--draw-mouse 0\|1`, `discard`, `stop --save-as` | same | same flags; ffmpeg path honors them, screencapture fallback ignores `--fps`/`--quality`/`--draw-mouse` |
 
 The Linux commands accept `--display` (defaults `$DISPLAY`, then `:0`; a VNC/AnyOS desktop is usually `:1`); Windows and macOS operate on the whole desktop and have no `--display`. Global synthetic input moves the real pointer/keyboard, so each platform gates it behind its own opt-in flag (default off):
 

@@ -42,20 +42,40 @@ public struct DesktopRecordRequest: Equatable, Sendable {
     public enum Subcommand: String, Equatable, Sendable {
         case start
         case stop
+        case discard
         case status
     }
 
     public let subcommand: Subcommand
     public let output: String?
-    /// Accepted for cross-platform parity; `screencapture` picks its own rate.
+    /// Honored when ffmpeg is available (avfoundation). Ignored by the
+    /// `/usr/sbin/screencapture -v` fallback.
     public let fps: Int
     public let pidfile: String?
+    /// `demo` (default) matches Cursor RecordScreen encode settings when
+    /// ffmpeg is used; `draft` keeps ultrafast. Ignored by screencapture.
+    public let quality: String
+    /// Whether to burn the OS cursor into the capture (ffmpeg only).
+    public let drawMouse: Int
+    /// Optional rename target for `record stop --save-as`.
+    public let saveAs: String?
 
-    public init(subcommand: Subcommand, output: String?, fps: Int, pidfile: String?) {
+    public init(
+        subcommand: Subcommand,
+        output: String?,
+        fps: Int,
+        pidfile: String?,
+        quality: String = "demo",
+        drawMouse: Int = 1,
+        saveAs: String? = nil
+    ) {
         self.subcommand = subcommand
         self.output = output
         self.fps = fps
         self.pidfile = pidfile
+        self.quality = quality
+        self.drawMouse = drawMouse
+        self.saveAs = saveAs
     }
 }
 
@@ -229,14 +249,14 @@ public func parseDesktopInputArguments(_ arguments: [String]) throws -> DesktopI
     }
 }
 
-/// Parses `record <start|stop|status> [options]`.
+/// Parses `record <start|stop|discard|status> [options]`.
 public func parseDesktopRecordArguments(_ arguments: [String]) throws -> DesktopRecordRequest {
     guard let subcommandName = arguments.first else {
-        throw OpenComputerUseCLIError(message: "record requires a subcommand: start, stop, or status")
+        throw OpenComputerUseCLIError(message: "record requires a subcommand: start, stop, discard, or status")
     }
     let subcommand: DesktopRecordRequest.Subcommand
     switch subcommandName {
-    case "start", "stop", "status":
+    case "start", "stop", "discard", "status":
         subcommand = DesktopRecordRequest.Subcommand(rawValue: subcommandName)!
     default:
         throw OpenComputerUseCLIError(message: "unknown record subcommand: \(subcommandName)")
@@ -245,6 +265,9 @@ public func parseDesktopRecordArguments(_ arguments: [String]) throws -> Desktop
     var output: String?
     var fps = 30
     var pidfile: String?
+    var quality = "demo"
+    var drawMouse = 1
+    var saveAs: String?
     let rest = Array(arguments.dropFirst())
     var index = 0
     while index < rest.count {
@@ -258,7 +281,7 @@ public func parseDesktopRecordArguments(_ arguments: [String]) throws -> Desktop
         case "--fps":
             index += 1
             guard index < rest.count, let parsed = Int(rest[index]), parsed >= 1 else {
-                throw OpenComputerUseCLIError(message: "--fps requires a positive integer (accepted for parity; ignored on macOS)")
+                throw OpenComputerUseCLIError(message: "--fps requires a positive integer")
             }
             fps = parsed
         case "--pidfile":
@@ -267,13 +290,48 @@ public func parseDesktopRecordArguments(_ arguments: [String]) throws -> Desktop
                 throw OpenComputerUseCLIError(message: "--pidfile requires a value")
             }
             pidfile = rest[index]
+		case "--quality":
+			index += 1
+			guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--quality requires a value (demo, draft, or proxy)")
+            }
+            switch rest[index].lowercased() {
+            case "demo", "high":
+                quality = "demo"
+            case "draft", "low":
+                quality = "draft"
+            case "proxy":
+                quality = "proxy"
+            default:
+                throw OpenComputerUseCLIError(message: "invalid --quality \"\(rest[index])\" (demo, draft, or proxy)")
+            }
+        case "--draw-mouse":
+            index += 1
+            guard index < rest.count, rest[index] == "0" || rest[index] == "1", let parsed = Int(rest[index]) else {
+                throw OpenComputerUseCLIError(message: "--draw-mouse requires 0 or 1")
+            }
+            drawMouse = parsed
+        case "--save-as":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--save-as requires a value")
+            }
+            saveAs = rest[index]
         default:
             throw OpenComputerUseCLIError(message: "unknown record option: \(rest[index])")
         }
         index += 1
     }
 
-    return DesktopRecordRequest(subcommand: subcommand, output: output, fps: fps, pidfile: pidfile)
+    return DesktopRecordRequest(
+        subcommand: subcommand,
+        output: output,
+        fps: fps,
+        pidfile: pidfile,
+        quality: quality,
+        drawMouse: drawMouse,
+        saveAs: saveAs
+    )
 }
 
 // MARK: - Runner
@@ -324,13 +382,15 @@ public enum DesktopCommandRunner {
         }
     }
 
-    /// `record <start|stop|status>`.
+    /// `record <start|stop|discard|status>`.
     public static func runRecord(_ request: DesktopRecordRequest) throws -> String {
         switch request.subcommand {
         case .start:
-            return try DesktopRecord.start(outputPath: request.output)
+            return try DesktopRecord.start(request)
         case .stop:
-            return try DesktopRecord.stop(pidfilePath: request.pidfile)
+            return try DesktopRecord.stop(pidfilePath: request.pidfile, saveAs: request.saveAs)
+        case .discard:
+            return try DesktopRecord.discard(pidfilePath: request.pidfile)
         case .status:
             return try DesktopRecord.status(pidfilePath: request.pidfile)
         }
@@ -686,6 +746,29 @@ enum DesktopRecord {
     struct RecordState: Codable {
         let pid: Int32
         let output: String
+        let backend: String?
+        let fps: Int?
+        let quality: String?
+        let drawMouse: Int?
+        let startedAt: String?
+
+        init(
+            pid: Int32,
+            output: String,
+            backend: String? = nil,
+            fps: Int? = nil,
+            quality: String? = nil,
+            drawMouse: Int? = nil,
+            startedAt: String? = nil
+        ) {
+            self.pid = pid
+            self.output = output
+            self.backend = backend
+            self.fps = fps
+            self.quality = quality
+            self.drawMouse = drawMouse
+            self.startedAt = startedAt
+        }
     }
 
     static func defaultPidfilePath() -> String {
@@ -695,59 +778,172 @@ enum DesktopRecord {
             .path
     }
 
-    static func defaultOutputPath() -> String {
+    static func defaultOutputPath(preferMP4: Bool) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        let name = "open-computer-use-recording-\(formatter.string(from: Date())).mov"
+        let ext = preferMP4 ? "mp4" : "mov"
+        let name = "open-computer-use-recording-\(formatter.string(from: Date())).\(ext)"
         return FileManager.default.temporaryDirectory
             .appendingPathComponent(name)
             .standardizedFileURL
             .path
     }
 
-    @discardableResult
-    static func start(outputPath: String?) throws -> String {
-        let pidfilePath = defaultPidfilePath()
-        if let state = readState(pidfilePath: pidfilePath), processAlive(state.pid) {
-            throw ComputerUseError.message("recording already running (pid \(state.pid), output \(state.output)); run 'record stop' first")
+    static func buildFfmpegAvfoundationArgs(
+        output: String,
+        fps: Int,
+        quality: String,
+        drawMouse: Int,
+        screenDevice: String
+    ) -> [String] {
+        let resolvedFPS = fps > 0 ? fps : 30
+        let cursor = (drawMouse == 0) ? "0" : "1"
+        var args: [String] = [
+            "-nostdin", "-y",
+            "-f", "avfoundation",
+            "-framerate", "\(resolvedFPS)",
+            "-capture_cursor", cursor,
+            "-i", screenDevice,
+        ]
+        args += ["-c:v", "libx264"]
+        switch quality {
+        case "draft":
+            args += ["-preset", "ultrafast", "-pix_fmt", "yuv420p"]
+        case "proxy":
+            args += [
+                "-preset", "veryfast",
+                "-crf", "17",
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "high",
+                "-x264-params", "keyint=1:min-keyint=1:scenecut=0:bframes=0",
+                "-movflags", "+faststart",
+                "-tune", "fastdecode",
+            ]
+        default:
+            args += [
+                "-preset", "veryfast",
+                "-crf", "17",
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "high",
+                "-movflags", "+faststart",
+                "-tune", "fastdecode",
+            ]
         }
+        args.append(output)
+        return args
+    }
 
-        let screenCaptureURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        guard FileManager.default.isExecutableFile(atPath: screenCaptureURL.path) else {
-            throw ComputerUseError.message("screencapture is required for screen recording but was not found at /usr/sbin/screencapture")
+    static func resolveFfmpegURL() -> URL? {
+        let candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
         }
-
-        let output = outputPath ?? defaultOutputPath()
+        // Fall back to PATH lookup via /usr/bin/env.
         let process = Process()
-        process.executableURL = screenCaptureURL
-        process.arguments = ["-v", output]
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        process.arguments = ["ffmpeg"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+        guard process.terminationStatus == 0 else {
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let path = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !path.isEmpty,
+            FileManager.default.isExecutableFile(atPath: path)
+        else {
+            return nil
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    @discardableResult
+    static func start(_ request: DesktopRecordRequest) throws -> String {
+        let pidfilePath = request.pidfile ?? defaultPidfilePath()
+        if let state = readState(pidfilePath: pidfilePath), processAlive(state.pid) {
+            throw ComputerUseError.message(
+                "recording already running (pid \(state.pid), output \(state.output)); run 'record stop' or 'record discard' first"
+            )
+        }
+
+        let ffmpegURL = resolveFfmpegURL()
+        let preferMP4 = ffmpegURL != nil
+        let output = request.output ?? defaultOutputPath(preferMP4: preferMP4)
         let logURL = URL(fileURLWithPath: output + ".log")
         guard FileManager.default.createFile(atPath: logURL.path, contents: nil),
-              let logHandle = try? FileHandle(forWritingTo: logURL) else {
+              let logHandle = try? FileHandle(forWritingTo: logURL)
+        else {
             throw ComputerUseError.message("cannot create recording log at \(logURL.path)")
         }
         defer { try? logHandle.close() }
+
+        let process = Process()
+        let backend: String
+        if let ffmpegURL {
+            backend = "ffmpeg-avfoundation"
+            process.executableURL = ffmpegURL
+            let screenDevice = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_AVFOUNDATION_SCREEN"]
+                ?? "Capture screen 0"
+            process.arguments = buildFfmpegAvfoundationArgs(
+                output: output,
+                fps: request.fps,
+                quality: request.quality,
+                drawMouse: request.drawMouse,
+                screenDevice: screenDevice
+            )
+        } else {
+            backend = "screencapture"
+            let screenCaptureURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            guard FileManager.default.isExecutableFile(atPath: screenCaptureURL.path) else {
+                throw ComputerUseError.message(
+                    "ffmpeg (preferred) or /usr/sbin/screencapture is required for screen recording"
+                )
+            }
+            process.executableURL = screenCaptureURL
+            process.arguments = ["-v", output]
+        }
+
         process.standardOutput = logHandle
         process.standardError = logHandle
         do {
             try process.run()
         } catch {
-            throw ComputerUseError.message("cannot start screencapture: \(error.localizedDescription)")
+            throw ComputerUseError.message("cannot start recorder (\(backend)): \(error.localizedDescription)")
         }
         let pid = process.processIdentifier
         // Deliberately not waited: the recorder keeps running after this CLI
         // exits, exactly like the Linux/Windows detached ffmpeg recorders.
-        let state = RecordState(pid: pid, output: output)
+        try waitRecordProcessReady(pid: pid, output: output, timeout: 3.0)
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let state = RecordState(
+            pid: pid,
+            output: output,
+            backend: backend,
+            fps: request.fps,
+            quality: request.quality,
+            drawMouse: request.drawMouse,
+            startedAt: formatter.string(from: Date())
+        )
         do {
             try writeState(state, pidfilePath: pidfilePath)
         } catch {
             throw ComputerUseError.message("recording started (pid \(pid)) but pidfile write failed: \(error.localizedDescription)")
         }
-        return "recording started: pid=\(pid) output=\(output)"
+        return "recording started: pid=\(pid) backend=\(backend) fps=\(request.fps) quality=\(request.quality) draw_mouse=\(request.drawMouse) output=\(output)"
     }
 
-    static func stop(pidfilePath: String?) throws -> String {
+    static func stop(pidfilePath: String?, saveAs: String?) throws -> String {
         let path = pidfilePath ?? defaultPidfilePath()
         guard let state = readState(pidfilePath: path) else {
             throw ComputerUseError.message("no recording in progress (pidfile not found)")
@@ -756,7 +952,7 @@ enum DesktopRecord {
         if processAlive(state.pid) {
             if kill(state.pid, SIGINT) != 0 {
                 if errno != ESRCH {
-                    stopError = ComputerUseError.message("cannot signal screencapture pid \(state.pid): \(String(cString: strerror(errno)))")
+                    stopError = ComputerUseError.message("cannot signal recorder pid \(state.pid): \(String(cString: strerror(errno)))")
                 }
             } else {
                 let deadline = Date().addingTimeInterval(10)
@@ -767,7 +963,7 @@ enum DesktopRecord {
                     Thread.sleep(forTimeInterval: 0.1)
                 }
                 if processAlive(state.pid) {
-                    stopError = ComputerUseError.message("screencapture pid \(state.pid) did not exit after stop signal")
+                    stopError = ComputerUseError.message("recorder pid \(state.pid) did not exit after stop signal")
                 }
             }
         }
@@ -775,7 +971,38 @@ enum DesktopRecord {
         if let stopError {
             throw ComputerUseError.message("recording output=\(state.output) but stop had a problem: \(stopError.localizedDescription)")
         }
-        return "recording stopped: output=\(state.output)"
+        var finalOutput = state.output
+        if let saveAs, !saveAs.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            finalOutput = try relocateRecordOutput(current: state.output, saveAs: saveAs)
+        }
+        return "recording stopped: output=\(finalOutput)"
+    }
+
+    static func discard(pidfilePath: String?) throws -> String {
+        let path = pidfilePath ?? defaultPidfilePath()
+        guard let state = readState(pidfilePath: path) else {
+            throw ComputerUseError.message("no recording in progress (pidfile not found)")
+        }
+        var stopError: Error?
+        if processAlive(state.pid) {
+            if kill(state.pid, SIGINT) != 0, errno != ESRCH {
+                stopError = ComputerUseError.message("cannot signal recorder pid \(state.pid): \(String(cString: strerror(errno)))")
+            } else {
+                let deadline = Date().addingTimeInterval(10)
+                while Date() < deadline, processAlive(state.pid) {
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+            }
+        }
+        try? FileManager.default.removeItem(atPath: path)
+        try? FileManager.default.removeItem(atPath: state.output)
+        try? FileManager.default.removeItem(atPath: state.output + ".log")
+        if let stopError {
+            throw ComputerUseError.message(
+                "recording discarded (output removed=\(state.output)) but stop had a problem: \(stopError.localizedDescription)"
+            )
+        }
+        return "recording discarded: output=\(state.output)"
     }
 
     static func status(pidfilePath: String?) throws -> String {
@@ -783,16 +1010,97 @@ enum DesktopRecord {
         guard let state = readState(pidfilePath: path) else {
             return "{\n  \"running\": false\n}"
         }
-        let report: [String: Any] = [
+        var report: [String: Any] = [
             "running": processAlive(state.pid),
             "pid": state.pid,
             "output": state.output,
         ]
+        if let backend = state.backend {
+            report["backend"] = backend
+        }
+        if let fps = state.fps {
+            report["fps"] = fps
+        }
+        if let quality = state.quality {
+            report["quality"] = quality
+        }
+        if let drawMouse = state.drawMouse {
+            report["draw_mouse"] = drawMouse
+        }
+        if let startedAt = state.startedAt {
+            report["started_at"] = startedAt
+        }
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: state.output),
+           let size = attrs[.size] as? NSNumber
+        {
+            report["output_bytes"] = size.intValue
+        }
         let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
         guard let json = String(data: data, encoding: .utf8) else {
             throw ComputerUseError.message("cannot encode recording status")
         }
         return json
+    }
+
+    static func relocateRecordOutput(current: String, saveAs: String) throws -> String {
+        var target = saveAs.trimmingCharacters(in: .whitespacesAndNewlines)
+        if URL(fileURLWithPath: target).pathExtension.isEmpty {
+            let fallbackExt = URL(fileURLWithPath: current).pathExtension
+            target += ".\(fallbackExt.isEmpty ? "mp4" : fallbackExt)"
+        }
+        if !target.contains("/") && !target.hasPrefix("~") {
+            target = URL(fileURLWithPath: current)
+                .deletingLastPathComponent()
+                .appendingPathComponent(URL(fileURLWithPath: target).lastPathComponent)
+                .path
+        }
+        let destination = URL(fileURLWithPath: (target as NSString).expandingTildeInPath)
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        do {
+            try FileManager.default.moveItem(atPath: current, toPath: destination.path)
+        } catch {
+            try FileManager.default.copyItem(atPath: current, toPath: destination.path)
+            try? FileManager.default.removeItem(atPath: current)
+        }
+        let logSource = current + ".log"
+        if FileManager.default.fileExists(atPath: logSource) {
+            try? FileManager.default.moveItem(atPath: logSource, toPath: destination.path + ".log")
+        }
+        return destination.path
+    }
+
+    private static func waitRecordProcessReady(pid: Int32, output: String, timeout: TimeInterval) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if !processAlive(pid) {
+                var detail = ""
+                if let data = FileManager.default.contents(atPath: output + ".log"),
+                   let text = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !text.isEmpty
+                {
+                    detail = ": " + String(text.prefix(400))
+                }
+                throw ComputerUseError.message("recorder exited before recording became ready\(detail)")
+            }
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: output),
+               let size = attrs[.size] as? NSNumber,
+               size.intValue > 0
+            {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if processAlive(pid) {
+            return
+        }
+        throw ComputerUseError.message("recorder exited before recording became ready")
     }
 
     private static func writeState(_ state: RecordState, pidfilePath: String) throws {

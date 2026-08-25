@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -166,18 +167,84 @@ func TestParseWaitDuration(t *testing.T) {
 }
 
 func TestBuildFfmpegRecordArgs(t *testing.T) {
-	got := buildFfmpegRecordArgs(":1", "/tmp/out.mp4", 60)
+	got := buildFfmpegRecordArgs(":1", "/tmp/out.mp4", recordOptions{
+		fps: 60, quality: "demo", drawMouse: 0, videoSize: "1920x1200",
+	})
 	want := []string{
-		"-nostdin", "-y", "-f", "x11grab", "-draw_mouse", "1",
-		"-framerate", "60", "-i", ":1",
-		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+		"-nostdin", "-y",
+		"-video_size", "1920x1200",
+		"-framerate", "60",
+		"-draw_mouse", "0",
+		"-f", "x11grab",
+		"-i", ":1",
+		"-vf", "scale=1920:-2:flags=lanczos,fps=60",
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-crf", "17",
+		"-pix_fmt", "yuv420p",
+		"-profile:v", "high",
+		"-movflags", "+faststart",
+		"-tune", "fastdecode",
 		"/tmp/out.mp4",
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("ffmpeg args = %v, want %v", got, want)
+		t.Fatalf("demo ffmpeg args = %#v, want %#v", got, want)
 	}
-	if got := buildFfmpegRecordArgs(":0", "x.mp4", 0); got[7] != "30" {
-		t.Fatalf("fps<=0 should default to 30, got framerate %q", got[7])
+
+	draft := buildFfmpegRecordArgs(":0", "x.mp4", recordOptions{fps: 0, quality: "draft", drawMouse: 1})
+	if !reflect.DeepEqual(draft, []string{
+		"-nostdin", "-y",
+		"-framerate", "30",
+		"-draw_mouse", "1",
+		"-f", "x11grab",
+		"-i", ":0",
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-pix_fmt", "yuv420p",
+		"x.mp4",
+	}) {
+		t.Fatalf("draft ffmpeg args = %#v", draft)
+	}
+}
+
+func TestNormalizeRecordQuality(t *testing.T) {
+	for _, in := range []string{"", "demo", "high", "DEMO"} {
+		got, err := normalizeRecordQuality(in)
+		if err != nil || got != "demo" {
+			t.Fatalf("normalizeRecordQuality(%q) = %q, %v", in, got, err)
+		}
+	}
+	for _, in := range []string{"draft", "low"} {
+		got, err := normalizeRecordQuality(in)
+		if err != nil || got != "draft" {
+			t.Fatalf("normalizeRecordQuality(%q) = %q, %v", in, got, err)
+		}
+	}
+	if _, err := normalizeRecordQuality("medium"); err == nil {
+		t.Fatal("expected invalid quality to fail")
+	}
+}
+
+func TestRelocateRecordOutput(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "raw.mp4")
+	if err := os.WriteFile(src, []byte("mp4"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(src+".log", []byte("log"), 0o644)
+	dst, err := relocateRecordOutput(src, "demo-take")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dir, "demo-take.mp4")
+	if dst != want {
+		t.Fatalf("relocated path = %q, want %q", dst, want)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(want + ".log"); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -47,12 +47,16 @@ final class DesktopCommandTests: XCTestCase {
 
     func testCLIRecognizesRecordCommands() throws {
         XCTAssertEqual(
-            try parseOpenComputerUseCLI(arguments: ["record", "start", "--output", "/tmp/r.mov", "--fps", "15"]),
-            .record(DesktopRecordRequest(subcommand: .start, output: "/tmp/r.mov", fps: 15, pidfile: nil))
+            try parseOpenComputerUseCLI(arguments: ["record", "start", "--output", "/tmp/r.mp4", "--fps", "15", "--quality", "draft", "--draw-mouse", "0"]),
+            .record(DesktopRecordRequest(subcommand: .start, output: "/tmp/r.mp4", fps: 15, pidfile: nil, quality: "draft", drawMouse: 0, saveAs: nil))
         )
         XCTAssertEqual(
-            try parseOpenComputerUseCLI(arguments: ["record", "stop", "--pidfile", "/tmp/r.pid"]),
-            .record(DesktopRecordRequest(subcommand: .stop, output: nil, fps: 30, pidfile: "/tmp/r.pid"))
+            try parseOpenComputerUseCLI(arguments: ["record", "stop", "--pidfile", "/tmp/r.pid", "--save-as", "demo"]),
+            .record(DesktopRecordRequest(subcommand: .stop, output: nil, fps: 30, pidfile: "/tmp/r.pid", quality: "demo", drawMouse: 1, saveAs: "demo"))
+        )
+        XCTAssertEqual(
+            try parseOpenComputerUseCLI(arguments: ["record", "discard"]),
+            .record(DesktopRecordRequest(subcommand: .discard, output: nil, fps: 30, pidfile: nil))
         )
         XCTAssertEqual(
             try parseOpenComputerUseCLI(arguments: ["record", "status"]),
@@ -60,6 +64,31 @@ final class DesktopCommandTests: XCTestCase {
         )
         XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["record"]))
         XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["record", "pause"]))
+    }
+
+    func testBuildFfmpegAvfoundationArgsDemoQuality() {
+        let args = DesktopRecord.buildFfmpegAvfoundationArgs(
+            output: "/tmp/out.mp4",
+            fps: 60,
+            quality: "demo",
+            drawMouse: 0,
+            screenDevice: "Capture screen 0"
+        )
+        XCTAssertEqual(args, [
+            "-nostdin", "-y",
+            "-f", "avfoundation",
+            "-framerate", "60",
+            "-capture_cursor", "0",
+            "-i", "Capture screen 0",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "17",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "high",
+            "-movflags", "+faststart",
+            "-tune", "fastdecode",
+            "/tmp/out.mp4",
+        ])
     }
 
     func testDesktopHelpTopicsAreWired() {
@@ -184,8 +213,11 @@ final class DesktopCommandTests: XCTestCase {
         let pidfile = DesktopRecord.defaultPidfilePath()
         XCTAssertTrue(pidfile.hasSuffix("open-computer-use-record.pid"), pidfile)
 
-        let output = DesktopRecord.defaultOutputPath()
-        XCTAssertTrue(output.contains("open-computer-use-recording-"), output)
-        XCTAssertTrue(output.hasSuffix(".mov"), output)
+        let mp4 = DesktopRecord.defaultOutputPath(preferMP4: true)
+        XCTAssertTrue(mp4.contains("open-computer-use-recording-"), mp4)
+        XCTAssertTrue(mp4.hasSuffix(".mp4"), mp4)
+
+        let mov = DesktopRecord.defaultOutputPath(preferMP4: false)
+        XCTAssertTrue(mov.hasSuffix(".mov"), mov)
     }
 }

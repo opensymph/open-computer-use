@@ -103,7 +103,7 @@ npx skills add opensymph/open-computer-use -g -a claude-code --skill open-comput
 
 ### 显示级桌面命令（三平台）
 
-三个运行时提供同一套整屏 CLI 命令（命令名、参数、JSON 输出对齐，详见英文 README 的 "Display-level desktop commands"）：`screenshot` 整屏 PNG、`cursor-position` 指针坐标 JSON、`input` 全局合成输入（每平台独立环境变量门控，默认关闭：Linux `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`、Windows `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1`、macOS `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1`）、`record start/stop/status` 录屏（Linux/Windows 走 ffmpeg x11grab/gdigrab，macOS 走 `screencapture -v`，实验性）。这些是 CLI-only，不进入官方对齐的 14 个 MCP tool 面。
+三个运行时提供同一套整屏 CLI 命令（命令名、参数、JSON 输出对齐，详见英文 README 的 "Display-level desktop commands"）：`screenshot` 整屏 PNG、`cursor-position` 指针坐标 JSON、`input` 全局合成输入（每平台独立环境变量门控，默认关闭：Linux `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`、Windows `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1`、macOS `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1`）、`record start/stop/discard/status` 录屏（默认 `--quality demo` 对齐 Cursor RecordScreen 的 veryfast/crf17/High/faststart；Linux/Windows 走 ffmpeg x11grab/gdigrab，macOS 优先 ffmpeg avfoundation、回退 `screencapture -v`；另支持 `--draw-mouse`、`stop --save-as`）。这些是 CLI-only，不进入官方对齐的 14 个 MCP tool 面。
 
 ## 文档
 

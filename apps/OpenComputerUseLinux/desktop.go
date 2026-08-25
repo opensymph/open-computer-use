@@ -35,12 +35,27 @@ type pointerInfo struct {
 	ScreenHeight int `json:"screen_height"`
 }
 
-// recordState is persisted to the record pidfile so a later `record stop` can
-// find and signal the detached ffmpeg process.
+// recordState is persisted to the record pidfile so a later `record stop` /
+// `record discard` can find and signal the detached ffmpeg process.
 type recordState struct {
-	PID     int    `json:"pid"`
-	Output  string `json:"output"`
-	Display string `json:"display"`
+	PID       int    `json:"pid"`
+	Output    string `json:"output"`
+	Display   string `json:"display"`
+	FPS       int    `json:"fps,omitempty"`
+	Quality   string `json:"quality,omitempty"`
+	DrawMouse int    `json:"draw_mouse,omitempty"`
+	StartedAt string `json:"started_at,omitempty"`
+}
+
+// recordOptions controls the ffmpeg capture/encode knobs shared with the
+// Windows runtime. `demo` mirrors Cursor RecordScreen's high-quality capture
+// preset (veryfast + crf 17 + High + faststart + all-intra); `draft` keeps the
+// old ultrafast path for low-CPU hosts.
+type recordOptions struct {
+	fps       int
+	quality   string // demo | draft
+	drawMouse int    // 0 or 1
+	videoSize string // optional "WxH"
 }
 
 // resolveDisplay picks the X11 display target: explicit --display wins, then
@@ -399,13 +414,14 @@ func parseAmountFlag(rest []string, fallback int) (int, error) {
 
 func runRecordCommand(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("record requires a subcommand: start, stop, or status")
+		return errors.New("record requires a subcommand: start, stop, discard, or status")
 	}
 	sub := args[0]
 	rest := args[1:]
 
-	var displayFlag, output, pidfile string
+	var displayFlag, output, pidfile, saveAs, quality string
 	fps := 30
+	drawMouse := 1
 	for i := 0; i < len(rest); i++ {
 		switch rest[i] {
 		case "--display":
@@ -432,6 +448,24 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 				return errors.New("--fps requires an integer")
 			}
 			fps, _ = strconv.Atoi(rest[i])
+		case "--quality":
+			i++
+			if i >= len(rest) {
+				return errors.New("--quality requires a value (demo or draft)")
+			}
+			quality = rest[i]
+		case "--draw-mouse":
+			i++
+			if i >= len(rest) || (rest[i] != "0" && rest[i] != "1") {
+				return errors.New("--draw-mouse requires 0 or 1")
+			}
+			drawMouse, _ = strconv.Atoi(rest[i])
+		case "--save-as":
+			i++
+			if i >= len(rest) {
+				return errors.New("--save-as requires a value")
+			}
+			saveAs = rest[i]
 		default:
 			return fmt.Errorf("unknown record option: %s", rest[i])
 		}
@@ -439,24 +473,48 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 	if pidfile == "" {
 		pidfile = defaultRecordPidfile
 	}
+	normalizedQuality, err := normalizeRecordQuality(quality)
+	if err != nil {
+		return err
+	}
 
 	switch sub {
 	case "start":
 		if existing, ok := readRecordPidfile(pidfile); ok && processAlive(existing.PID) {
-			return fmt.Errorf("recording already running (pid %d, output %s); run 'record stop' first", existing.PID, existing.Output)
+			return fmt.Errorf("recording already running (pid %d, output %s); run 'record stop' or 'record discard' first", existing.PID, existing.Output)
 		}
 		display := resolveDisplay(displayFlag, os.Getenv("DISPLAY"))
 		if output == "" {
 			output = defaultRecordOutput(time.Now())
 		}
-		pid, err := startRecordProcess(display, output, buildFfmpegRecordArgs(display, output, fps))
+		opts := recordOptions{fps: fps, quality: normalizedQuality, drawMouse: drawMouse}
+		if info, err := queryPointer(display); err == nil && info.ScreenWidth > 0 && info.ScreenHeight > 0 {
+			opts.videoSize = fmt.Sprintf("%dx%d", info.ScreenWidth, info.ScreenHeight)
+		}
+		pid, err := startRecordProcess(display, output, buildFfmpegRecordArgs(display, output, opts))
 		if err != nil {
 			return err
 		}
-		if err := writeRecordPidfile(pidfile, recordState{PID: pid, Output: output, Display: display}); err != nil {
+		if err := waitRecordProcessReady(pid, output, 3*time.Second); err != nil {
+			_ = stopRecordProcess(pid)
+			_ = os.Remove(output)
+			_ = os.Remove(output + ".log")
+			return err
+		}
+		state := recordState{
+			PID:       pid,
+			Output:    output,
+			Display:   display,
+			FPS:       opts.fps,
+			Quality:   opts.quality,
+			DrawMouse: opts.drawMouse,
+			StartedAt: time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := writeRecordPidfile(pidfile, state); err != nil {
 			return fmt.Errorf("recording started (pid %d) but pidfile write failed: %w", pid, err)
 		}
-		fmt.Fprintf(stdout, "recording started: pid=%d display=%s fps=%d output=%s\n", pid, display, fps, output)
+		fmt.Fprintf(stdout, "recording started: pid=%d display=%s fps=%d quality=%s draw_mouse=%d output=%s\n",
+			pid, display, state.FPS, state.Quality, state.DrawMouse, output)
 		return nil
 
 	case "stop":
@@ -469,7 +527,30 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 		if stopErr != nil {
 			return fmt.Errorf("recording output=%s but stop had a problem: %w", state.Output, stopErr)
 		}
-		fmt.Fprintf(stdout, "recording stopped: output=%s\n", state.Output)
+		finalOutput := state.Output
+		if saveAs != "" {
+			moved, err := relocateRecordOutput(state.Output, saveAs)
+			if err != nil {
+				return fmt.Errorf("recording stopped but --save-as failed: %w", err)
+			}
+			finalOutput = moved
+		}
+		fmt.Fprintf(stdout, "recording stopped: output=%s\n", finalOutput)
+		return nil
+
+	case "discard":
+		state, ok := readRecordPidfile(pidfile)
+		if !ok {
+			return errors.New("no recording in progress (pidfile not found)")
+		}
+		stopErr := stopRecordProcess(state.PID)
+		_ = os.Remove(pidfile)
+		_ = os.Remove(state.Output)
+		_ = os.Remove(state.Output + ".log")
+		if stopErr != nil {
+			return fmt.Errorf("recording discarded (output removed=%s) but stop had a problem: %w", state.Output, stopErr)
+		}
+		fmt.Fprintf(stdout, "recording discarded: output=%s\n", state.Output)
 		return nil
 
 	case "status":
@@ -479,6 +560,21 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 			status["pid"] = state.PID
 			status["output"] = state.Output
 			status["display"] = state.Display
+			if state.FPS > 0 {
+				status["fps"] = state.FPS
+			}
+			if state.Quality != "" {
+				status["quality"] = state.Quality
+			}
+			if state.StartedAt != "" {
+				status["started_at"] = state.StartedAt
+			}
+			if state.DrawMouse == 0 || state.DrawMouse == 1 {
+				status["draw_mouse"] = state.DrawMouse
+			}
+			if fi, err := os.Stat(state.Output); err == nil {
+				status["output_bytes"] = fi.Size()
+			}
 		}
 		encoded, err := json.MarshalIndent(status, "", "  ")
 		if err != nil {
@@ -492,24 +588,136 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 	}
 }
 
-// buildFfmpegRecordArgs mirrors the host recorder: x11grab of the display into
-// an H.264 mp4 with a broadly-compatible pixel format. Kept pure for testing.
-func buildFfmpegRecordArgs(display, output string, fps int) []string {
-	if fps <= 0 {
-		fps = 30
+func normalizeRecordQuality(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "demo", "high":
+		return "demo", nil
+	case "draft", "low":
+		return "draft", nil
+	case "proxy":
+		return "proxy", nil
+	default:
+		return "", fmt.Errorf("invalid --quality %q (demo, draft, or proxy)", value)
 	}
-	return []string{
-		"-nostdin",
-		"-y",
+}
+
+// buildFfmpegRecordArgs builds the x11grab capture line. `demo` quality mirrors
+// Cursor RecordScreen's capture encode settings (high-quality, seekable,
+// faststart mp4); `draft` keeps the older ultrafast path. Kept pure for tests.
+func buildFfmpegRecordArgs(display, output string, opts recordOptions) []string {
+	if opts.fps <= 0 {
+		opts.fps = 30
+	}
+	if opts.quality == "" {
+		opts.quality = "demo"
+	}
+	if opts.drawMouse != 0 && opts.drawMouse != 1 {
+		opts.drawMouse = 1
+	}
+
+	args := []string{"-nostdin", "-y"}
+	if opts.videoSize != "" {
+		args = append(args, "-video_size", opts.videoSize)
+	}
+	args = append(args,
+		"-framerate", strconv.Itoa(opts.fps),
+		"-draw_mouse", strconv.Itoa(opts.drawMouse),
 		"-f", "x11grab",
-		"-draw_mouse", "1",
-		"-framerate", strconv.Itoa(fps),
 		"-i", display,
-		"-c:v", "libx264",
-		"-preset", "ultrafast",
-		"-pix_fmt", "yuv420p",
-		output,
+	)
+	if opts.videoSize != "" {
+		// Match RecordScreen: normalize through lanczos + fps filter even when
+		// the grab size already matches, so encode timing stays stable.
+		width := strings.Split(opts.videoSize, "x")[0]
+		args = append(args, "-vf", fmt.Sprintf("scale=%s:-2:flags=lanczos,fps=%d", width, opts.fps))
 	}
+	args = append(args, "-c:v", "libx264")
+	switch opts.quality {
+	case "draft":
+		args = append(args, "-preset", "ultrafast", "-pix_fmt", "yuv420p")
+	case "proxy":
+		// All-intra proxy matching Cursor RecordScreen's staging capture
+		// (great for frame-accurate seeking; large files).
+		args = append(args,
+			"-preset", "veryfast",
+			"-crf", "17",
+			"-pix_fmt", "yuv420p",
+			"-profile:v", "high",
+			"-x264-params", "keyint=1:min-keyint=1:scenecut=0:bframes=0",
+			"-movflags", "+faststart",
+			"-tune", "fastdecode",
+		)
+	default: // demo — RecordScreen-aligned quality without all-intra bloat
+		args = append(args,
+			"-preset", "veryfast",
+			"-crf", "17",
+			"-pix_fmt", "yuv420p",
+			"-profile:v", "high",
+			"-movflags", "+faststart",
+			"-tune", "fastdecode",
+		)
+	}
+	args = append(args, output)
+	return args
+}
+
+// waitRecordProcessReady confirms ffmpeg stayed alive and started writing the
+// output file (RecordScreen waits on the same readiness signal).
+func waitRecordProcessReady(pid int, output string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			detail := ""
+			if data, err := os.ReadFile(output + ".log"); err == nil && len(data) > 0 {
+				detail = ": " + strings.TrimSpace(string(data))
+				if len(detail) > 400 {
+					detail = detail[:400] + "…"
+				}
+			}
+			return fmt.Errorf("ffmpeg exited before recording became ready%s", detail)
+		}
+		if fi, err := os.Stat(output); err == nil && fi.Size() > 0 {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if processAlive(pid) {
+		return nil // still encoding; allow slow hosts
+	}
+	return errors.New("ffmpeg exited before recording became ready")
+}
+
+// relocateRecordOutput implements `record stop --save-as`, mirroring Cursor
+// RecordScreen's save_as_filename convenience (bare names land next to the
+// original output and get a .mp4 suffix when missing).
+func relocateRecordOutput(current, saveAs string) (string, error) {
+	target := strings.TrimSpace(saveAs)
+	if target == "" {
+		return current, nil
+	}
+	if !strings.Contains(filepath.Base(target), ".") {
+		target += ".mp4"
+	}
+	if !filepath.IsAbs(target) && !strings.Contains(target, string(os.PathSeparator)) && !strings.Contains(target, "/") {
+		target = filepath.Join(filepath.Dir(current), target)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Rename(current, target); err != nil {
+		data, readErr := os.ReadFile(current)
+		if readErr != nil {
+			return "", err
+		}
+		if writeErr := os.WriteFile(target, data, 0o644); writeErr != nil {
+			return "", writeErr
+		}
+		_ = os.Remove(current)
+	}
+	if _, err := os.Stat(current + ".log"); err == nil {
+		_ = os.Rename(current+".log", target+".log")
+	}
+	return target, nil
 }
 
 func defaultRecordOutput(now time.Time) string {
