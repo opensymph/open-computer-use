@@ -4,6 +4,7 @@ package main
 
 import (
 	"math"
+	"runtime"
 	"sync"
 )
 
@@ -125,7 +126,7 @@ func applyZoomPan(src, dst *rgbaFrame, z zoomState) {
 	cy := h * 0.5
 	inv := 1.0 / z.Scale
 	var wg sync.WaitGroup
-	workers := 4
+	workers := effectWorkers()
 	rows := src.H
 	chunk := (rows + workers - 1) / workers
 	for wi := 0; wi < workers; wi++ {
@@ -215,7 +216,7 @@ func mapLensUV(u, v float64, p lensParams, width, height int) (float64, float64,
 
 func applyLensWarp(src, dst *rgbaFrame, p lensParams) {
 	var wg sync.WaitGroup
-	workers := 4
+	workers := effectWorkers()
 	chunk := (src.H + workers - 1) / workers
 	for wi := 0; wi < workers; wi++ {
 		y0 := wi * chunk
@@ -263,8 +264,22 @@ func defaultMotionBlurConfig() motionBlurConfig {
 		MaxBlurFraction:   1.0,
 		CursorReduction:   0.4,
 		VelocityThreshold: 0.001,
-		MaxSampleCount:    12, // slightly below proprietary "high" for speed
+		MaxSampleCount:    6, // balance quality vs CPU (was 12)
 	}
+}
+
+func effectWorkers() int {
+	n := 8
+	if v := runtime.NumCPU(); v > 0 {
+		n = v
+		if n < 4 {
+			n = 4
+		}
+		if n > 16 {
+			n = 16
+		}
+	}
+	return n
 }
 
 func (c motionBlurConfig) shutterFraction() float64 {
@@ -309,7 +324,7 @@ func applyCameraMotionBlur(src, dst *rgbaFrame, curr, prev zoomState, cfg motion
 	prevScale := prev.Scale
 
 	var wg sync.WaitGroup
-	workers := 4
+	workers := effectWorkers()
 	chunk := (src.H + workers - 1) / workers
 	for wi := 0; wi < workers; wi++ {
 		y0 := wi * chunk

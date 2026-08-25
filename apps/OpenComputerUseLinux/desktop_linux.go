@@ -90,6 +90,16 @@ func runInputInvocations(display string, invocations [][]string) error {
 		return errors.New("xdotool is required for input actions but was not found on PATH")
 	}
 	for _, argv := range invocations {
+		if len(argv) > 0 && argv[0] == "__sleep_ms__" {
+			ms := 0
+			if len(argv) > 1 {
+				fmt.Sscanf(argv[1], "%d", &ms)
+			}
+			if ms > 0 {
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+			}
+			continue
+		}
 		cmd := exec.Command(xdotool, argv...)
 		cmd.Env = append(os.Environ(), "DISPLAY="+display)
 		if out, err := cmd.CombinedOutput(); err != nil {

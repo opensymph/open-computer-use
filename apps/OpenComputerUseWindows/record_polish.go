@@ -118,10 +118,11 @@ type clickEffect struct {
 }
 
 type cursorKeyframe struct {
-	TMs   int64
-	X     int
-	Y     int
-	Scale float64 // 1.0 normal; ~0.75 during click depress
+	TMs        int64
+	X          int
+	Y          int
+	Scale      float64 // 1.0 normal; ~0.75 during click depress
+	CursorType string  // arrow|pointer|text|wait|crosshair|move (clean-room CursorType)
 }
 
 type polishPlan struct {
@@ -670,7 +671,10 @@ func generateCursorPath(events []recordEvent, durationMs int64, width, height in
 		}
 	}
 	if len(waypoints) == 0 {
-		return []cursorKeyframe{{0, width / 2, height / 2, 1}, {durationMs, width / 2, height / 2, 1}}
+		return []cursorKeyframe{
+			{TMs: 0, X: width / 2, Y: height / 2, Scale: 1, CursorType: "arrow"},
+			{TMs: durationMs, X: width / 2, Y: height / 2, Scale: 1, CursorType: "arrow"},
+		}
 	}
 	sort.Slice(waypoints, func(i, j int) bool { return waypoints[i].t < waypoints[j].t })
 	dedup := waypoints[:1]
@@ -683,22 +687,36 @@ func generateCursorPath(events []recordEvent, durationMs int64, width, height in
 	}
 	waypoints = dedup
 
-	// Click times for depress animation
+	// Click / type times for depress + cursor type selection
 	var clickTimes []int64
+	var typeWindows [][2]int64
 	for _, w := range waypoints {
 		if w.click {
 			clickTimes = append(clickTimes, w.t)
+		}
+	}
+	for _, ev := range events {
+		if ev.Type == "type" {
+			typeWindows = append(typeWindows, [2]int64{ev.TMs, ev.TMs + 800})
 		}
 	}
 
 	const fps = 30
 	frameMs := int64(1000 / fps)
 	var frames []cursorKeyframe
+	cursorTypeAt := func(t int64) string {
+		for _, w := range typeWindows {
+			if t >= w[0] && t <= w[1] {
+				return "text"
+			}
+		}
+		return "arrow"
+	}
 
 	// Hold at first point from 0
 	if waypoints[0].t > 0 {
 		for t := int64(0); t < waypoints[0].t; t += frameMs {
-			frames = append(frames, cursorKeyframe{t, waypoints[0].x, waypoints[0].y, cursorDepressScale(t, clickTimes)})
+			frames = append(frames, cursorKeyframe{TMs: t, X: waypoints[0].x, Y: waypoints[0].y, Scale: cursorDepressScale(t, clickTimes), CursorType: cursorTypeAt(t)})
 		}
 	}
 
@@ -725,7 +743,7 @@ func generateCursorPath(events []recordEvent, durationMs int64, width, height in
 
 		// Hold at `a` until move starts
 		for t := a.t; float64(t) < moveStart; t += frameMs {
-			frames = append(frames, cursorKeyframe{t, a.x, a.y, cursorDepressScale(t, clickTimes)})
+			frames = append(frames, cursorKeyframe{TMs: t, X: a.x, Y: a.y, Scale: cursorDepressScale(t, clickTimes), CursorType: cursorTypeAt(t)})
 		}
 		steps := int(moveDur/float64(frameMs)) + 1
 		for s := 0; s <= steps; s++ {
@@ -741,12 +759,12 @@ func generateCursorPath(events []recordEvent, durationMs int64, width, height in
 			x := float64(a.x) + (float64(b.x)-float64(a.x))*e
 			y := float64(a.y) + (float64(b.y)-float64(a.y))*e
 			t := int64(moveStart + moveDur*u)
-			frames = append(frames, cursorKeyframe{t, int(x + 0.5), int(y + 0.5), cursorDepressScale(t, clickTimes)})
+			frames = append(frames, cursorKeyframe{TMs: t, X: int(x + 0.5), Y: int(y + 0.5), Scale: cursorDepressScale(t, clickTimes), CursorType: cursorTypeAt(t)})
 		}
 	}
 	last := waypoints[len(waypoints)-1]
 	for t := last.t; t <= durationMs; t += frameMs {
-		frames = append(frames, cursorKeyframe{t, last.x, last.y, cursorDepressScale(t, clickTimes)})
+		frames = append(frames, cursorKeyframe{TMs: t, X: last.x, Y: last.y, Scale: cursorDepressScale(t, clickTimes), CursorType: cursorTypeAt(t)})
 	}
 	return frames
 }
@@ -1392,9 +1410,10 @@ func escapeFFmpegFilterPath(path string) string {
 }
 
 func runPolishCommand(args []string, stdout io.Writer) error {
-	var input, events, output string
+	var input, events, output, planPath, writePlanPath string
 	opts := defaultPolishOptions()
 	engine := polishEngineCompositor
+	writePlan := true
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--input", "-i":
@@ -1415,6 +1434,21 @@ func runPolishCommand(args []string, stdout io.Writer) error {
 				return errors.New("--output requires a value")
 			}
 			output = args[i]
+		case "--plan":
+			i++
+			if i >= len(args) {
+				return errors.New("--plan requires a value")
+			}
+			planPath = args[i]
+		case "--write-plan":
+			i++
+			if i >= len(args) {
+				return errors.New("--write-plan requires a path")
+			}
+			writePlanPath = args[i]
+			writePlan = true
+		case "--no-write-plan":
+			writePlan = false
 		case "--engine":
 			i++
 			if i >= len(args) {
@@ -1468,16 +1502,66 @@ func runPolishCommand(args []string, stdout io.Writer) error {
 	if output == "" {
 		output = defaultPolishedOutput(input)
 	}
+	if writePlan && writePlanPath == "" {
+		writePlanPath = defaultRenderPlanPath(input)
+	}
 	// Ripples are an OCU ffmpeg-only overlay; force legacy engine when requested.
 	if opts.ShowClickRipples && engine == polishEngineCompositor {
 		engine = polishEngineFFmpeg
 	}
 	started := time.Now()
-	if err := polishRecordingEngine(input, events, output, engine, opts); err != nil {
+	if planPath != "" {
+		if err := polishRecordingWithPlan(input, events, output, planPath, engine, opts, writePlanPath); err != nil {
+			return err
+		}
+	} else if err := polishRecordingEngine(input, events, output, engine, opts); err != nil {
 		return err
+	} else if writePlan {
+		_ = exportRenderPlanBestEffort(input, events, writePlanPath, opts)
 	}
 	fmt.Fprintf(stdout, "recording polished: engine=%s input=%s events=%s output=%s elapsed=%s\n",
 		polishEngineName(engine), input, events, output, time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+func exportRenderPlanBestEffort(input, events, planPath string, opts polishOptions) error {
+	log, err := readRecordEventLog(events)
+	if err != nil {
+		return err
+	}
+	durationMs, _, _, err := probeVideoDurationMs(input)
+	if err != nil {
+		return err
+	}
+	plan := buildPolishPlan(log, durationMs, opts)
+	idles := detectIdlePeriods(log.Events, durationMs, opts)
+	segs := buildPlaybackSegments(idles, plan.Zooms, durationMs, opts)
+	rp := buildRenderPlanJSON(input, log, durationMs, opts, plan, segs)
+	return writeRenderPlanJSON(planPath, rp)
+}
+
+func polishRecordingWithPlan(input, events, output, planPath string, engine polishEngineKind, opts polishOptions, writePlanPath string) error {
+	rp, err := loadRenderPlanJSON(planPath)
+	if err != nil {
+		return fmt.Errorf("cannot load --plan: %w", err)
+	}
+	segs, zooms, cursor, err := applyRenderPlanToPolish(rp, &opts)
+	if err != nil {
+		return err
+	}
+	// Prefer compositor when consuming a plan (has continuous zoom/cursor tracks).
+	if engine == polishEngineCompositor {
+		copts := defaultCompositorOptions()
+		copts.polishOptions = opts
+		if err := polishRecordingCompositorFromPlan(input, events, output, copts, segs, zooms, cursor); err != nil {
+			return err
+		}
+	} else if err := polishRecordingEngine(input, events, output, engine, opts); err != nil {
+		return err
+	}
+	if writePlanPath != "" {
+		_ = writeRenderPlanJSON(writePlanPath, rp)
+	}
 	return nil
 }
 

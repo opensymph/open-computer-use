@@ -56,7 +56,7 @@ func TestBuildXdotoolInvocationsMove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := [][]string{{"mousemove", "--", "100", "200"}}
+	want := [][]string{{"mousemove", "--sync", "--", "100", "200"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("move = %v, want %v", got, want)
 	}
@@ -71,11 +71,27 @@ func TestBuildXdotoolInvocationsClick(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := [][]string{
-		{"mousemove", "--", "5", "6"},
-		{"click", "--repeat", "2", "3"},
+		{"mousemove", "--sync", "--", "5", "6"},
+		{"click", "--repeat", "2", "--delay", "50", "3"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("click = %v, want %v", got, want)
+	}
+
+	got, err = buildXdotoolInvocations("click", []string{"--modifiers", "ctrl+shift", "--x", "1", "--y", "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = [][]string{
+		{"keydown", "--", "ctrl"},
+		{"keydown", "--", "shift"},
+		{"mousemove", "--sync", "--", "1", "2"},
+		{"click", "1"},
+		{"keyup", "--", "shift"},
+		{"keyup", "--", "ctrl"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("click+mods = %v, want %v", got, want)
 	}
 
 	got, err = buildXdotoolInvocations("click", nil)
@@ -97,9 +113,9 @@ func TestBuildXdotoolInvocationsDrag(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := [][]string{
-		{"mousemove", "--", "1", "2"},
+		{"mousemove", "--sync", "--", "1", "2"},
 		{"mousedown", "1"},
-		{"mousemove", "--", "3", "4"},
+		{"mousemove", "--sync", "--", "3", "4"},
 		{"mouseup", "1"},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -123,8 +139,21 @@ func TestBuildXdotoolInvocationsScrollTypeKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got, [][]string{{"type", "--", "hello world"}}) {
+	if !reflect.DeepEqual(got, [][]string{{"type", "--delay", "12", "--", "hello world"}}) {
 		t.Fatalf("type = %v", got)
+	}
+
+	got, err = buildXdotoolInvocations("type", []string{"a\nb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantType := [][]string{
+		{"type", "--delay", "12", "--", "a"},
+		{"key", "--", "Return"},
+		{"type", "--delay", "12", "--", "b"},
+	}
+	if !reflect.DeepEqual(got, wantType) {
+		t.Fatalf("type newlines = %v, want %v", got, wantType)
 	}
 
 	got, err = buildXdotoolInvocations("key", []string{"ctrl+s"})
@@ -135,8 +164,44 @@ func TestBuildXdotoolInvocationsScrollTypeKey(t *testing.T) {
 		t.Fatalf("key = %v", got)
 	}
 
+	got, err = buildXdotoolInvocations("key", []string{"a", "--hold-ms", "100"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHold := [][]string{
+		{"keydown", "--", "a"},
+		{"__sleep_ms__", "100"},
+		{"keyup", "--", "a"},
+	}
+	if !reflect.DeepEqual(got, wantHold) {
+		t.Fatalf("key hold = %v, want %v", got, wantHold)
+	}
+
+	got, err = buildXdotoolInvocations("mouse_down", []string{"--button", "left", "--x", "9", "--y", "8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDown := [][]string{
+		{"mousemove", "--sync", "--", "9", "8"},
+		{"mousedown", "1"},
+	}
+	if !reflect.DeepEqual(got, wantDown) {
+		t.Fatalf("mouse_down = %v, want %v", got, wantDown)
+	}
+
 	if _, err := buildXdotoolInvocations("teleport", nil); err == nil {
 		t.Fatal("expected unknown action to error")
+	}
+}
+
+func TestCoordScaler(t *testing.T) {
+	s := newCoordScaler(1280, 800, 1920, 1200)
+	x, y := s.scaleXY(640, 400)
+	if x != 960 || y != 600 {
+		t.Fatalf("scaleXY = %d,%d", x, y)
+	}
+	if s.unscaleX(960) != 640 || s.unscaleY(600) != 400 {
+		t.Fatalf("unscale failed")
 	}
 }
 

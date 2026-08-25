@@ -60,7 +60,7 @@ type recordOptions struct {
 // parsed action; runInputOps executes them in order. Kept as data so the
 // construction stays pure and unit-testable without a display.
 type inputOp struct {
-	kind string // move, click, drag, scroll, type, key
+	kind string // move, click, drag, scroll, type, key, mouse_down, mouse_up, keydown, keyup, sleep_ms
 	x    int
 	y    int
 	toX  int
@@ -71,10 +71,11 @@ type inputOp struct {
 	count  int
 	// dy/dx are wheel notches (dy positive scrolls up, dx positive scrolls
 	// right), matching the Linux scroll directions.
-	dy   int
-	dx   int
-	text string
-	key  string
+	dy      int
+	dx      int
+	text    string
+	key     string
+	sleepMs int
 }
 
 func isIntArg(value string) bool {
@@ -174,8 +175,12 @@ func runCursorPositionCommand(args []string, stdout io.Writer) error {
 // --- input (SendInput) -----------------------------------------------------
 
 func runInputCommand(args []string, stdout io.Writer) error {
+	apiSizeFlag, args, err := extractAPISizeFlag(args)
+	if err != nil {
+		return err
+	}
 	if len(args) == 0 {
-		return errors.New("input requires an action: move, click, drag, scroll, type, key, or wait")
+		return errors.New("input requires an action: move, click, drag, scroll, type, key, mouse_down, mouse_up, or wait")
 	}
 	action := args[0]
 	rest := args[1:]
@@ -194,15 +199,25 @@ func runInputCommand(args []string, stdout io.Writer) error {
 		return nil
 	}
 
-	ops, err := buildInputOps(action, rest)
-	if err != nil {
-		return err
-	}
 	// Global synthetic input moves the real pointer / keyboard and can change
 	// foreground focus, so it sits behind the same explicit gate as
 	// input_method=global / click_method=global.
 	if !envFlagEnabled(foregroundInputFlag) {
 		return fmt.Errorf("input actions move the real pointer/keyboard and require %s=1", foregroundInputFlag)
+	}
+
+	scaler, err := resolveInputScaler(apiSizeFlag)
+	if err != nil {
+		return err
+	}
+	rest, err = scaleInputRestCoords(action, rest, scaler)
+	if err != nil {
+		return err
+	}
+
+	ops, err := buildInputOps(action, rest)
+	if err != nil {
+		return err
 	}
 	if err := runInputOps(ops); err != nil {
 		return err
@@ -212,6 +227,90 @@ func runInputCommand(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "input %s ok\n", action)
 	return nil
+}
+
+func extractAPISizeFlag(args []string) (string, []string, error) {
+	var apiSize string
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--api-size" {
+			i++
+			if i >= len(args) {
+				return "", nil, errors.New("--api-size requires a value (e.g. 1280x800)")
+			}
+			apiSize = args[i]
+			continue
+		}
+		rest = append(rest, args[i])
+	}
+	return apiSize, rest, nil
+}
+
+func resolveInputScaler(apiSizeFlag string) (coordScaler, error) {
+	apiW, apiH := 0, 0
+	var err error
+	if apiSizeFlag != "" {
+		apiW, apiH, err = parseAPISize(apiSizeFlag)
+		if err != nil {
+			return coordScaler{}, err
+		}
+	} else {
+		apiW, apiH, err = resolveAPISizeFromEnv()
+		if err != nil {
+			return coordScaler{}, err
+		}
+	}
+	if apiW == 0 || apiH == 0 {
+		return coordScaler{}, nil
+	}
+	info, err := queryPointer()
+	if err != nil || info.ScreenWidth <= 0 || info.ScreenHeight <= 0 {
+		return coordScaler{}, nil
+	}
+	return newCoordScaler(apiW, apiH, info.ScreenWidth, info.ScreenHeight), nil
+}
+
+// scaleInputRestCoords rewrites integer coordinates in rest from API→display space.
+func scaleInputRestCoords(action string, rest []string, scaler coordScaler) ([]string, error) {
+	if !scaler.active() {
+		return rest, nil
+	}
+	out := append([]string(nil), rest...)
+	switch action {
+	case "move":
+		if len(out) >= 2 && isIntArg(out[0]) && isIntArg(out[1]) {
+			x, _ := strconv.Atoi(out[0])
+			y, _ := strconv.Atoi(out[1])
+			sx, sy := scaler.scaleXY(x, y)
+			out[0], out[1] = strconv.Itoa(sx), strconv.Itoa(sy)
+		}
+	case "drag":
+		if len(out) >= 4 {
+			for i := 0; i < 4; i++ {
+				if !isIntArg(out[i]) {
+					continue
+				}
+				v, _ := strconv.Atoi(out[i])
+				if i%2 == 0 {
+					out[i] = strconv.Itoa(scaler.scaleX(v))
+				} else {
+					out[i] = strconv.Itoa(scaler.scaleY(v))
+				}
+			}
+		}
+	case "click", "scroll", "mouse_down", "mousedown", "mouse_up", "mouseup":
+		for i := 0; i+1 < len(out); i++ {
+			if out[i] == "--x" && isIntArg(out[i+1]) {
+				v, _ := strconv.Atoi(out[i+1])
+				out[i+1] = strconv.Itoa(scaler.scaleX(v))
+			}
+			if out[i] == "--y" && isIntArg(out[i+1]) {
+				v, _ := strconv.Atoi(out[i+1])
+				out[i+1] = strconv.Itoa(scaler.scaleY(v))
+			}
+		}
+	}
+	return out, nil
 }
 
 // buildInputOps turns a parsed input action into SendInput operations. Kept
@@ -227,15 +326,52 @@ func buildInputOps(action string, rest []string) ([]inputOp, error) {
 		return []inputOp{{kind: "move", x: x, y: y}}, nil
 
 	case "click":
-		button, count, x, y, err := parseClickParams(rest)
+		mods, rest2, err := parseModifiersFlag(rest)
 		if err != nil {
 			return nil, err
 		}
-		ops := make([]inputOp, 0, 2)
-		if x != "" && y != "" {
-			ops = append(ops, inputOp{kind: "move", x: atoiOrZero(x), y: atoiOrZero(y)})
+		button, count, x, y, err := parseClickParams(rest2)
+		if err != nil {
+			return nil, err
 		}
-		return append(ops, inputOp{kind: "click", button: button, count: count}), nil
+		var body []inputOp
+		if x != "" && y != "" {
+			body = append(body, inputOp{kind: "move", x: atoiOrZero(x), y: atoiOrZero(y)})
+		}
+		body = append(body, inputOp{kind: "click", button: button, count: count})
+		return wrapOpsWithModifiers(mods, body)
+
+	case "mouse_down", "mousedown":
+		mods, rest2, err := parseModifiersFlag(rest)
+		if err != nil {
+			return nil, err
+		}
+		button, _, x, y, err := parseClickParams(rest2)
+		if err != nil {
+			return nil, err
+		}
+		var body []inputOp
+		if x != "" && y != "" {
+			body = append(body, inputOp{kind: "move", x: atoiOrZero(x), y: atoiOrZero(y)})
+		}
+		body = append(body, inputOp{kind: "mouse_down", button: button})
+		return wrapOpsWithModifiers(mods, body)
+
+	case "mouse_up", "mouseup":
+		mods, rest2, err := parseModifiersFlag(rest)
+		if err != nil {
+			return nil, err
+		}
+		button, _, x, y, err := parseClickParams(rest2)
+		if err != nil {
+			return nil, err
+		}
+		var body []inputOp
+		if x != "" && y != "" {
+			body = append(body, inputOp{kind: "move", x: atoiOrZero(x), y: atoiOrZero(y)})
+		}
+		body = append(body, inputOp{kind: "mouse_up", button: button})
+		return wrapOpsWithModifiers(mods, body)
 
 	case "drag":
 		if len(rest) < 4 {
@@ -263,36 +399,127 @@ func buildInputOps(action string, rest []string) ([]inputOp, error) {
 		if len(rest) == 0 {
 			return nil, errors.New("scroll requires a direction: up, down, left, or right")
 		}
-		dy, dx, ok := scrollNotches(rest[0])
-		if !ok {
-			return nil, fmt.Errorf("invalid scroll direction %q (up, down, left, right)", rest[0])
-		}
-		amount, err := parseAmountFlag(rest[1:], 3)
+		mods, rest2, err := parseModifiersFlag(rest)
 		if err != nil {
 			return nil, err
 		}
-		return []inputOp{{kind: "scroll", dy: dy * amount, dx: dx * amount}}, nil
+		dy, dx, ok := scrollNotches(rest2[0])
+		if !ok {
+			return nil, fmt.Errorf("invalid scroll direction %q (up, down, left, right)", rest2[0])
+		}
+		x, y, rest3, err := parseOptionalXY(rest2[1:])
+		if err != nil {
+			return nil, err
+		}
+		amount, err := parseAmountFlag(rest3, 3)
+		if err != nil {
+			return nil, err
+		}
+		var body []inputOp
+		if x != "" && y != "" {
+			body = append(body, inputOp{kind: "move", x: atoiOrZero(x), y: atoiOrZero(y)})
+		}
+		body = append(body, inputOp{kind: "scroll", dy: dy * amount, dx: dx * amount})
+		return wrapOpsWithModifiers(mods, body)
 
 	case "type":
 		if len(rest) == 0 {
 			return nil, errors.New("type requires text, e.g. 'input type \"hello\"'")
 		}
-		return []inputOp{{kind: "type", text: strings.Join(rest, " ")}}, nil
+		return buildTypeOps(strings.Join(rest, " ")), nil
 
 	case "key":
-		if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" {
-			return nil, errors.New("key requires a single key or chord, e.g. 'input key ctrl+s'")
-		}
-		// Same non-negotiable deny as press_key: the Windows/Meta key must
-		// never be pressed, even on the raw display-level path.
-		if err := validateKeyChord(rest[0]); err != nil {
+		holdMs, rest2, err := parseHoldMsFlag(rest)
+		if err != nil {
 			return nil, err
 		}
-		return []inputOp{{kind: "key", key: rest[0]}}, nil
+		if len(rest2) != 1 || strings.TrimSpace(rest2[0]) == "" {
+			return nil, errors.New("key requires a single key or chord, e.g. 'input key ctrl+s'")
+		}
+		return buildKeyOps(rest2[0], holdMs)
 
 	default:
 		return nil, fmt.Errorf("unknown input action: %s", action)
 	}
+}
+
+func wrapOpsWithModifiers(mods []string, body []inputOp) ([]inputOp, error) {
+	if err := validateModifierList(mods); err != nil {
+		return nil, err
+	}
+	if len(mods) == 0 {
+		return body, nil
+	}
+	ops := make([]inputOp, 0, len(mods)*2+len(body))
+	for _, m := range mods {
+		ops = append(ops, inputOp{kind: "keydown", key: m})
+	}
+	ops = append(ops, body...)
+	for i := len(mods) - 1; i >= 0; i-- {
+		ops = append(ops, inputOp{kind: "keyup", key: mods[i]})
+	}
+	return ops, nil
+}
+
+func validateModifierList(mods []string) error {
+	for _, m := range mods {
+		normalized := strings.ToLower(strings.TrimSpace(m))
+		for _, banned := range bannedModifierNames {
+			if normalized == banned {
+				return fmt.Errorf("press_key with the Windows/Meta key (%s) is not permitted by the official Computer Use safety policy.", m)
+			}
+		}
+	}
+	return nil
+}
+
+func buildTypeOps(text string) []inputOp {
+	segments := splitTypeSegments(text)
+	var ops []inputOp
+	for i, seg := range segments {
+		if i > 0 {
+			ops = append(ops, inputOp{kind: "key", key: "Return"})
+		}
+		if seg == "" {
+			continue
+		}
+		for _, chunk := range chunkString(seg, defaultTypingBatchSize) {
+			ops = append(ops, inputOp{kind: "type", text: chunk})
+		}
+	}
+	if len(ops) == 0 {
+		ops = append(ops, inputOp{kind: "type", text: ""})
+	}
+	return ops
+}
+
+func buildKeyOps(key string, holdMs int) ([]inputOp, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, errors.New("key requires a single key or chord, e.g. 'input key ctrl+s'")
+	}
+	if err := validateKeyChord(key); err != nil {
+		return nil, err
+	}
+	if holdMs > 0 {
+		parts := strings.Split(key, "+")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+			if parts[i] == "" {
+				return nil, fmt.Errorf("invalid key chord %q", key)
+			}
+		}
+		var ops []inputOp
+		for _, p := range parts {
+			ops = append(ops, inputOp{kind: "keydown", key: p})
+		}
+		ops = append(ops, inputOp{kind: "sleep_ms", sleepMs: holdMs})
+		for i := len(parts) - 1; i >= 0; i-- {
+			ops = append(ops, inputOp{kind: "keyup", key: parts[i]})
+		}
+		return ops, nil
+	}
+	return []inputOp{{kind: "key", key: key}}, nil
 }
 
 func atoiOrZero(value string) int {
@@ -391,12 +618,15 @@ func parseAmountFlag(rest []string, fallback int) (int, error) {
 
 func runRecordCommand(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("record requires a subcommand: start, stop, discard, polish, or status")
+		return errors.New("record requires a subcommand: start, stop, discard, polish, proxy, or status")
 	}
 	sub := args[0]
 	rest := args[1:]
 	if sub == "polish" {
 		return runPolishCommand(rest, stdout)
+	}
+	if sub == "proxy" {
+		return runProxyCommand(rest, stdout)
 	}
 
 	var output, pidfile, saveAs, quality string
@@ -427,7 +657,7 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 		case "--quality":
 			i++
 			if i >= len(rest) {
-				return errors.New("--quality requires a value (demo, draft, or proxy)")
+				return errors.New("--quality requires a value (demo, draft, proxy, or anyos)")
 			}
 			quality = rest[i]
 		case "--draw-mouse":
@@ -605,8 +835,10 @@ func normalizeRecordQuality(value string) (string, error) {
 		return "draft", nil
 	case "proxy":
 		return "proxy", nil
+	case "anyos", "120":
+		return "anyos", nil
 	default:
-		return "", fmt.Errorf("invalid --quality %q (demo, draft, or proxy)", value)
+		return "", fmt.Errorf("invalid --quality %q (demo, draft, proxy, or anyos)", value)
 	}
 }
 
@@ -641,7 +873,7 @@ func buildFfmpegRecordArgs(output string, opts recordOptions) []string {
 	switch opts.quality {
 	case "draft":
 		args = append(args, "-preset", "ultrafast", "-pix_fmt", "yuv420p")
-	case "proxy":
+	case "proxy", "anyos":
 		args = append(args,
 			"-preset", "veryfast",
 			"-crf", "17",

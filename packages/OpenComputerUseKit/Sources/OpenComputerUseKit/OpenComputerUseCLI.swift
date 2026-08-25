@@ -10,7 +10,7 @@ public enum OpenComputerUseCLICommand: Equatable {
     case turnEnded(payload: String?)
     case screenshot(output: String?)
     case cursorPosition
-    case input(DesktopInputAction)
+    case input(DesktopInputCommand)
     case record(DesktopRecordRequest)
     case help(command: String?)
     case version
@@ -130,8 +130,8 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
           turn-ended           Notify the running MCP process that the host turn ended.
           screenshot           Capture the whole desktop to PNG (Screen Recording permission).
           cursor-position      Print the pointer position and desktop size as JSON.
-          input <action>       Global CGEvent input: move/click/drag/scroll/type/key/wait.
-          record <start|stop|discard|polish|status>  Record screen; polish overlays via ffmpeg+ASS.
+          input <action>       Global CGEvent input: move/click/drag/scroll/type/key/wait/mouse_down/mouse_up.
+          record <start|stop|discard|polish|proxy|status>  Record screen; polish overlays via ffmpeg+ASS.
           help [command]       Show general or command-specific help.
           version              Print the CLI version.
 
@@ -230,44 +230,49 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
     case "input":
         return """
         Usage:
-          open-computer-use input <action> [options]
+          open-computer-use input [--api-size WxH] <action> [options]
 
         Actions (global synthetic input via CGEvent):
           move <x> <y>
-          click [--button left|right|middle] [--count N] [--x X --y Y]
+          click [--button left|right|middle] [--count N] [--modifiers ctrl+shift] [--x X --y Y]
+          mouse_down|mouse_up [--button left|right|middle] [--modifiers ...] [--x X --y Y]
           drag <from_x> <from_y> <to_x> <to_y> [--button left]
-          scroll <up|down|left|right> [--amount N]
-          type <text>
-          key <key-or-chord>          e.g. ctrl+s, Return, Page_Up
+          scroll <up|down|left|right> [--amount N] [--modifiers ...] [--x X --y Y]
+          type <text>                 newlines become Return; long text is batched (~50 chars)
+          key <key-or-chord> [--hold-ms N]   e.g. ctrl+s, Return, Page_Up
           wait <seconds>
 
-        Every action except wait moves the real pointer/keyboard and requires
-        OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1 plus the Accessibility
-        permission (run `open-computer-use doctor` to grant).
+        --api-size (or OPEN_COMPUTER_USE_API_SIZE / WIDTH+HEIGHT) maps model/API
+        coordinates to the display when sizes differ. Every action except wait moves
+        the real pointer/keyboard and requires OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1
+        plus the Accessibility permission (run `open-computer-use doctor` to grant).
         """
     case "record":
         return """
         Usage:
           open-computer-use record start [--output <path.mp4|.mov>] [--fps N]
-                                         [--quality demo|draft|proxy] [--draw-mouse 0|1] [--polish] [--pidfile <path>]
+                                         [--quality demo|draft|proxy|anyos] [--draw-mouse 0|1] [--polish] [--pidfile <path>]
           open-computer-use record stop  [--pidfile <path>] [--save-as <name-or-path>] [--polish]
           open-computer-use record discard [--pidfile <path>]
           open-computer-use record polish --input <raw.mp4> [--events <file>] [--output <polished.mp4>]
+                                         [--plan <render-plan.json>] [--write-plan <file>] [--no-write-plan]
                                          [--engine compositor|ffmpeg] [--cursor-style slow|mellow|quick|rapid]
                                          [--ripples] [--no-ripples] [--no-keystrokes] [--no-cursor]
                                          [--no-idle-speedup] [--no-zoom]
+          open-computer-use record proxy --input <raw.mp4> [--output-dir <dir>] [--1080p] [--full] [--no-1080p] [--no-full]
           open-computer-use record status [--pidfile <path>]
 
         Record the screen. Prefers ffmpeg avfoundation when ffmpeg is on PATH
         (same demo-quality H.264 mp4 encode as Linux/Windows / Cursor RecordScreen:
-        veryfast + crf 17 + High + faststart). Falls back to /usr/sbin/screencapture
-        -v (.mov; --fps/--quality/--draw-mouse ignored). While recording, display
-        `input` actions append <output>.events.json. `record polish` (or start/stop
-        --polish) uses the macOS ffmpeg+ASS path (accepts `--engine` for CLI parity
-        with Linux/Windows compositor). Overlays: cursor depress + Screen Studio
-        easing, ease-in/out zoom, keystroke captions, optional --ripples. --polish
-        on start defaults draw-mouse to 0 (ffmpeg -capture_cursor 0). discard stops
-        and deletes the output plus sidecars. Defaults: fps 30, quality demo,
+        veryfast + crf 17 + High + faststart; proxy/anyos use all-intra keyint=1).
+        Falls back to /usr/sbin/screencapture -v (.mov; --fps/--quality/--draw-mouse ignored).
+        While recording, display `input` actions append <output>.events.json after each action
+        completes. `record polish` uses the macOS ffmpeg+ASS path (accepts `--engine` and
+        `--plan` for CLI parity; writes simplified `<stem>.render-plan.json` unless
+        `--no-write-plan`). `record proxy` shells ffmpeg to produce proxy-1080p.mp4 and
+        proxy-full.mp4 (crf 17, veryfast, keyint=1). Overlays: cursor ghost, keystroke
+        captions, optional --ripples. --polish on start defaults draw-mouse to 0. discard
+        stops and deletes the output plus sidecars. Defaults: fps 30, quality demo,
         draw-mouse 1, output in $TMPDIR, pidfile $TMPDIR/open-computer-use-record.pid.
         Requires Screen Recording permission (run `open-computer-use doctor` to grant).
         Override the avfoundation device with OPEN_COMPUTER_USE_AVFOUNDATION_SCREEN.
@@ -444,7 +449,7 @@ private func parseDesktopInput(arguments: [String]) throws -> OpenComputerUseCLI
     if arguments.count == 1, let option = arguments.first, option == "-h" || option == "--help" {
         return .help(command: "input")
     }
-    return .input(try parseDesktopInputArguments(arguments))
+    return .input(try parseDesktopInputCommand(arguments))
 }
 
 private func parseDesktopRecord(arguments: [String]) throws -> OpenComputerUseCLICommand {

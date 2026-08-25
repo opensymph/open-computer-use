@@ -126,6 +126,60 @@ func TestBuildInputOpsScrollTypeKey(t *testing.T) {
 		t.Fatalf("type = %#v", got)
 	}
 
+	got, err = buildInputOps("type", []string{"a\nb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantType := []inputOp{
+		{kind: "type", text: "a"},
+		{kind: "key", key: "Return"},
+		{kind: "type", text: "b"},
+	}
+	if !reflect.DeepEqual(got, wantType) {
+		t.Fatalf("type newlines = %#v, want %#v", got, wantType)
+	}
+
+	got, err = buildInputOps("key", []string{"a", "--hold-ms", "100"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHold := []inputOp{
+		{kind: "keydown", key: "a"},
+		{kind: "sleep_ms", sleepMs: 100},
+		{kind: "keyup", key: "a"},
+	}
+	if !reflect.DeepEqual(got, wantHold) {
+		t.Fatalf("key hold = %#v, want %#v", got, wantHold)
+	}
+
+	got, err = buildInputOps("mouse_down", []string{"--button", "left", "--x", "9", "--y", "8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDown := []inputOp{
+		{kind: "move", x: 9, y: 8},
+		{kind: "mouse_down", button: 1},
+	}
+	if !reflect.DeepEqual(got, wantDown) {
+		t.Fatalf("mouse_down = %#v, want %#v", got, wantDown)
+	}
+
+	got, err = buildInputOps("click", []string{"--modifiers", "ctrl+shift", "--x", "1", "--y", "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMods := []inputOp{
+		{kind: "keydown", key: "ctrl"},
+		{kind: "keydown", key: "shift"},
+		{kind: "move", x: 1, y: 2},
+		{kind: "click", button: 1, count: 1},
+		{kind: "keyup", key: "shift"},
+		{kind: "keyup", key: "ctrl"},
+	}
+	if !reflect.DeepEqual(got, wantMods) {
+		t.Fatalf("click+mods = %#v, want %#v", got, wantMods)
+	}
+
 	got, err = buildInputOps("key", []string{"ctrl+s"})
 	if err != nil {
 		t.Fatal(err)
@@ -141,6 +195,41 @@ func TestBuildInputOpsScrollTypeKey(t *testing.T) {
 
 	if _, err := buildInputOps("teleport", nil); err == nil {
 		t.Fatal("expected unknown action to error")
+	}
+}
+
+func TestCoordScaler(t *testing.T) {
+	s := newCoordScaler(1280, 800, 1920, 1200)
+	x, y := s.scaleXY(640, 400)
+	if x != 960 || y != 600 {
+		t.Fatalf("scaleXY = %d,%d", x, y)
+	}
+	if s.unscaleX(960) != 640 || s.unscaleY(600) != 400 {
+		t.Fatalf("unscale failed")
+	}
+}
+
+func TestScaleInputRestCoords(t *testing.T) {
+	s := newCoordScaler(1280, 800, 1920, 1200)
+	got, err := scaleInputRestCoords("move", []string{"640", "400"}, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []string{"960", "600"}) {
+		t.Fatalf("scale move = %v", got)
+	}
+}
+
+func TestExtractAPISizeFlag(t *testing.T) {
+	apiSize, rest, err := extractAPISizeFlag([]string{"--api-size", "1280x800", "move", "1", "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if apiSize != "1280x800" || !reflect.DeepEqual(rest, []string{"move", "1", "2"}) {
+		t.Fatalf("extractAPISizeFlag = %q %v", apiSize, rest)
+	}
+	if _, _, err := extractAPISizeFlag([]string{"--api-size"}); err == nil {
+		t.Fatal("expected error for dangling --api-size")
 	}
 }
 
@@ -224,6 +313,10 @@ func TestNormalizeRecordQuality(t *testing.T) {
 	if _, err := normalizeRecordQuality("nope"); err == nil {
 		t.Fatal("expected invalid quality to fail")
 	}
+	got, err = normalizeRecordQuality("anyos")
+	if err != nil || got != "anyos" {
+		t.Fatalf("anyos quality = %q, %v", got, err)
+	}
 }
 
 func TestRelocateRecordOutput(t *testing.T) {
@@ -280,7 +373,7 @@ func TestScreenshotHelpAndDispatch(t *testing.T) {
 		}
 	}
 	recordHelp := helpText("record")
-	for _, needle := range []string{"polish", "--polish", "events.json"} {
+	for _, needle := range []string{"polish", "--polish", "events.json", "proxy", "anyos"} {
 		if !strings.Contains(recordHelp, needle) {
 			t.Fatalf("record help missing %q:\n%s", needle, recordHelp)
 		}
@@ -294,6 +387,12 @@ func TestScreenshotHelpAndDispatch(t *testing.T) {
 	}
 	if !strings.Contains(top, "polish") {
 		t.Fatalf("top-level help missing polish subcommand:\n%s", top)
+	}
+	inputHelp := helpText("input")
+	for _, needle := range []string{"--api-size", "mouse_down", "--hold-ms", "--modifiers"} {
+		if !strings.Contains(inputHelp, needle) {
+			t.Fatalf("input help missing %q:\n%s", needle, inputHelp)
+		}
 	}
 }
 

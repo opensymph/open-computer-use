@@ -141,6 +141,12 @@ func runInputOps(ops []inputOp) error {
 			err = realMouseMove(op.x, op.y)
 		case "click":
 			err = realMouseClick(mouseButtonName(op.button), op.count)
+		case "mouse_down":
+			down, _ := mouseDownUpFlags(mouseButtonName(op.button))
+			err = sendInputs([]tagINPUT{mouseEvent(down, 0, 0, 0)})
+		case "mouse_up":
+			_, up := mouseDownUpFlags(mouseButtonName(op.button))
+			err = sendInputs([]tagINPUT{mouseEvent(up, 0, 0, 0)})
 		case "drag":
 			err = realMouseDragButton(op.x, op.y, op.toX, op.toY, mouseButtonName(op.button))
 		case "scroll":
@@ -154,6 +160,14 @@ func runInputOps(ops []inputOp) error {
 			if err == nil {
 				err = realKeyChord(modifiers, vk)
 			}
+		case "keydown":
+			err = realKeyDownName(op.key)
+		case "keyup":
+			err = realKeyUpName(op.key)
+		case "sleep_ms":
+			if op.sleepMs > 0 {
+				sleepMs(op.sleepMs)
+			}
 		default:
 			err = fmt.Errorf("unknown input op: %s", op.kind)
 		}
@@ -162,6 +176,29 @@ func runInputOps(ops []inputOp) error {
 		}
 	}
 	return nil
+}
+
+func vkForKeyName(name string) (uint16, error) {
+	if vk, err := modifierVirtualKeyForName(name); err == nil {
+		return vk, nil
+	}
+	return virtualKeyForName(name)
+}
+
+func realKeyDownName(name string) error {
+	vk, err := vkForKeyName(name)
+	if err != nil {
+		return err
+	}
+	return sendInputs([]tagINPUT{keyEvent(vk, mapVirtualKey(vk), keyeventfScancode)})
+}
+
+func realKeyUpName(name string) error {
+	vk, err := vkForKeyName(name)
+	if err != nil {
+		return err
+	}
+	return sendInputs([]tagINPUT{keyEvent(vk, mapVirtualKey(vk), keyeventfScancode|keyeventfKeyUp)})
 }
 
 // --- record (ffmpeg gdigrab) ----------------------------------------------

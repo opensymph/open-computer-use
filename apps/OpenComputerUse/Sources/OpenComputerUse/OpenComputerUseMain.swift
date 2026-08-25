@@ -76,8 +76,8 @@ enum OpenComputerUseMain {
             print(try DesktopCommandRunner.runScreenshot(outputPath: output))
         case .cursorPosition:
             print(try DesktopCommandRunner.runCursorPosition())
-        case let .input(action):
-            print(try DesktopCommandRunner.runInput(action))
+        case let .input(command):
+            print(try DesktopCommandRunner.runInput(command))
         case let .record(request):
             print(try DesktopCommandRunner.runRecord(request))
         case let .help(command):

@@ -31,15 +31,19 @@ final class DesktopCommandTests: XCTestCase {
     func testCLIRecognizesInputCommands() throws {
         XCTAssertEqual(
             try parseOpenComputerUseCLI(arguments: ["input", "move", "100", "200"]),
-            .input(.move(x: 100, y: 200))
+            .input(DesktopInputCommand(action: .move(x: 100, y: 200)))
         )
         XCTAssertEqual(
             try parseOpenComputerUseCLI(arguments: ["input", "key", "ctrl+s"]),
-            .input(.key(specification: "ctrl+s"))
+            .input(DesktopInputCommand(action: .key(specification: "ctrl+s", holdMs: 0)))
         )
         XCTAssertEqual(
             try parseOpenComputerUseCLI(arguments: ["input", "wait", "1.5"]),
-            .input(.wait(seconds: 1.5))
+            .input(DesktopInputCommand(action: .wait(seconds: 1.5)))
+        )
+        XCTAssertEqual(
+            try parseOpenComputerUseCLI(arguments: ["input", "--api-size", "1280x800", "move", "1", "2"]),
+            .input(DesktopInputCommand(action: .move(x: 1, y: 2), apiSize: "1280x800"))
         )
         XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["input"]))
         XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["input", "teleport"]))
@@ -84,9 +88,47 @@ final class DesktopCommandTests: XCTestCase {
                 idleRate: 4
             ))
         )
+        XCTAssertEqual(
+            try parseOpenComputerUseCLI(arguments: ["record", "start", "--quality", "anyos", "--fps", "120"]),
+            .record(DesktopRecordRequest(subcommand: .start, output: nil, fps: 120, pidfile: nil, quality: "anyos"))
+        )
+        XCTAssertEqual(
+            try parseOpenComputerUseCLI(arguments: ["record", "proxy", "--input", "/tmp/a.mp4", "--output-dir", "/tmp/proxies"]),
+            .record(DesktopRecordRequest(
+                subcommand: .proxy,
+                output: nil,
+                fps: 30,
+                pidfile: nil,
+                proxyInput: "/tmp/a.mp4",
+                proxyOutputDir: "/tmp/proxies"
+            ))
+        )
+        XCTAssertEqual(
+            try parseOpenComputerUseCLI(arguments: ["record", "polish", "--input", "/tmp/a.mp4", "--no-write-plan"]),
+            .record(DesktopRecordRequest(
+                subcommand: .polish,
+                output: nil,
+                fps: 30,
+                pidfile: nil,
+                polishInput: "/tmp/a.mp4",
+                writePlan: false
+            ))
+        )
         XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["record"]))
         XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["record", "pause"]))
         XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["record", "polish"]))
+    }
+
+    func testBuildFfmpegAvfoundationArgsAnyosQuality() {
+        let args = DesktopRecord.buildFfmpegAvfoundationArgs(
+            output: "/tmp/out.mp4",
+            fps: 120,
+            quality: "anyos",
+            drawMouse: 1,
+            screenDevice: "Capture screen 0"
+        )
+        XCTAssertTrue(args.contains("120"))
+        XCTAssertTrue(args.contains(where: { $0.contains("keyint=1") }))
     }
 
     func testBuildFfmpegAvfoundationArgsDemoQuality() {
@@ -119,8 +161,12 @@ final class DesktopCommandTests: XCTestCase {
             XCTAssertTrue(openComputerUseHelpText(command: topic).contains("Usage:"))
         }
         let recordHelp = openComputerUseHelpText(command: "record")
-        for needle in ["polish", "--polish", "events.json"] {
+        for needle in ["polish", "--polish", "events.json", "proxy", "anyos", "render-plan"] {
             XCTAssertTrue(recordHelp.contains(needle), "record help missing \(needle):\n\(recordHelp)")
+        }
+        let inputHelp = openComputerUseHelpText(command: "input")
+        for needle in ["--api-size", "mouse_down", "--hold-ms", "--modifiers"] {
+            XCTAssertTrue(inputHelp.contains(needle), "input help missing \(needle):\n\(inputHelp)")
         }
         let top = openComputerUseHelpText(command: nil)
         for command in ["screenshot", "cursor-position", "input", "record"] {
@@ -133,7 +179,7 @@ final class DesktopCommandTests: XCTestCase {
         for command: OpenComputerUseCLICommand in [
             .screenshot(output: nil),
             .cursorPosition,
-            .input(.move(x: 1, y: 2)),
+            .input(DesktopInputCommand(action: .move(x: 1, y: 2))),
             .record(DesktopRecordRequest(subcommand: .status, output: nil, fps: 30, pidfile: nil)),
         ] {
             XCTAssertTrue(
@@ -173,13 +219,50 @@ final class DesktopCommandTests: XCTestCase {
     func testParseDesktopInputClick() throws {
         XCTAssertEqual(
             try parseDesktopInputArguments(["click", "--button", "right", "--count", "2", "--x", "5", "--y", "6"]),
-            .click(button: "right", count: 2, x: 5, y: 6)
+            .click(button: "right", count: 2, x: 5, y: 6, modifiers: [])
+        )
+        XCTAssertEqual(
+            try parseDesktopInputArguments(["click", "--modifiers", "ctrl+shift", "--x", "1", "--y", "2"]),
+            .click(button: "left", count: 1, x: 1, y: 2, modifiers: ["ctrl", "shift"])
         )
         XCTAssertEqual(
             try parseDesktopInputArguments(["click"]),
-            .click(button: "left", count: 1, x: nil, y: nil)
+            .click(button: "left", count: 1, x: nil, y: nil, modifiers: [])
         )
         XCTAssertThrowsError(try parseDesktopInputArguments(["click", "--x", "5"])) // --x without --y
+    }
+
+    func testParseDesktopInputMouseDownUpAndHoldKey() throws {
+        XCTAssertEqual(
+            try parseDesktopInputArguments(["mouse_down", "--button", "left", "--x", "9", "--y", "8"]),
+            .mouseDown(button: "left", x: 9, y: 8, modifiers: [])
+        )
+        XCTAssertEqual(
+            try parseDesktopInputArguments(["mouse_up", "--button", "right"]),
+            .mouseUp(button: "right", x: nil, y: nil, modifiers: [])
+        )
+        XCTAssertEqual(
+            try parseDesktopInputArguments(["key", "a", "--hold-ms", "100"]),
+            .key(specification: "a", holdMs: 100)
+        )
+    }
+
+    func testParseDesktopAPISizeAndScaling() throws {
+        let (apiSize, rest) = try extractDesktopAPISizeFlag(["--api-size", "1280x800", "move", "640", "400"])
+        XCTAssertEqual(apiSize, "1280x800")
+        XCTAssertEqual(rest, ["move", "640", "400"])
+        let parsed = try parseDesktopAPISize("1280x800")
+        XCTAssertEqual(parsed.width, 1280)
+        XCTAssertEqual(parsed.height, 800)
+        let scaler = DesktopCoordScaler(apiWidth: 1280, apiHeight: 800, displayWidth: 2560, displayHeight: 1600)
+        XCTAssertTrue(scaler.isActive)
+        let scaled = scaleDesktopInputAction(.move(x: 640, y: 400), scaler: scaler)
+        XCTAssertEqual(scaled, .move(x: 1280, y: 800))
+    }
+
+    func testSplitTypeSegmentsAndChunks() {
+        XCTAssertEqual(splitDesktopTypeSegments("a\nb"), ["a", "b"])
+        XCTAssertEqual(chunkDesktopString("abcdefghijklmnopqrstuvwxyz", size: 10).count, 3)
     }
 
     func testParseDesktopInputDragAndScroll() throws {
@@ -191,11 +274,11 @@ final class DesktopCommandTests: XCTestCase {
 
         XCTAssertEqual(
             try parseDesktopInputArguments(["scroll", "down", "--amount", "5"]),
-            .scroll(direction: "down", amount: 5)
+            .scroll(direction: "down", amount: 5, x: nil, y: nil, modifiers: [])
         )
         XCTAssertEqual(
             try parseDesktopInputArguments(["scroll", "right"]),
-            .scroll(direction: "right", amount: 3)
+            .scroll(direction: "right", amount: 3, x: nil, y: nil, modifiers: [])
         )
         XCTAssertThrowsError(try parseDesktopInputArguments(["scroll", "sideways"]))
     }
@@ -209,7 +292,7 @@ final class DesktopCommandTests: XCTestCase {
 
         XCTAssertEqual(
             try parseDesktopInputArguments(["key", "ctrl+s"]),
-            .key(specification: "ctrl+s")
+            .key(specification: "ctrl+s", holdMs: 0)
         )
         XCTAssertThrowsError(try parseDesktopInputArguments(["key"]))
     }
@@ -257,16 +340,19 @@ final class DesktopCommandTests: XCTestCase {
         XCTAssertEqual(move?.x, 10)
         XCTAssertEqual(move?.y, 20)
 
-        let click = buildRecordEvent(from: .click(button: "right", count: 2, x: 5, y: 6))
+        let click = buildRecordEvent(from: .click(button: "right", count: 2, x: 5, y: 6, modifiers: []))
         XCTAssertEqual(click?.button, "right")
         XCTAssertEqual(click?.count, 2)
         XCTAssertEqual(click?.x, 5)
         XCTAssertEqual(click?.y, 6)
 
+        let mouseDown = buildRecordEvent(from: .mouseDown(button: "left", x: 1, y: 2, modifiers: []))
+        XCTAssertEqual(mouseDown?.type, "mouse_down")
+
         let typed = buildRecordEvent(from: .type(text: "hello world"))
         XCTAssertEqual(typed?.text, "hello world")
 
-        let key = buildRecordEvent(from: .key(specification: "ctrl+s"))
+        let key = buildRecordEvent(from: .key(specification: "ctrl+s", holdMs: 50))
         XCTAssertEqual(key?.key, "ctrl+s")
     }
 
@@ -300,7 +386,29 @@ final class DesktopCommandTests: XCTestCase {
         XCTAssertEqual(formatASSTime(3_661_020), "1:01:01.02")
         XCTAssertEqual(defaultPolishedOutput(forRaw: "/tmp/a.mp4"), "/tmp/a.polished.mp4")
         XCTAssertEqual(recordEventsPath(forOutput: "/tmp/a.mp4"), "/tmp/a.events.json")
+        XCTAssertEqual(defaultRenderPlanPath(forRaw: "/tmp/a.mp4"), "/tmp/a.render-plan.json")
     }
+
+    func testBuildRenderPlanJSONShape() {
+        let log = DesktopRecordEventLog(
+            startedAtMs: 0,
+            width: 800,
+            height: 600,
+            fps: 30,
+            events: [DesktopRecordEvent(tMs: 100, type: "click", x: 10, y: 20, button: "left", count: 1)]
+        )
+        let segments = [DesktopPolishSegment(startMs: 0, endMs: 1000, rate: 1)]
+        let plan = buildRenderPlanJSON(
+            inputVideo: "/tmp/a.mp4",
+            log: log,
+            durationMs: 1000,
+            opts: .default(),
+            segments: segments,
+            zooms: []
+        )
+        XCTAssertEqual(plan.video.inputVideoPath, "/tmp/a.mp4")
+        XCTAssertEqual(plan.playback.segments.count, 1)
+        XCTAssertEqual(plan.tracks.clickEffects.count, 1)
 
     func testKeyDisplayLabelMapsReturn() {
         let label = keyDisplayLabel("ctrl+Return")

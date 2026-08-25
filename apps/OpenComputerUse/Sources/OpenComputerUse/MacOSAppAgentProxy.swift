@@ -434,8 +434,8 @@ private final class AppAgentConnection: @unchecked Sendable {
             case .cursorPosition:
                 return CLIProxyResponse(stdout: try DesktopCommandRunner.runCursorPosition() + "\n", stderr: "", exitCode: EXIT_SUCCESS)
 
-            case let .input(action):
-                return CLIProxyResponse(stdout: try DesktopCommandRunner.runInput(action) + "\n", stderr: "", exitCode: EXIT_SUCCESS)
+            case let .input(command):
+                return CLIProxyResponse(stdout: try DesktopCommandRunner.runInput(command) + "\n", stderr: "", exitCode: EXIT_SUCCESS)
 
             case let .record(request):
                 return CLIProxyResponse(stdout: try DesktopCommandRunner.runRecord(request) + "\n", stderr: "", exitCode: EXIT_SUCCESS)

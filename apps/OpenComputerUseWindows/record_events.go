@@ -135,12 +135,20 @@ func buildRecordEventFromInput(action string, rest []string) (recordEvent, bool)
 		x, _ := strconv.Atoi(rest[0])
 		y, _ := strconv.Atoi(rest[1])
 		return recordEvent{Type: "move", X: x, Y: y}, true
-	case "click":
-		button, count, x, y, err := parseClickParams(rest)
+	case "click", "mouse_down", "mousedown", "mouse_up", "mouseup":
+		_, rest2, _ := parseModifiersFlag(rest)
+		button, count, x, y, err := parseClickParams(rest2)
 		if err != nil {
 			return recordEvent{}, false
 		}
-		ev := recordEvent{Type: "click", Button: buttonNameFromNumber(button), Count: count}
+		typ := "click"
+		switch action {
+		case "mouse_down", "mousedown":
+			typ = "mouse_down"
+		case "mouse_up", "mouseup":
+			typ = "mouse_up"
+		}
+		ev := recordEvent{Type: typ, Button: buttonNameFromNumber(button), Count: count}
 		if x != "" && y != "" {
 			ev.X, _ = strconv.Atoi(x)
 			ev.Y, _ = strconv.Atoi(y)
@@ -165,21 +173,29 @@ func buildRecordEventFromInput(action string, rest []string) (recordEvent, bool)
 		if len(rest) == 0 {
 			return recordEvent{}, false
 		}
-		amount := 3
-		if len(rest) >= 3 && (rest[1] == "--amount" || rest[1] == "-n") && isIntArg(rest[2]) {
-			amount, _ = strconv.Atoi(rest[2])
+		_, rest2, _ := parseModifiersFlag(rest)
+		if len(rest2) == 0 {
+			return recordEvent{}, false
 		}
-		return recordEvent{Type: "scroll", Direction: strings.ToLower(rest[0]), Amount: amount}, true
+		amount := 3
+		dir := strings.ToLower(rest2[0])
+		for i := 1; i+1 < len(rest2); i++ {
+			if (rest2[i] == "--amount" || rest2[i] == "-n") && isIntArg(rest2[i+1]) {
+				amount, _ = strconv.Atoi(rest2[i+1])
+			}
+		}
+		return recordEvent{Type: "scroll", Direction: dir, Amount: amount}, true
 	case "type":
 		if len(rest) == 0 {
 			return recordEvent{}, false
 		}
 		return recordEvent{Type: "type", Text: strings.Join(rest, " ")}, true
 	case "key":
-		if len(rest) != 1 {
+		_, rest2, err := parseHoldMsFlag(rest)
+		if err != nil || len(rest2) != 1 {
 			return recordEvent{}, false
 		}
-		return recordEvent{Type: "key", Key: rest[0]}, true
+		return recordEvent{Type: "key", Key: rest2[0]}, true
 	case "wait":
 		if len(rest) != 1 {
 			return recordEvent{}, false

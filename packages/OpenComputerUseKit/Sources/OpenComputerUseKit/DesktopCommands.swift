@@ -29,12 +29,25 @@ public struct DesktopPointerInfo: Codable, Equatable, Sendable {
 /// Parsing is pure so it stays unit-testable without a desktop session.
 public enum DesktopInputAction: Equatable, Sendable {
     case move(x: Int, y: Int)
-    case click(button: String, count: Int, x: Int?, y: Int?)
+    case click(button: String, count: Int, x: Int?, y: Int?, modifiers: [String])
+    case mouseDown(button: String, x: Int?, y: Int?, modifiers: [String])
+    case mouseUp(button: String, x: Int?, y: Int?, modifiers: [String])
     case drag(fromX: Int, fromY: Int, toX: Int, toY: Int, button: String)
-    case scroll(direction: String, amount: Int)
+    case scroll(direction: String, amount: Int, x: Int?, y: Int?, modifiers: [String])
     case type(text: String)
-    case key(specification: String)
+    case key(specification: String, holdMs: Int)
     case wait(seconds: Double)
+}
+
+/// Parsed `input` command: action plus optional `--api-size` (env fallback at perform time).
+public struct DesktopInputCommand: Equatable, Sendable {
+    public let action: DesktopInputAction
+    public let apiSize: String?
+
+    public init(action: DesktopInputAction, apiSize: String? = nil) {
+        self.action = action
+        self.apiSize = apiSize
+    }
 }
 
 /// The parsed `record` subcommand request.
@@ -45,6 +58,7 @@ public struct DesktopRecordRequest: Equatable, Sendable {
         case discard
         case status
         case polish
+        case proxy
     }
 
     public let subcommand: Subcommand
@@ -80,6 +94,18 @@ public struct DesktopRecordRequest: Equatable, Sendable {
     /// `compositor` | `ffmpeg`. macOS currently uses the ffmpeg filter path for both
     /// (full CPU compositor ships on Linux/Windows); the flag is accepted for CLI parity.
     public let polishEngine: String
+    /// Existing render-plan JSON for `record polish --plan`.
+    public let polishPlan: String?
+    /// When false, skip writing `<stem>.render-plan.json` (`--no-write-plan`).
+    public let writePlan: Bool
+    /// Override path for plan export (`--write-plan`).
+    public let writePlanPath: String?
+    /// Raw video for `record proxy --input`.
+    public let proxyInput: String?
+    /// Output directory for proxy artifacts (`--output-dir`).
+    public let proxyOutputDir: String?
+    public let proxyWant1080p: Bool
+    public let proxyWantFull: Bool
 
     public init(
         subcommand: Subcommand,
@@ -100,7 +126,14 @@ public struct DesktopRecordRequest: Equatable, Sendable {
         smartZoom: Bool = true,
         idleRate: Double = 3.0,
         cursorStyle: String = "mellow",
-        polishEngine: String = "ffmpeg"
+        polishEngine: String = "ffmpeg",
+        polishPlan: String? = nil,
+        writePlan: Bool = true,
+        writePlanPath: String? = nil,
+        proxyInput: String? = nil,
+        proxyOutputDir: String? = nil,
+        proxyWant1080p: Bool = true,
+        proxyWantFull: Bool = true
     ) {
         self.subcommand = subcommand
         self.output = output
@@ -121,6 +154,13 @@ public struct DesktopRecordRequest: Equatable, Sendable {
         self.idleRate = idleRate
         self.cursorStyle = cursorStyle
         self.polishEngine = polishEngine
+        self.polishPlan = polishPlan
+        self.writePlan = writePlan
+        self.writePlanPath = writePlanPath
+        self.proxyInput = proxyInput
+        self.proxyOutputDir = proxyOutputDir
+        self.proxyWant1080p = proxyWant1080p
+        self.proxyWantFull = proxyWantFull
     }
 
     public var polishOptions: DesktopPolishOptions {
@@ -246,10 +286,336 @@ func isDesktopIntArgument(_ value: String) -> Bool {
     Int(value) != nil
 }
 
+private let desktopAPISizeEnvironmentKey = "OPEN_COMPUTER_USE_API_SIZE"
+private let desktopAPIWidthEnvironmentKey = "OPEN_COMPUTER_USE_API_WIDTH"
+private let desktopAPIHeightEnvironmentKey = "OPEN_COMPUTER_USE_API_HEIGHT"
+private let defaultTypingDelayMs = 12
+private let defaultTypingBatchSize = 50
+
+/// Coordinate scaler maps model/API-space coordinates to display pixels.
+public struct DesktopCoordScaler: Equatable, Sendable {
+    public let apiWidth: Int
+    public let apiHeight: Int
+    public let displayWidth: Int
+    public let displayHeight: Int
+
+    public var isActive: Bool {
+        apiWidth > 0 && apiHeight > 0 && displayWidth > 0 && displayHeight > 0 &&
+            (apiWidth != displayWidth || apiHeight != displayHeight)
+    }
+
+    public func scaleX(_ x: Int) -> Int {
+        guard isActive, apiWidth > 0 else { return x }
+        return Int((Double(x) * Double(displayWidth) / Double(apiWidth)).rounded())
+    }
+
+    public func scaleY(_ y: Int) -> Int {
+        guard isActive, apiHeight > 0 else { return y }
+        return Int((Double(y) * Double(displayHeight) / Double(apiHeight)).rounded())
+    }
+
+    public func scaleXY(x: Int, y: Int) -> (x: Int, y: Int) {
+        (scaleX(x), scaleY(y))
+    }
+}
+
+public func parseDesktopAPISize(_ value: String) throws -> (width: Int, height: Int) {
+    let trimmed = value.lowercased().trimmingCharacters(in: .whitespaces)
+    let parts = trimmed.split(separator: "x", omittingEmptySubsequences: false).map(String.init)
+    guard parts.count == 2,
+          let width = Int(parts[0]), width > 0,
+          let height = Int(parts[1]), height > 0
+    else {
+        throw OpenComputerUseCLIError(message: "invalid api size \"\(value)\" (want WxH, e.g. 1280x800)")
+    }
+    return (width, height)
+}
+
+public func resolveDesktopAPISizeFromEnvironment(_ environment: [String: String]) throws -> (width: Int, height: Int)? {
+    if let combined = environment[desktopAPISizeEnvironmentKey]?.trimmingCharacters(in: .whitespaces), !combined.isEmpty {
+        let parsed = try parseDesktopAPISize(combined)
+        return (parsed.width, parsed.height)
+    }
+    let widthText = environment[desktopAPIWidthEnvironmentKey]?.trimmingCharacters(in: .whitespaces) ?? ""
+    let heightText = environment[desktopAPIHeightEnvironmentKey]?.trimmingCharacters(in: .whitespaces) ?? ""
+    if widthText.isEmpty && heightText.isEmpty {
+        return nil
+    }
+    guard !widthText.isEmpty, !heightText.isEmpty else {
+        throw OpenComputerUseCLIError(
+            message: "\(desktopAPIWidthEnvironmentKey) and \(desktopAPIHeightEnvironmentKey) must both be set"
+        )
+    }
+    guard let width = Int(widthText), width > 0 else {
+        throw OpenComputerUseCLIError(message: "invalid \(desktopAPIWidthEnvironmentKey)")
+    }
+    guard let height = Int(heightText), height > 0 else {
+        throw OpenComputerUseCLIError(message: "invalid \(desktopAPIHeightEnvironmentKey)")
+    }
+    return (width, height)
+}
+
+public func desktopDisplaySizeForScaling() -> (width: Int, height: Int) {
+    if let main = NSScreen.main {
+        let frame = main.frame
+        return (max(1, Int(frame.width.rounded())), max(1, Int(frame.height.rounded())))
+    }
+    let union = desktopUnionBounds()
+    return (
+        max(1, Int(union.width.rounded())),
+        max(1, Int(union.height.rounded()))
+    )
+}
+
+public func resolveDesktopInputScaler(apiSizeFlag: String?, environment: [String: String]) throws -> DesktopCoordScaler? {
+    let apiSize: (width: Int, height: Int)?
+    if let apiSizeFlag, !apiSizeFlag.isEmpty {
+        apiSize = try parseDesktopAPISize(apiSizeFlag)
+    } else {
+        apiSize = try resolveDesktopAPISizeFromEnvironment(environment)
+    }
+    guard let apiSize else {
+        return nil
+    }
+    let display = desktopDisplaySizeForScaling()
+    return DesktopCoordScaler(
+        apiWidth: apiSize.width,
+        apiHeight: apiSize.height,
+        displayWidth: display.width,
+        displayHeight: display.height
+    )
+}
+
+public func scaleDesktopInputAction(_ action: DesktopInputAction, scaler: DesktopCoordScaler?) -> DesktopInputAction {
+    guard let scaler, scaler.isActive else {
+        return action
+    }
+    switch action {
+    case let .move(x, y):
+        let scaled = scaler.scaleXY(x: x, y: y)
+        return .move(x: scaled.x, y: scaled.y)
+    case let .click(button, count, x, y, modifiers):
+        if let x, let y {
+            let scaled = scaler.scaleXY(x: x, y: y)
+            return .click(button: button, count: count, x: scaled.x, y: scaled.y, modifiers: modifiers)
+        }
+        return action
+    case let .mouseDown(button, x, y, modifiers):
+        if let x, let y {
+            let scaled = scaler.scaleXY(x: x, y: y)
+            return .mouseDown(button: button, x: scaled.x, y: scaled.y, modifiers: modifiers)
+        }
+        return action
+    case let .mouseUp(button, x, y, modifiers):
+        if let x, let y {
+            let scaled = scaler.scaleXY(x: x, y: y)
+            return .mouseUp(button: button, x: scaled.x, y: scaled.y, modifiers: modifiers)
+        }
+        return action
+    case let .drag(fromX, fromY, toX, toY, button):
+        let from = scaler.scaleXY(x: fromX, y: fromY)
+        let to = scaler.scaleXY(x: toX, y: toY)
+        return .drag(fromX: from.x, fromY: from.y, toX: to.x, toY: to.y, button: button)
+    case let .scroll(direction, amount, x, y, modifiers):
+        if let x, let y {
+            let scaled = scaler.scaleXY(x: x, y: y)
+            return .scroll(direction: direction, amount: amount, x: scaled.x, y: scaled.y, modifiers: modifiers)
+        }
+        return action
+    case .type, .key, .wait:
+        return action
+    }
+}
+
+public func extractDesktopAPISizeFlag(_ arguments: [String]) throws -> (apiSize: String?, rest: [String]) {
+    var apiSize: String?
+    var rest: [String] = []
+    var index = 0
+    while index < arguments.count {
+        if arguments[index] == "--api-size" {
+            index += 1
+            guard index < arguments.count else {
+                throw OpenComputerUseCLIError(message: "--api-size requires a value (e.g. 1280x800)")
+            }
+            apiSize = arguments[index]
+        } else {
+            rest.append(arguments[index])
+        }
+        index += 1
+    }
+    return (apiSize, rest)
+}
+
+public func parseDesktopInputCommand(_ arguments: [String]) throws -> DesktopInputCommand {
+    let (apiSize, rest) = try extractDesktopAPISizeFlag(arguments)
+    return DesktopInputCommand(action: try parseDesktopInputArguments(rest), apiSize: apiSize)
+}
+
+public func splitDesktopModifiers(_ value: String) -> [String] {
+    value.split(separator: "+", omittingEmptySubsequences: false)
+        .map { normalizeDesktopModifierName(String($0)) }
+        .filter { !$0.isEmpty }
+}
+
+public func normalizeDesktopModifierName(_ name: String) -> String {
+    switch name.lowercased().trimmingCharacters(in: .whitespaces) {
+    case "ctrl", "control", "control_l", "control_r":
+        return "ctrl"
+    case "alt", "alt_l", "alt_r", "mod1", "option":
+        return "alt"
+    case "shift", "shift_l", "shift_r":
+        return "shift"
+    case "super", "meta", "win", "windows", "cmd", "command":
+        return "cmd"
+    default:
+        return name.lowercased()
+    }
+}
+
+func parseDesktopHoldMsFlag(_ rest: [String]) throws -> (holdMs: Int, remaining: [String]) {
+    var holdMs = 0
+    var remaining: [String] = []
+    var index = 0
+    while index < rest.count {
+        if rest[index] == "--hold-ms" || rest[index] == "--hold" {
+            index += 1
+            guard index < rest.count, let parsed = Int(rest[index]), parsed >= 0 else {
+                throw OpenComputerUseCLIError(message: "--hold-ms requires an integer millisecond value >= 0")
+            }
+            holdMs = parsed
+        } else {
+            remaining.append(rest[index])
+        }
+        index += 1
+    }
+    return (holdMs, remaining)
+}
+
+func parseDesktopModifiersFlag(_ rest: [String]) throws -> (modifiers: [String], remaining: [String]) {
+    var modifiers: [String] = []
+    var remaining: [String] = []
+    var index = 0
+    while index < rest.count {
+        if rest[index] == "--modifiers" || rest[index] == "--mods" {
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--modifiers requires a value (e.g. ctrl+shift)")
+            }
+            modifiers = splitDesktopModifiers(rest[index])
+        } else {
+            remaining.append(rest[index])
+        }
+        index += 1
+    }
+    return (modifiers, remaining)
+}
+
+func parseDesktopOptionalXY(_ rest: [String]) throws -> (x: Int?, y: Int?, remaining: [String]) {
+    var x: Int?
+    var y: Int?
+    var remaining: [String] = []
+    var index = 0
+    while index < rest.count {
+        switch rest[index] {
+        case "--x":
+            index += 1
+            guard index < rest.count, let parsed = Int(rest[index]) else {
+                throw OpenComputerUseCLIError(message: "--x requires an integer")
+            }
+            x = parsed
+        case "--y":
+            index += 1
+            guard index < rest.count, let parsed = Int(rest[index]) else {
+                throw OpenComputerUseCLIError(message: "--y requires an integer")
+            }
+            y = parsed
+        default:
+            remaining.append(rest[index])
+        }
+        index += 1
+    }
+    if (x == nil) != (y == nil) {
+        throw OpenComputerUseCLIError(message: "--x and --y must be provided together")
+    }
+    return (x, y, remaining)
+}
+
+func parseDesktopClickParams(_ rest: [String]) throws -> (button: String, count: Int, x: Int?, y: Int?) {
+    var button = "left"
+    var count = 1
+    var x: Int?
+    var y: Int?
+    var index = 0
+    while index < rest.count {
+        switch rest[index] {
+        case "--button", "-b":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--button requires a value")
+            }
+            button = try parseDesktopMouseButton(rest[index])
+        case "--count", "-c":
+            index += 1
+            guard index < rest.count, let parsed = Int(rest[index]), parsed >= 1 else {
+                throw OpenComputerUseCLIError(message: "--count requires a positive integer")
+            }
+            count = parsed
+        case "--x":
+            index += 1
+            guard index < rest.count, let parsed = Int(rest[index]) else {
+                throw OpenComputerUseCLIError(message: "--x requires an integer")
+            }
+            x = parsed
+        case "--y":
+            index += 1
+            guard index < rest.count, let parsed = Int(rest[index]) else {
+                throw OpenComputerUseCLIError(message: "--y requires an integer")
+            }
+            y = parsed
+        default:
+            throw OpenComputerUseCLIError(message: "unknown click option: \(rest[index])")
+        }
+        index += 1
+    }
+    if (x == nil) != (y == nil) {
+        throw OpenComputerUseCLIError(message: "click --x and --y must be provided together")
+    }
+    return (button, count, x, y)
+}
+
+func splitDesktopTypeSegments(_ text: String) -> [String] {
+    text
+        .replacingOccurrences(of: "\r\n", with: "\n")
+        .replacingOccurrences(of: "\r", with: "\n")
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map(String.init)
+}
+
+func chunkDesktopString(_ value: String, size: Int) -> [String] {
+    let batchSize = size > 0 ? size : defaultTypingBatchSize
+    guard !value.isEmpty else { return [""] }
+    var chunks: [String] = []
+    var current = ""
+    var runeCount = 0
+    for character in value {
+        if runeCount >= batchSize, !current.isEmpty {
+            chunks.append(current)
+            current = ""
+            runeCount = 0
+        }
+        current.append(character)
+        runeCount += 1
+    }
+    if !current.isEmpty {
+        chunks.append(current)
+    }
+    return chunks
+}
+
 /// Parses `input <action> [options]` into a `DesktopInputAction`.
 public func parseDesktopInputArguments(_ arguments: [String]) throws -> DesktopInputAction {
     guard let action = arguments.first, !action.isEmpty else {
-        throw OpenComputerUseCLIError(message: "input requires an action: move, click, drag, scroll, type, key, or wait")
+        throw OpenComputerUseCLIError(message: "input requires an action: move, click, drag, scroll, type, key, mouse_down, mouse_up, or wait")
     }
     let rest = Array(arguments.dropFirst())
 
@@ -261,46 +627,19 @@ public func parseDesktopInputArguments(_ arguments: [String]) throws -> DesktopI
         return .move(x: x, y: y)
 
     case "click":
-        var button = "left"
-        var count = 1
-        var x: Int?
-        var y: Int?
-        var index = 0
-        while index < rest.count {
-            switch rest[index] {
-            case "--button", "-b":
-                index += 1
-                guard index < rest.count else {
-                    throw OpenComputerUseCLIError(message: "--button requires a value")
-                }
-                button = try parseDesktopMouseButton(rest[index])
-            case "--count", "-c":
-                index += 1
-                guard index < rest.count, let parsed = Int(rest[index]), parsed >= 1 else {
-                    throw OpenComputerUseCLIError(message: "--count requires a positive integer")
-                }
-                count = parsed
-            case "--x":
-                index += 1
-                guard index < rest.count, let parsed = Int(rest[index]) else {
-                    throw OpenComputerUseCLIError(message: "--x requires an integer")
-                }
-                x = parsed
-            case "--y":
-                index += 1
-                guard index < rest.count, let parsed = Int(rest[index]) else {
-                    throw OpenComputerUseCLIError(message: "--y requires an integer")
-                }
-                y = parsed
-            default:
-                throw OpenComputerUseCLIError(message: "unknown click option: \(rest[index])")
-            }
-            index += 1
-        }
-        if (x == nil) != (y == nil) {
-            throw OpenComputerUseCLIError(message: "click --x and --y must be provided together")
-        }
-        return .click(button: button, count: count, x: x, y: y)
+        let (modifiers, rest2) = try parseDesktopModifiersFlag(rest)
+        let (button, count, x, y) = try parseDesktopClickParams(rest2)
+        return .click(button: button, count: count, x: x, y: y, modifiers: modifiers)
+
+    case "mouse_down", "mousedown":
+        let (modifiers, rest2) = try parseDesktopModifiersFlag(rest)
+        let (button, _, x, y) = try parseDesktopClickParams(rest2)
+        return .mouseDown(button: button, x: x, y: y, modifiers: modifiers)
+
+    case "mouse_up", "mouseup":
+        let (modifiers, rest2) = try parseDesktopModifiersFlag(rest)
+        let (button, _, x, y) = try parseDesktopClickParams(rest2)
+        return .mouseUp(button: button, x: x, y: y, modifiers: modifiers)
 
     case "drag":
         guard rest.count >= 4,
@@ -325,17 +664,19 @@ public func parseDesktopInputArguments(_ arguments: [String]) throws -> DesktopI
         )
 
     case "scroll":
-        guard let direction = rest.first, desktopScrollNotches(direction) != nil else {
+        let (modifiers, rest2) = try parseDesktopModifiersFlag(rest)
+        guard let direction = rest2.first, desktopScrollNotches(direction) != nil else {
             throw OpenComputerUseCLIError(message: "scroll requires a direction: up, down, left, or right")
         }
+        let (x, y, rest3) = try parseDesktopOptionalXY(Array(rest2.dropFirst()))
         var amount = 3
-        if rest.count > 1 {
-            guard rest.count == 3, rest[1] == "--amount" || rest[1] == "-n", let parsed = Int(rest[2]), parsed >= 1 else {
-                throw OpenComputerUseCLIError(message: "unknown scroll option: \(rest.count > 1 ? rest[1] : "")")
+        if !rest3.isEmpty {
+            guard rest3.count == 2, rest3[0] == "--amount" || rest3[0] == "-n", let parsed = Int(rest3[1]), parsed >= 1 else {
+                throw OpenComputerUseCLIError(message: "unknown scroll option: \(rest3.first ?? "")")
             }
             amount = parsed
         }
-        return .scroll(direction: direction.lowercased(), amount: amount)
+        return .scroll(direction: direction.lowercased(), amount: amount, x: x, y: y, modifiers: modifiers)
 
     case "type":
         guard !rest.isEmpty else {
@@ -344,10 +685,11 @@ public func parseDesktopInputArguments(_ arguments: [String]) throws -> DesktopI
         return .type(text: rest.joined(separator: " "))
 
     case "key":
-        guard rest.count == 1, !rest[0].trimmingCharacters(in: .whitespaces).isEmpty else {
+        let (holdMs, rest2) = try parseDesktopHoldMsFlag(rest)
+        guard rest2.count == 1, !rest2[0].trimmingCharacters(in: .whitespaces).isEmpty else {
             throw OpenComputerUseCLIError(message: "key requires a single key or chord, e.g. 'input key ctrl+s'")
         }
-        return .key(specification: rest[0])
+        return .key(specification: rest2[0], holdMs: holdMs)
 
     case "wait":
         guard rest.count == 1, let seconds = Double(rest[0]), seconds >= 0 else {
@@ -360,14 +702,14 @@ public func parseDesktopInputArguments(_ arguments: [String]) throws -> DesktopI
     }
 }
 
-/// Parses `record <start|stop|discard|polish|status> [options]`.
+/// Parses `record <start|stop|discard|polish|proxy|status> [options]`.
 public func parseDesktopRecordArguments(_ arguments: [String]) throws -> DesktopRecordRequest {
     guard let subcommandName = arguments.first else {
-        throw OpenComputerUseCLIError(message: "record requires a subcommand: start, stop, discard, polish, or status")
+        throw OpenComputerUseCLIError(message: "record requires a subcommand: start, stop, discard, polish, proxy, or status")
     }
     let subcommand: DesktopRecordRequest.Subcommand
     switch subcommandName {
-    case "start", "stop", "discard", "status", "polish":
+    case "start", "stop", "discard", "status", "polish", "proxy":
         subcommand = DesktopRecordRequest.Subcommand(rawValue: subcommandName)!
     default:
         throw OpenComputerUseCLIError(message: "unknown record subcommand: \(subcommandName)")
@@ -376,6 +718,9 @@ public func parseDesktopRecordArguments(_ arguments: [String]) throws -> Desktop
     let rest = Array(arguments.dropFirst())
     if subcommand == .polish {
         return try parseDesktopRecordPolishArguments(rest)
+    }
+    if subcommand == .proxy {
+        return try parseDesktopRecordProxyArguments(rest)
     }
 
     var output: String?
@@ -410,7 +755,7 @@ public func parseDesktopRecordArguments(_ arguments: [String]) throws -> Desktop
         case "--quality":
             index += 1
             guard index < rest.count else {
-                throw OpenComputerUseCLIError(message: "--quality requires a value (demo, draft, or proxy)")
+                throw OpenComputerUseCLIError(message: "--quality requires a value (demo, draft, proxy, or anyos)")
             }
             switch rest[index].lowercased() {
             case "demo", "high":
@@ -419,8 +764,10 @@ public func parseDesktopRecordArguments(_ arguments: [String]) throws -> Desktop
                 quality = "draft"
             case "proxy":
                 quality = "proxy"
+            case "anyos", "120":
+                quality = "anyos"
             default:
-                throw OpenComputerUseCLIError(message: "invalid --quality \"\(rest[index])\" (demo, draft, or proxy)")
+                throw OpenComputerUseCLIError(message: "invalid --quality \"\(rest[index])\" (demo, draft, proxy, or anyos)")
             }
         case "--draw-mouse":
             index += 1
@@ -463,6 +810,9 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
     var polishInput: String?
     var polishEvents: String?
     var polishOutput: String?
+    var polishPlan: String?
+    var writePlan = true
+    var writePlanPath: String?
     var showClickRipples = false
     var showKeystrokes = true
     var showCursorGhost = true
@@ -492,6 +842,21 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
                 throw OpenComputerUseCLIError(message: "--output requires a value")
             }
             polishOutput = rest[index]
+        case "--plan":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--plan requires a value")
+            }
+            polishPlan = rest[index]
+        case "--write-plan":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--write-plan requires a path")
+            }
+            writePlanPath = rest[index]
+            writePlan = true
+        case "--no-write-plan":
+            writePlan = false
         case "--engine":
             index += 1
             guard index < rest.count else {
@@ -554,7 +919,58 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
         smartZoom: smartZoom,
         idleRate: idleRate,
         cursorStyle: cursorStyle,
-        polishEngine: polishEngine
+        polishEngine: polishEngine,
+        polishPlan: polishPlan,
+        writePlan: writePlan,
+        writePlanPath: writePlanPath
+    )
+}
+
+func parseDesktopRecordProxyArguments(_ rest: [String]) throws -> DesktopRecordRequest {
+    var proxyInput: String?
+    var proxyOutputDir: String?
+    var want1080p = true
+    var wantFull = true
+    var index = 0
+    while index < rest.count {
+        switch rest[index] {
+        case "--input", "-i":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--input requires a value")
+            }
+            proxyInput = rest[index]
+        case "--output-dir", "-o":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--output-dir requires a value")
+            }
+            proxyOutputDir = rest[index]
+        case "--1080p":
+            want1080p = true
+        case "--full":
+            wantFull = true
+        case "--no-1080p":
+            want1080p = false
+        case "--no-full":
+            wantFull = false
+        default:
+            throw OpenComputerUseCLIError(message: "unknown proxy option: \(rest[index])")
+        }
+        index += 1
+    }
+    guard let proxyInput, !proxyInput.isEmpty else {
+        throw OpenComputerUseCLIError(message: "record proxy requires --input <raw.mp4>")
+    }
+    return DesktopRecordRequest(
+        subcommand: .proxy,
+        output: nil,
+        fps: 30,
+        pidfile: nil,
+        proxyInput: proxyInput,
+        proxyOutputDir: proxyOutputDir,
+        proxyWant1080p: want1080p,
+        proxyWantFull: wantFull
     )
 }
 
@@ -596,20 +1012,28 @@ public enum DesktopCommandRunner {
     }
 
     /// `input <action>`: global synthetic input behind the opt-in gate.
-    public static func runInput(_ action: DesktopInputAction) throws -> String {
+    public static func runInput(_ command: DesktopInputCommand) throws -> String {
+        let environment = ProcessInfo.processInfo.environment
+        let scaler = try resolveDesktopInputScaler(apiSizeFlag: command.apiSize, environment: environment)
+        let action = scaleDesktopInputAction(command.action, scaler: scaler)
         try DesktopInput.perform(action)
         if let event = buildRecordEvent(from: action) {
             appendRecordEventIfRecording(pidfile: nil, event: event)
         }
         switch action {
-        case .move, .click, .drag, .scroll, .type, .key:
+        case .move, .click, .mouseDown, .mouseUp, .drag, .scroll, .type, .key:
             return "input \(DesktopInput.actionName(action)) ok"
         case .wait(let seconds):
             return "waited \(seconds)s"
         }
     }
 
-    /// `record <start|stop|discard|polish|status>`.
+    /// Backward-compatible entry when no `--api-size` flag was parsed.
+    public static func runInput(_ action: DesktopInputAction) throws -> String {
+        try runInput(DesktopInputCommand(action: action))
+    }
+
+    /// `record <start|stop|discard|polish|proxy|status>`.
     public static func runRecord(_ request: DesktopRecordRequest) throws -> String {
         switch request.subcommand {
         case .start:
@@ -626,6 +1050,8 @@ public enum DesktopCommandRunner {
             return try DesktopRecord.status(pidfilePath: request.pidfile)
         case .polish:
             return try DesktopRecord.runPolish(request)
+        case .proxy:
+            return try DesktopRecord.runProxy(request)
         }
     }
 }
@@ -766,6 +1192,10 @@ enum DesktopInput {
             return "move"
         case .click:
             return "click"
+        case .mouseDown:
+            return "mouse_down"
+        case .mouseUp:
+            return "mouse_up"
         case .drag:
             return "drag"
         case .scroll:
@@ -799,19 +1229,44 @@ enum DesktopInput {
         switch action {
         case let .move(x, y):
             try postMouseEvent(type: .mouseMoved, point: globalPoint(CGPoint(x: x, y: y)), button: .left, clickState: 1)
-        case let .click(button, count, x, y):
-            if let x, let y {
-                try postMouseEvent(type: .mouseMoved, point: globalPoint(CGPoint(x: x, y: y)), button: .left, clickState: 1)
+        case let .click(button, count, x, y, modifiers):
+            try withModifiers(modifiers) {
+                if let x, let y {
+                    try postMouseEvent(type: .mouseMoved, point: globalPoint(CGPoint(x: x, y: y)), button: .left, clickState: 1)
+                }
+                try postClick(button: button, count: count)
             }
-            try postClick(button: button, count: count)
+        case let .mouseDown(button, x, y, modifiers):
+            try withModifiers(modifiers) {
+                if let x, let y {
+                    try postMouseEvent(type: .mouseMoved, point: globalPoint(CGPoint(x: x, y: y)), button: .left, clickState: 1)
+                }
+                let kind = mouseKind(button)
+                let location = currentPointerLocation()
+                try postMouseEvent(type: kind.downEvent, point: location, button: kind.cgButton, clickState: 1)
+            }
+        case let .mouseUp(button, x, y, modifiers):
+            try withModifiers(modifiers) {
+                if let x, let y {
+                    try postMouseEvent(type: .mouseMoved, point: globalPoint(CGPoint(x: x, y: y)), button: .left, clickState: 1)
+                }
+                let kind = mouseKind(button)
+                let location = currentPointerLocation()
+                try postMouseEvent(type: kind.upEvent, point: location, button: kind.cgButton, clickState: 1)
+            }
         case let .drag(fromX, fromY, toX, toY, button):
             try postDrag(from: CGPoint(x: fromX, y: fromY), to: CGPoint(x: toX, y: toY), button: button)
-        case let .scroll(direction, amount):
-            try postScroll(direction: direction, amount: amount)
+        case let .scroll(direction, amount, x, y, modifiers):
+            try withModifiers(modifiers) {
+                if let x, let y {
+                    try postMouseEvent(type: .mouseMoved, point: globalPoint(CGPoint(x: x, y: y)), button: .left, clickState: 1)
+                }
+                try postScroll(direction: direction, amount: amount)
+            }
         case let .type(text):
             try postTypeText(text)
-        case let .key(specification):
-            try postKeyChord(specification)
+        case let .key(specification, holdMs):
+            try postKeyChord(specification, holdMs: holdMs)
         case .wait:
             break // handled above
         }
@@ -842,6 +1297,49 @@ enum DesktopInput {
         default:
             return .left
         }
+    }
+
+    private static func modifierFromName(_ name: String) throws -> ParsedKeyPress.Modifier {
+        switch normalizeDesktopModifierName(name) {
+        case "cmd", "command", "super", "meta":
+            return ParsedKeyPress.Modifier(flag: .maskCommand, keyCode: CGKeyCode(kVK_Command))
+        case "shift":
+            return ParsedKeyPress.Modifier(flag: .maskShift, keyCode: CGKeyCode(kVK_Shift))
+        case "alt", "option":
+            return ParsedKeyPress.Modifier(flag: .maskAlternate, keyCode: CGKeyCode(kVK_Option))
+        case "ctrl", "control":
+            return ParsedKeyPress.Modifier(flag: .maskControl, keyCode: CGKeyCode(kVK_Control))
+        default:
+            throw ComputerUseError.message("unsupported modifier '\(name)'")
+        }
+    }
+
+    private static func withModifiers(_ modifiers: [String], body: () throws -> Void) throws {
+        guard !modifiers.isEmpty else {
+            try body()
+            return
+        }
+        let parsed = try modifiers.map { try modifierFromName($0) }
+        var activeFlags: CGEventFlags = []
+        for modifier in parsed {
+            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: true) else {
+                throw ComputerUseError.message("Failed to create modifier key down event.")
+            }
+            activeFlags.insert(modifier.flag)
+            event.flags = activeFlags
+            event.post(tap: .cghidEventTap)
+        }
+        defer {
+            for modifier in parsed.reversed() {
+                guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: false) else {
+                    continue
+                }
+                event.flags = activeFlags
+                event.post(tap: .cghidEventTap)
+                activeFlags.remove(modifier.flag)
+            }
+        }
+        try body()
     }
 
     private static func postMouseEvent(type: CGEventType, point: CGPoint, button: CGMouseButton, clickState: Int) throws {
@@ -921,27 +1419,71 @@ enum DesktopInput {
     }
 
     private static func postTypeText(_ text: String) throws {
-        for chunk in InputSimulation.keyboardUnicodeChunks(for: text) {
-            var mutableChunk = chunk
-            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
-                throw ComputerUseError.message("Failed to create keyboard event.")
+        let segments = splitDesktopTypeSegments(text)
+        for (segmentIndex, segment) in segments.enumerated() {
+            if segmentIndex > 0 {
+                try postKeyChord("Return", holdMs: 0)
             }
-            mutableChunk.withUnsafeMutableBufferPointer { buffer in
-                guard let baseAddress = buffer.baseAddress else {
-                    return
+            if segment.isEmpty {
+                continue
+            }
+            for chunk in chunkDesktopString(segment, size: defaultTypingBatchSize) {
+                for unicodeChunk in InputSimulation.keyboardUnicodeChunks(for: chunk) {
+                    var mutableChunk = unicodeChunk
+                    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                          let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+                        throw ComputerUseError.message("Failed to create keyboard event.")
+                    }
+                    mutableChunk.withUnsafeMutableBufferPointer { buffer in
+                        guard let baseAddress = buffer.baseAddress else {
+                            return
+                        }
+                        down.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: baseAddress)
+                        up.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: baseAddress)
+                    }
+                    down.post(tap: .cghidEventTap)
+                    up.post(tap: .cghidEventTap)
                 }
-                down.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: baseAddress)
-                up.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: baseAddress)
+                Thread.sleep(forTimeInterval: Double(defaultTypingDelayMs) / 1000.0)
             }
-            down.post(tap: .cghidEventTap)
-            up.post(tap: .cghidEventTap)
-            Thread.sleep(forTimeInterval: 0.02)
         }
     }
 
-    private static func postKeyChord(_ specification: String) throws {
+    private static func postKeyChord(_ specification: String, holdMs: Int) throws {
         let parsed = try KeyPressParser.parse(specification)
+        if holdMs > 0 {
+            var activeFlags: CGEventFlags = []
+            for modifier in parsed.modifiers {
+                guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: true) else {
+                    throw ComputerUseError.message("Failed to create modifier key down event.")
+                }
+                activeFlags.insert(modifier.flag)
+                event.flags = activeFlags
+                event.post(tap: .cghidEventTap)
+            }
+            guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: true) else {
+                throw ComputerUseError.message("Failed to create key event.")
+            }
+            keyDown.flags = activeFlags
+            keyDown.post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: Double(holdMs) / 1000.0)
+            guard let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: false) else {
+                throw ComputerUseError.message("Failed to create key event.")
+            }
+            keyUp.flags = activeFlags
+            keyUp.post(tap: .cghidEventTap)
+            for modifier in parsed.modifiers.reversed() {
+                guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: false) else {
+                    throw ComputerUseError.message("Failed to create modifier key up event.")
+                }
+                event.flags = activeFlags
+                event.post(tap: .cghidEventTap)
+                activeFlags.remove(modifier.flag)
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+            return
+        }
+
         var activeFlags: CGEventFlags = []
         for modifier in parsed.modifiers {
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: true) else {
@@ -1124,19 +1666,33 @@ public func buildRecordEvent(from action: DesktopInputAction, tMs: Int64 = 0) ->
     switch action {
     case let .move(x, y):
         return DesktopRecordEvent(tMs: tMs, type: "move", x: x, y: y)
-    case let .click(button, count, x, y):
+    case let .click(button, count, x, y, _):
         return DesktopRecordEvent(tMs: tMs, type: "click", x: x, y: y, button: button, count: count)
+    case let .mouseDown(button, x, y, _):
+        return DesktopRecordEvent(tMs: tMs, type: "mouse_down", x: x, y: y, button: button, count: 1)
+    case let .mouseUp(button, x, y, _):
+        return DesktopRecordEvent(tMs: tMs, type: "mouse_up", x: x, y: y, button: button, count: 1)
     case let .drag(fromX, fromY, toX, toY, button):
         return DesktopRecordEvent(tMs: tMs, type: "drag", x: fromX, y: fromY, toX: toX, toY: toY, button: button)
-    case let .scroll(direction, amount):
+    case let .scroll(direction, amount, _, _, _):
         return DesktopRecordEvent(tMs: tMs, type: "scroll", direction: direction, amount: amount)
     case let .type(text):
         return DesktopRecordEvent(tMs: tMs, type: "type", text: text)
-    case let .key(specification):
+    case let .key(specification, _):
         return DesktopRecordEvent(tMs: tMs, type: "key", key: specification)
     case let .wait(seconds):
         return DesktopRecordEvent(tMs: tMs, type: "wait", seconds: seconds)
     }
+}
+
+public func defaultRenderPlanPath(forRaw input: String) -> String {
+    let url = URL(fileURLWithPath: input)
+    let ext = url.pathExtension
+    if ext.isEmpty {
+        return input + ".render-plan.json"
+    }
+    let stem = String(input.dropLast(ext.count + 1))
+    return stem + ".render-plan.json"
 }
 
 public func recordEventsPath(forOutput output: String) -> String {
@@ -1792,6 +2348,211 @@ func buildPolishFilterComplexSplit(
     return b
 }
 
+    return b
+}
+
+// MARK: - Render plan JSON (simplified export for polish parity)
+
+public struct DesktopRenderPlanJSON: Codable, Equatable, Sendable {
+    public struct Video: Codable, Equatable, Sendable {
+        public var inputVideoPath: String
+        public var sourceDurationMs: Double
+        public var outputDurationMs: Double
+        public var width: Int
+        public var height: Int
+        public var fps: Int
+        public var configHash: String
+    }
+
+    public struct PlaybackSegment: Codable, Equatable, Sendable {
+        public var type: String
+        public var sourceStartMs: Double
+        public var sourceEndMs: Double
+        public var sourceDurationMs: Double
+        public var outputStartMs: Double
+        public var outputEndMs: Double
+        public var outputDurationMs: Double
+        public var playbackRate: Double
+    }
+
+    public struct Playback: Codable, Equatable, Sendable {
+        public var segments: [PlaybackSegment]
+        public var outputDurationMs: Double
+        public var sourceDurationMs: Double
+    }
+
+    public struct ClickEffect: Codable, Equatable, Sendable {
+        public var timeMs: Double
+        public var x: Double
+        public var y: Double
+        public var score: Int?
+    }
+
+    public struct KeystrokeEvent: Codable, Equatable, Sendable {
+        public var timeMs: Double
+        public var text: String?
+        public var key: String?
+        public var eventType: String?
+    }
+
+    public struct ZoomWindow: Codable, Equatable, Sendable {
+        public var startMs: Double
+        public var endMs: Double
+        public var x: Double
+        public var y: Double
+        public var factor: Double
+    }
+
+    public struct Tracks: Codable, Equatable, Sendable {
+        public var clickEffects: [ClickEffect]
+        public var keystrokeEvents: [KeystrokeEvent]
+        public var zoomWindows: [ZoomWindow]
+        public var cursorStyle: String
+    }
+
+    public var video: Video
+    public var playback: Playback
+    public var tracks: Tracks
+}
+
+public func outputDurationFromPolishSegments(_ segments: [DesktopPolishSegment]) -> Double {
+    var total = 0.0
+    for segment in segments {
+        let rate = segment.rate < 1.01 ? 1.0 : segment.rate
+        let sourceDuration = Double(segment.endMs - segment.startMs)
+        if sourceDuration > 0 {
+            total += sourceDuration / rate
+        }
+    }
+    return total
+}
+
+public func buildRenderPlanJSON(
+    inputVideo: String,
+    log: DesktopRecordEventLog,
+    durationMs: Int64,
+    opts: DesktopPolishOptions,
+    segments: [DesktopPolishSegment],
+    zooms: [DesktopZoomWindow]
+) -> DesktopRenderPlanJSON {
+    let sourceDuration = Double(max(durationMs, 1))
+    let outputDuration = outputDurationFromPolishSegments(segments)
+    var outputCursor = 0.0
+    var playbackSegments: [DesktopRenderPlanJSON.PlaybackSegment] = []
+    for segment in segments {
+        let rate = segment.rate < 1.01 ? 1.0 : segment.rate
+        let sourceStart = Double(segment.startMs)
+        let sourceEnd = Double(segment.endMs)
+        let sourceSegmentDuration = sourceEnd - sourceStart
+        let outputSegmentDuration = sourceSegmentDuration / rate
+        playbackSegments.append(
+            DesktopRenderPlanJSON.PlaybackSegment(
+                type: rate > 1.01 ? "gap" : "action",
+                sourceStartMs: sourceStart,
+                sourceEndMs: sourceEnd,
+                sourceDurationMs: sourceSegmentDuration,
+                outputStartMs: outputCursor,
+                outputEndMs: outputCursor + outputSegmentDuration,
+                outputDurationMs: outputSegmentDuration,
+                playbackRate: rate
+            )
+        )
+        outputCursor += outputSegmentDuration
+    }
+    var clicks: [DesktopRenderPlanJSON.ClickEffect] = []
+    for event in log.events where event.type == "click" {
+        clicks.append(
+            DesktopRenderPlanJSON.ClickEffect(
+                timeMs: Double(event.tMs),
+                x: Double(event.x ?? 0),
+                y: Double(event.y ?? 0),
+                score: 60
+            )
+        )
+    }
+    var keys: [DesktopRenderPlanJSON.KeystrokeEvent] = []
+    for event in log.events {
+        switch event.type {
+        case "key":
+            keys.append(
+                DesktopRenderPlanJSON.KeystrokeEvent(
+                    timeMs: Double(event.tMs),
+                    key: event.key,
+                    eventType: "keyCombo"
+                )
+            )
+        case "type":
+            keys.append(
+                DesktopRenderPlanJSON.KeystrokeEvent(
+                    timeMs: Double(event.tMs),
+                    text: event.text,
+                    eventType: "textTyped"
+                )
+            )
+        default:
+            break
+        }
+    }
+    let zoomWindows = zooms.map {
+        DesktopRenderPlanJSON.ZoomWindow(
+            startMs: Double($0.startMs),
+            endMs: Double($0.endMs),
+            x: Double($0.x),
+            y: Double($0.y),
+            factor: $0.factor
+        )
+    }
+    let width = log.width ?? 1920
+    let height = log.height ?? 1200
+    let fps = log.fps ?? 30
+    return DesktopRenderPlanJSON(
+        video: DesktopRenderPlanJSON.Video(
+            inputVideoPath: inputVideo,
+            sourceDurationMs: sourceDuration,
+            outputDurationMs: outputDuration,
+            width: width,
+            height: height,
+            fps: fps,
+            configHash: "ocu-cleanroom-v1"
+        ),
+        playback: DesktopRenderPlanJSON.Playback(
+            segments: playbackSegments,
+            outputDurationMs: outputDuration,
+            sourceDurationMs: sourceDuration
+        ),
+        tracks: DesktopRenderPlanJSON.Tracks(
+            clickEffects: clicks,
+            keystrokeEvents: keys,
+            zoomWindows: zoomWindows,
+            cursorStyle: opts.cursorStyle
+        )
+    )
+}
+
+public func writeRenderPlanJSON(path: String, plan: DesktopRenderPlanJSON) throws {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(plan)
+    try data.write(to: URL(fileURLWithPath: path))
+}
+
+func exportRenderPlanBestEffort(input: String, eventsPath: String, planPath: String, opts: DesktopPolishOptions) throws {
+    var log = try readRecordEventLog(path: eventsPath)
+    let probed = try probeVideoDurationMs(path: input)
+    if (log.width ?? 0) <= 0 { log.width = probed.width }
+    if (log.height ?? 0) <= 0 { log.height = probed.height }
+    let plan = buildPolishPlan(log: log, durationMs: probed.durationMs, opts: opts)
+    let renderPlan = buildRenderPlanJSON(
+        inputVideo: input,
+        log: log,
+        durationMs: probed.durationMs,
+        opts: opts,
+        segments: plan.segments,
+        zooms: plan.zooms
+    )
+    try writeRenderPlanJSON(path: planPath, plan: renderPlan)
+}
+
 func probeVideoDurationMs(path: String) throws -> (durationMs: Int64, width: Int, height: Int) {
     let ffprobe = DesktopRecord.resolveFfprobeURL()
         ?? URL(fileURLWithPath: "/usr/bin/ffprobe")
@@ -1838,7 +2599,10 @@ func polishRecording(
     inputVideo: String,
     eventsPath: String,
     outputVideo: String,
-    opts: DesktopPolishOptions
+    opts: DesktopPolishOptions,
+    planPath: String? = nil,
+    writePlan: Bool = false,
+    writePlanPath: String? = nil
 ) throws {
     guard let ffmpegURL = DesktopRecord.resolveFfmpegURL() else {
         throw ComputerUseError.message("ffmpeg is required for record polish but was not found on PATH")
@@ -1849,6 +2613,22 @@ func polishRecording(
     if (log.height ?? 0) <= 0 { log.height = probed.height }
 
     let plan = buildPolishPlan(log: log, durationMs: probed.durationMs, opts: opts)
+    if writePlan {
+        let exportPath = writePlanPath ?? defaultRenderPlanPath(forRaw: inputVideo)
+        let renderPlan = buildRenderPlanJSON(
+            inputVideo: inputVideo,
+            log: log,
+            durationMs: probed.durationMs,
+            opts: opts,
+            segments: plan.segments,
+            zooms: plan.zooms
+        )
+        try? writeRenderPlanJSON(path: exportPath, plan: renderPlan)
+    }
+    if let planPath, !planPath.isEmpty {
+        // Accept --plan for CLI parity; macOS ffmpeg path still uses analyzed segments.
+        _ = planPath
+    }
     let assPath = inputVideo + ".ass"
     try plan.ass.write(to: URL(fileURLWithPath: assPath), atomically: true, encoding: .utf8)
 
@@ -1893,6 +2673,91 @@ func polishRecording(
         }
         throw ComputerUseError.message("ffmpeg polish failed: \(detail)")
     }
+}
+
+// MARK: - Render proxies
+
+public struct DesktopProxyArtifact: Codable, Equatable, Sendable {
+    public var path: String
+    public var width: Int
+    public var height: Int
+    public var createdAt: String
+}
+
+public struct DesktopRenderProxiesMetadata: Codable, Equatable, Sendable {
+    public var version: Int
+    public var source: String
+    public var primary1080p: DesktopProxyArtifact?
+    public var full: DesktopProxyArtifact?
+    public var createdAt: String
+}
+
+func runProxyEncode(input: String, output: String, targetHeight: Int, ffmpegURL: URL) throws {
+    var args = ["-nostdin", "-y", "-i", input]
+    if targetHeight > 0 {
+        args += ["-vf", "scale=-2:\(targetHeight):flags=lanczos"]
+    }
+    args += [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "17",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-x264-params", "keyint=1:min-keyint=1:scenecut=0:bframes=0",
+        "-movflags", "+faststart",
+        "-an",
+        output,
+    ]
+    let process = Process()
+    process.executableURL = ffmpegURL
+    process.arguments = args
+    let logURL = URL(fileURLWithPath: output + ".log")
+    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+    let logHandle = try? FileHandle(forWritingTo: logURL)
+    defer { try? logHandle?.close() }
+    process.standardOutput = logHandle ?? FileHandle.nullDevice
+    process.standardError = logHandle ?? FileHandle.nullDevice
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        var detail = ""
+        if let data = FileManager.default.contents(atPath: logURL.path),
+           let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !text.isEmpty
+        {
+            detail = text.count > 400 ? String(text.suffix(400)) : text
+        }
+        throw ComputerUseError.message("proxy encode failed: \(detail)")
+    }
+}
+
+func generateRenderProxies(sourceVideo: String, outDir: String, want1080p: Bool, wantFull: Bool) throws -> DesktopRenderProxiesMetadata {
+    guard let ffmpegURL = DesktopRecord.resolveFfmpegURL() else {
+        throw ComputerUseError.message("ffmpeg is required for proxy generation")
+    }
+    let probed = try probeVideoDurationMs(path: sourceVideo)
+    let createdAt = ISO8601DateFormatter().string(from: Date())
+    var meta = DesktopRenderProxiesMetadata(version: 1, source: sourceVideo, createdAt: createdAt)
+    if want1080p {
+        let path = URL(fileURLWithPath: outDir).appendingPathComponent("proxy-1080p.mp4").path
+        var targetHeight = 1080
+        if probed.height > 0, probed.height < 1080 {
+            targetHeight = probed.height
+        }
+        try runProxyEncode(input: sourceVideo, output: path, targetHeight: targetHeight, ffmpegURL: ffmpegURL)
+        meta.primary1080p = DesktopProxyArtifact(path: path, width: 0, height: targetHeight, createdAt: createdAt)
+    }
+    if wantFull {
+        let path = URL(fileURLWithPath: outDir).appendingPathComponent("proxy-full.mp4").path
+        try runProxyEncode(input: sourceVideo, output: path, targetHeight: 0, ffmpegURL: ffmpegURL)
+        meta.full = DesktopProxyArtifact(path: path, width: probed.width, height: probed.height, createdAt: createdAt)
+    }
+    let metaPath = URL(fileURLWithPath: outDir).appendingPathComponent("render-proxies.json").path
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(meta)
+    try data.write(to: URL(fileURLWithPath: metaPath))
+    return meta
 }
 
 // MARK: - Record
@@ -1971,7 +2836,7 @@ enum DesktopRecord {
         switch quality {
         case "draft":
             args += ["-preset", "ultrafast", "-pix_fmt", "yuv420p"]
-        case "proxy":
+        case "proxy", "anyos":
             args += [
                 "-preset", "veryfast",
                 "-crf", "17",
@@ -2269,15 +3134,45 @@ enum DesktopRecord {
         }
         let events = request.polishEvents ?? recordEventsPath(forOutput: input)
         let output = request.polishOutput ?? defaultPolishedOutput(forRaw: input)
+        let writePlanPath = request.writePlan
+            ? (request.writePlanPath ?? defaultRenderPlanPath(forRaw: input))
+            : nil
         let started = Date()
         try polishRecording(
             inputVideo: input,
             eventsPath: events,
             outputVideo: output,
-            opts: request.polishOptions
+            opts: request.polishOptions,
+            planPath: request.polishPlan,
+            writePlan: request.writePlan,
+            writePlanPath: writePlanPath
         )
         let elapsedMs = Int((Date().timeIntervalSince(started) * 1000.0).rounded())
-        return "recording polished: engine=\(request.polishEngine) input=\(input) events=\(events) output=\(output) elapsed=\(elapsedMs)ms"
+        var message = "recording polished: engine=\(request.polishEngine) input=\(input) events=\(events) output=\(output) elapsed=\(elapsedMs)ms"
+        if let writePlanPath {
+            message += "\nrender plan written: \(writePlanPath)"
+        }
+        return message
+    }
+
+    static func runProxy(_ request: DesktopRecordRequest) throws -> String {
+        guard let input = request.proxyInput, !input.isEmpty else {
+            throw ComputerUseError.message("record proxy requires --input <raw.mp4>")
+        }
+        let outDir: String
+        if let proxyOutputDir = request.proxyOutputDir, !proxyOutputDir.isEmpty {
+            outDir = (proxyOutputDir as NSString).expandingTildeInPath
+        } else {
+            outDir = URL(fileURLWithPath: input).deletingLastPathComponent().appendingPathComponent("render-proxies").path
+        }
+        try FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+        let meta = try generateRenderProxies(
+            sourceVideo: input,
+            outDir: outDir,
+            want1080p: request.proxyWant1080p,
+            wantFull: request.proxyWantFull
+        )
+        return "render proxies ready: dir=\(outDir) primary=\(meta.primary1080p != nil) full=\(meta.full != nil)"
     }
 
     static func relocateRecordOutput(current: String, saveAs: String) throws -> String {

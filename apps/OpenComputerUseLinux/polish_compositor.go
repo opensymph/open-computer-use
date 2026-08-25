@@ -86,15 +86,70 @@ func polishRecordingCompositor(inputVideo, eventsPath, outputVideo string, opts 
 	if opts.ShowCursorGhost {
 		cursorPath = generateCursorPath(events, durationMs, log.Width, log.Height, opts.CursorStyle)
 	}
+	_ = writeRenderPlanJSON(defaultRenderPlanPath(inputVideo), buildRenderPlanJSON(
+		inputVideo, log, durationMs, opts.polishOptions,
+		polishPlan{Zooms: zooms, Clicks: clicks, Cursor: cursorPath, Width: log.Width, Height: log.Height},
+		segments,
+	))
+	return polishRecordingCompositorCore(inputVideo, outputVideo, width, height, events, segments, zooms, cursorPath, opts)
+}
 
+func polishRecordingCompositorFromPlan(inputVideo, eventsPath, outputVideo string, opts compositorOptions, segments []polishSegment, zooms []zoomWindow, cursor []cursorKeyframe) error {
+	log, err := readRecordEventLog(eventsPath)
+	if err != nil {
+		return err
+	}
+	_, width, height, err := probeVideoDurationMs(inputVideo)
+	if err != nil {
+		return err
+	}
+	events := append([]recordEvent(nil), log.Events...)
+	sort.Slice(events, func(i, j int) bool { return events[i].TMs < events[j].TMs })
+	if len(segments) == 0 {
+		durationMs, _, _, _ := probeVideoDurationMs(inputVideo)
+		segments = buildPlaybackSegments(nil, zooms, durationMs, opts.polishOptions)
+	}
+	return polishRecordingCompositorCore(inputVideo, outputVideo, width, height, events, segments, zooms, cursor, opts)
+}
+
+func polishRecordingCompositorCore(inputVideo, outputVideo string, width, height int, events []recordEvent, segments []polishSegment, zooms []zoomWindow, cursorPath []cursorKeyframe, opts compositorOptions) error {
 	workDir, err := os.MkdirTemp("", "ocu-comp-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(workDir)
 
+	sourceForLinear := inputVideo
+	scale := 1.0
+	// Full-HD+ CPU compositor is expensive; process at ≤1280 wide then upscale.
+	if width > 1280 {
+		scaled := filepath.Join(workDir, "scaled.mp4")
+		targetW := 1280
+		targetH := int(float64(height)*float64(targetW)/float64(width) + 0.5)
+		if targetH%2 != 0 {
+			targetH++
+		}
+		cmd := exec.Command("ffmpeg", "-nostdin", "-y", "-i", inputVideo,
+			"-vf", fmt.Sprintf("scale=%d:%d:flags=lanczos", targetW, targetH),
+			"-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p", "-an", scaled)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("compositor downscale failed: %v: %s", err, trimTail(string(out), 300))
+		}
+		scale = float64(targetW) / float64(width)
+		width, height = targetW, targetH
+		sourceForLinear = scaled
+		for i := range zooms {
+			zooms[i].X = int(float64(zooms[i].X)*scale + 0.5)
+			zooms[i].Y = int(float64(zooms[i].Y)*scale + 0.5)
+		}
+		for i := range cursorPath {
+			cursorPath[i].X = int(float64(cursorPath[i].X)*scale + 0.5)
+			cursorPath[i].Y = int(float64(cursorPath[i].Y)*scale + 0.5)
+		}
+	}
+
 	linearPath := filepath.Join(workDir, "linear.mp4")
-	if err := renderLinearTimeline(inputVideo, linearPath, segments); err != nil {
+	if err := renderLinearTimeline(sourceForLinear, linearPath, segments); err != nil {
 		return err
 	}
 
@@ -117,7 +172,32 @@ func polishRecordingCompositor(inputVideo, eventsPath, outputVideo string, opts 
 		outChips = nil
 	}
 
-	return renderCompositorPass(linearPath, outputVideo, width, height, opts.FPS, outDurationMs, outZooms, outCursor, outChips, opts)
+	compOut := outputVideo
+	if scale < 1.0 {
+		compOut = filepath.Join(workDir, "comp.mp4")
+	}
+	if err := renderCompositorPass(linearPath, compOut, width, height, opts.FPS, outDurationMs, outZooms, outCursor, outChips, opts); err != nil {
+		return err
+	}
+	if scale < 1.0 {
+		// Upscale back to original resolution for delivery.
+		origW, origH := 0, 0
+		if _, w, h, e := probeVideoDurationMs(inputVideo); e == nil {
+			origW, origH = w, h
+		}
+		if origW <= 0 {
+			origW = int(float64(width)/scale + 0.5)
+			origH = int(float64(height)/scale + 0.5)
+		}
+		cmd := exec.Command("ffmpeg", "-nostdin", "-y", "-i", compOut,
+			"-vf", fmt.Sprintf("scale=%d:%d:flags=lanczos", origW, origH),
+			"-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+			"-pix_fmt", "yuv420p", "-movflags", "+faststart", outputVideo)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("compositor upscale failed: %v: %s", err, trimTail(string(out), 300))
+		}
+	}
+	return nil
 }
 
 func outputDurationFromSegments(segs []polishSegment) int64 {
@@ -180,7 +260,7 @@ func remapCursorPath(path []cursorKeyframe, mapFn func(float64) float64, outDur 
 		if t > outDur {
 			t = outDur
 		}
-		out = append(out, cursorKeyframe{TMs: t, X: kf.X, Y: kf.Y, Scale: kf.Scale})
+		out = append(out, cursorKeyframe{TMs: t, X: kf.X, Y: kf.Y, Scale: kf.Scale, CursorType: kf.CursorType})
 	}
 	return out
 }
@@ -265,9 +345,18 @@ func trimTail(s string, n int) string {
 }
 
 func renderCompositorPass(linearVideo, output string, width, height, fps int, outDurationMs int64, zooms []zoomWindow, cursor []cursorKeyframe, chips []keystrokeChip, opts compositorOptions) error {
+	probedDur, _, _, _ := probeVideoDurationMs(linearVideo)
+	if probedDur > 0 {
+		outDurationMs = probedDur
+	}
 	frameCount := int(outDurationMs) * fps / 1000
 	if frameCount < 1 {
 		frameCount = 1
+	}
+	// Cap runaway estimates (avoid hanging on ReadFull past EOF forever when
+	// duration metadata disagrees with the elementary stream).
+	if frameCount > fps*600 {
+		frameCount = fps * 600
 	}
 	frameBytes := width * height * 4
 
@@ -374,6 +463,7 @@ func renderCompositorPass(linearVideo, output string, width, height, fps int, ou
 		}
 	}
 	_ = encIn.Close()
+	_ = decOut.Close()
 	_ = dec.Wait()
 	if err := enc.Wait(); err != nil {
 		detail, _ := os.ReadFile(output + ".comp.log")
@@ -402,6 +492,7 @@ func cursorAt(path []cursorKeyframe, tMs float64) cursorKeyframe {
 				X:     int(float64(a.X) + (float64(b.X)-float64(a.X))*u + 0.5),
 				Y:     int(float64(a.Y) + (float64(b.Y)-float64(a.Y))*u + 0.5),
 				Scale: a.Scale + (b.Scale-a.Scale)*u,
+				CursorType: a.CursorType,
 			}
 		}
 	}

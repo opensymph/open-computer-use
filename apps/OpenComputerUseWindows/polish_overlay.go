@@ -22,21 +22,85 @@ type compositorCursor struct {
 }
 
 func newCompositorCursor() *compositorCursor {
-	// Build a crisp arrow with soft drop shadow (clean-room, not Cursor SVG).
+	return &compositorCursor{sprite: buildCursorSprite("arrow"), baseW: 48, baseH: 48}
+}
+
+func buildCursorSprite(cursorType string) *rgbaFrame {
 	const size = 48
 	img := image.NewNRGBA(image.Rect(0, 0, size, size))
-	// shadow
-	drawArrow(img, 3, 4, color.NRGBA{0, 0, 0, 90})
-	// white outline
-	drawArrow(img, 1, 1, color.NRGBA{255, 255, 255, 255})
-	drawArrow(img, 0, 0, color.NRGBA{255, 255, 255, 255})
-	drawArrow(img, 2, 0, color.NRGBA{255, 255, 255, 255})
-	drawArrow(img, 0, 2, color.NRGBA{255, 255, 255, 255})
-	// black fill
-	drawArrow(img, 1, 1, color.NRGBA{20, 20, 20, 255})
+	switch strings.ToLower(cursorType) {
+	case "text", "ibeam":
+		drawIBeam(img, color.NRGBA{20, 20, 20, 255})
+	case "wait", "progress":
+		drawWaitCursor(img)
+	case "crosshair":
+		drawCrosshair(img)
+	case "pointer", "hand":
+		drawArrow(img, 3, 4, color.NRGBA{0, 0, 0, 90})
+		drawArrow(img, 1, 1, color.NRGBA{255, 255, 255, 255})
+		drawArrow(img, 1, 1, color.NRGBA{20, 20, 20, 255})
+	default: // arrow
+		// Hotspot aligned to proprietary SVG ratio 3/24, 2/24 of viewBox.
+		drawArrow(img, 3, 4, color.NRGBA{0, 0, 0, 90})
+		drawArrow(img, 1, 1, color.NRGBA{255, 255, 255, 255})
+		drawArrow(img, 0, 0, color.NRGBA{255, 255, 255, 255})
+		drawArrow(img, 2, 0, color.NRGBA{255, 255, 255, 255})
+		drawArrow(img, 0, 2, color.NRGBA{255, 255, 255, 255})
+		drawArrow(img, 1, 1, color.NRGBA{20, 20, 20, 255})
+	}
 	f := newRGBAFrame(size, size)
 	copy(f.Pix, img.Pix)
-	return &compositorCursor{sprite: f, baseW: size, baseH: size}
+	return f
+}
+
+func drawIBeam(img *image.NRGBA, c color.NRGBA) {
+	// Vertical bar with serifs — text caret.
+	for y := 8; y <= 40; y++ {
+		img.SetNRGBA(24, y, c)
+		img.SetNRGBA(23, y, color.NRGBA{255, 255, 255, 200})
+		img.SetNRGBA(25, y, color.NRGBA{255, 255, 255, 200})
+	}
+	for x := 18; x <= 30; x++ {
+		img.SetNRGBA(x, 8, c)
+		img.SetNRGBA(x, 40, c)
+	}
+}
+
+func drawWaitCursor(img *image.NRGBA) {
+	c := color.NRGBA{20, 20, 20, 255}
+	o := color.NRGBA{255, 255, 255, 255}
+	cx, cy, r := 24, 24, 12
+	for y := cy - r; y <= cy+r; y++ {
+		for x := cx - r; x <= cx+r; x++ {
+			d := (x-cx)*(x-cx) + (y-cy)*(y-cy)
+			if d <= r*r && d >= (r-2)*(r-2) {
+				img.SetNRGBA(x, y, o)
+			}
+			if d <= (r-2)*(r-2) && d >= (r-4)*(r-4) {
+				img.SetNRGBA(x, y, c)
+			}
+		}
+	}
+}
+
+func drawCrosshair(img *image.NRGBA) {
+	c := color.NRGBA{20, 20, 20, 255}
+	for i := 8; i <= 40; i++ {
+		img.SetNRGBA(24, i, c)
+		img.SetNRGBA(i, 24, c)
+	}
+}
+
+func cursorHotspotRatio(cursorType string) (hx, hy float64) {
+	switch strings.ToLower(cursorType) {
+	case "text", "ibeam":
+		return 0.5, 0.5
+	case "wait", "crosshair":
+		return 0.5, 0.5
+	default:
+		// Proprietary SVG viewBox hotspot ≈ (3/24, 2/24).
+		return 3.0 / 24.0, 2.0 / 24.0
+	}
 }
 
 func drawArrow(img *image.NRGBA, ox, oy int, c color.NRGBA) {
@@ -71,7 +135,14 @@ func drawArrow(img *image.NRGBA, ox, oy int, c color.NRGBA) {
 }
 
 func overlayCursor(dst *rgbaFrame, sprite *compositorCursor, state cursorKeyframe, zoom zoomState, videoW int) {
-	if sprite == nil || sprite.sprite == nil {
+	if sprite == nil {
+		return
+	}
+	spr := sprite.sprite
+	if state.CursorType != "" && state.CursorType != "arrow" {
+		spr = buildCursorSprite(state.CursorType)
+	}
+	if spr == nil {
 		return
 	}
 	scale := state.Scale
@@ -84,15 +155,15 @@ func overlayCursor(dst *rgbaFrame, sprite *compositorCursor, state cursorKeyfram
 	if size < 8 {
 		size = 8
 	}
-	// Tip in frame after zoom.
 	tipX, tipY := cursorTipInFrame(float64(state.X), float64(state.Y), zoom, dst.W, dst.H)
-	hotX := size * (4.0 / 48.0)
-	hotY := size * (4.0 / 48.0)
+	hx, hy := cursorHotspotRatio(state.CursorType)
+	hotX := size * hx
+	hotY := size * hy
 	originX := tipX - hotX
 	originY := tipY - hotY
 
-	sw := float64(sprite.sprite.W)
-	sh := float64(sprite.sprite.H)
+	sw := float64(spr.W)
+	sh := float64(spr.H)
 	x0 := int(math.Floor(originX))
 	y0 := int(math.Floor(originY))
 	x1 := int(math.Ceil(originX + size))
@@ -104,7 +175,7 @@ func overlayCursor(dst *rgbaFrame, sprite *compositorCursor, state cursorKeyfram
 			}
 			u := ((float64(x)+0.5 - originX) / size) * sw
 			v := ((float64(y)+0.5 - originY) / size) * sh
-			sr, sg, sb, sa := sprite.sprite.sampleBilinear(u-0.5, v-0.5)
+			sr, sg, sb, sa := spr.sampleBilinear(u-0.5, v-0.5)
 			if sa < 1 {
 				continue
 			}
@@ -299,7 +370,6 @@ func overlayKeystrokeChip(dst *rgbaFrame, text string, opacity float64) {
 	}
 	scale := (float64(dst.W) / 1920.0) * 2.0
 	face := basicfont.Face7x13
-	// Measure
 	width := font.MeasureString(face, text).Ceil()
 	padX := int(18 * scale)
 	padY := int(12 * scale)
@@ -308,25 +378,29 @@ func overlayKeystrokeChip(dst *rgbaFrame, text string, opacity float64) {
 	if pillW < int(80*scale) {
 		pillW = int(80 * scale)
 	}
-	img := image.NewNRGBA(image.Rect(0, 0, pillW, pillH))
-	// rounded-ish dark pill
+	shadowPad := int(6 * scale)
+	if shadowPad < 2 {
+		shadowPad = 2
+	}
+	canvas := image.NewNRGBA(image.Rect(0, 0, pillW+shadowPad*2, pillH+shadowPad*2))
 	rr := int(10 * scale)
 	if rr < 4 {
 		rr = 4
 	}
-	fillRoundRect(img, 0, 0, pillW, pillH, rr, color.NRGBA{20, 20, 24, 210})
-	// text
+	// Soft drop shadow (proprietary keystrokes fade shadow before edges).
+	fillRoundRect(canvas, shadowPad+2, shadowPad+3, pillW, pillH, rr, color.NRGBA{0, 0, 0, 90})
+	fillRoundRect(canvas, shadowPad, shadowPad, pillW, pillH, rr, color.NRGBA{20, 20, 24, 220})
 	d := &font.Drawer{
-		Dst:  img,
+		Dst:  canvas,
 		Src:  image.NewUniform(color.NRGBA{255, 255, 255, 255}),
 		Face: face,
-		Dot:  fixed.P(padX, padY+11),
+		Dot:  fixed.P(shadowPad+padX, shadowPad+padY+11),
 	}
 	d.DrawString(text)
 
-	pillX := (dst.W - pillW) / 2
-	pillY := dst.H - int(60*scale) - pillH
-	overlayNRGBA(dst, img, pillX, pillY, opacity)
+	pillX := (dst.W - canvas.Bounds().Dx()) / 2
+	pillY := dst.H - int(60*scale) - canvas.Bounds().Dy()
+	overlayNRGBA(dst, canvas, pillX, pillY, opacity)
 }
 
 func fillRoundRect(img *image.NRGBA, x0, y0, w, h, r int, c color.NRGBA) {
