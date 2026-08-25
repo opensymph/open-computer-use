@@ -253,8 +253,9 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
           open-computer-use record stop  [--pidfile <path>] [--save-as <name-or-path>] [--polish]
           open-computer-use record discard [--pidfile <path>]
           open-computer-use record polish --input <raw.mp4> [--events <file>] [--output <polished.mp4>]
-                                         [--cursor-style slow|mellow|quick|rapid] [--ripples]
-                                         [--no-ripples] [--no-keystrokes] [--no-cursor] [--no-idle-speedup] [--no-zoom]
+                                         [--engine compositor|ffmpeg] [--cursor-style slow|mellow|quick|rapid]
+                                         [--ripples] [--no-ripples] [--no-keystrokes] [--no-cursor]
+                                         [--no-idle-speedup] [--no-zoom]
           open-computer-use record status [--pidfile <path>]
 
         Record the screen. Prefers ffmpeg avfoundation when ffmpeg is on PATH
@@ -262,10 +263,11 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
         veryfast + crf 17 + High + faststart). Falls back to /usr/sbin/screencapture
         -v (.mov; --fps/--quality/--draw-mouse ignored). While recording, display
         `input` actions append <output>.events.json. `record polish` (or start/stop
-        --polish) adds Cursor RecordScreen-style overlays: click ripples, keystroke
-        captions, idle speedup, smart zoom, and a cursor ghost. --polish on start
-        defaults draw-mouse to 0 (ffmpeg -capture_cursor 0). discard stops and
-        deletes the output plus sidecars. Defaults: fps 30, quality demo,
+        --polish) uses the macOS ffmpeg+ASS path (accepts `--engine` for CLI parity
+        with Linux/Windows compositor). Overlays: cursor depress + Screen Studio
+        easing, ease-in/out zoom, keystroke captions, optional --ripples. --polish
+        on start defaults draw-mouse to 0 (ffmpeg -capture_cursor 0). discard stops
+        and deletes the output plus sidecars. Defaults: fps 30, quality demo,
         draw-mouse 1, output in $TMPDIR, pidfile $TMPDIR/open-computer-use-record.pid.
         Requires Screen Recording permission (run `open-computer-use doctor` to grant).
         Override the avfoundation device with OPEN_COMPUTER_USE_AVFOUNDATION_SCREEN.

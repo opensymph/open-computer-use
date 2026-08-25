@@ -1,14 +1,15 @@
 package main
 
 // Open-source record polish pipeline aligned with Cursor polished-renderer
-// compositor behavior (clean-room; does NOT vendor proprietary source):
+// compositor behavior (clean-room; does NOT vendor proprietary source).
 //
-//   - SVG-style cursor ghost with click depress (scale ~0.75)
-//   - Screen Studio cursor easing between click waypoints
-//   - smart zoom with 700ms ease-in / ease-out (not hard cuts)
-//   - idle classification speedups + keystroke captions
-//   - optional thin click rings (--ripples); proprietary compositor does
-//     NOT draw ripples — "click effects" there drive cursor/depress only
+// Default engine (`--engine compositor`): frame compositor pipeline
+//   idle remap → zoom → lens warp → camera motion blur →
+//   cursor (+depress + cursor motion blur) → keystroke chips
+//
+// Legacy (`--engine ffmpeg`): filter_complex + ASS overlays.
+// Optional `--ripples` forces the ffmpeg path for thin click rings
+// (proprietary compositor does not draw ripples).
 //
 // Algorithm references: recording-renderer preprocessing constants and the
 // publicly dumped polished-renderer effect parameters (cursor move 600ms,
@@ -1111,6 +1112,20 @@ func probeVideoDurationMs(path string) (int64, int, int, error) {
 }
 
 func polishRecording(inputVideo, eventsPath, outputVideo string, opts polishOptions) error {
+	return polishRecordingEngine(inputVideo, eventsPath, outputVideo, defaultCompositorOptions().Engine, opts)
+}
+
+func polishRecordingEngine(inputVideo, eventsPath, outputVideo string, engine polishEngineKind, opts polishOptions) error {
+	if engine == polishEngineCompositor {
+		copts := defaultCompositorOptions()
+		copts.polishOptions = opts
+		copts.Engine = polishEngineCompositor
+		return polishRecordingCompositor(inputVideo, eventsPath, outputVideo, copts)
+	}
+	return polishRecordingFFmpeg(inputVideo, eventsPath, outputVideo, opts)
+}
+
+func polishRecordingFFmpeg(inputVideo, eventsPath, outputVideo string, opts polishOptions) error {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return errors.New("ffmpeg is required for record polish but was not found on PATH")
 	}
@@ -1379,6 +1394,7 @@ func escapeFFmpegFilterPath(path string) string {
 func runPolishCommand(args []string, stdout io.Writer) error {
 	var input, events, output string
 	opts := defaultPolishOptions()
+	engine := polishEngineCompositor
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--input", "-i":
@@ -1399,10 +1415,21 @@ func runPolishCommand(args []string, stdout io.Writer) error {
 				return errors.New("--output requires a value")
 			}
 			output = args[i]
+		case "--engine":
+			i++
+			if i >= len(args) {
+				return errors.New("--engine requires a value (compositor|ffmpeg)")
+			}
+			kind, err := parsePolishEngine(args[i])
+			if err != nil {
+				return err
+			}
+			engine = kind
 		case "--no-ripples":
 			opts.ShowClickRipples = false
 		case "--ripples":
 			// Optional: proprietary compositor has no yellow rings.
+			// Ripples only apply to the legacy ffmpeg engine.
 			opts.ShowClickRipples = true
 		case "--no-keystrokes":
 			opts.ShowKeystrokes = false
@@ -1441,11 +1468,26 @@ func runPolishCommand(args []string, stdout io.Writer) error {
 	if output == "" {
 		output = defaultPolishedOutput(input)
 	}
+	// Ripples are an OCU ffmpeg-only overlay; force legacy engine when requested.
+	if opts.ShowClickRipples && engine == polishEngineCompositor {
+		engine = polishEngineFFmpeg
+	}
 	started := time.Now()
-	if err := polishRecording(input, events, output, opts); err != nil {
+	if err := polishRecordingEngine(input, events, output, engine, opts); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "recording polished: input=%s events=%s output=%s elapsed=%s\n",
-		input, events, output, time.Since(started).Round(time.Millisecond))
+	fmt.Fprintf(stdout, "recording polished: engine=%s input=%s events=%s output=%s elapsed=%s\n",
+		polishEngineName(engine), input, events, output, time.Since(started).Round(time.Millisecond))
 	return nil
+}
+
+func polishEngineName(k polishEngineKind) string {
+	switch k {
+	case polishEngineCompositor:
+		return "compositor"
+	case polishEngineFFmpeg:
+		return "ffmpeg"
+	default:
+		return "unknown"
+	}
 }

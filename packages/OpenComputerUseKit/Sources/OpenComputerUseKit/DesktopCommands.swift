@@ -77,6 +77,9 @@ public struct DesktopRecordRequest: Equatable, Sendable {
     public let smartZoom: Bool
     public let idleRate: Double
     public let cursorStyle: String
+    /// `compositor` | `ffmpeg`. macOS currently uses the ffmpeg filter path for both
+    /// (full CPU compositor ships on Linux/Windows); the flag is accepted for CLI parity.
+    public let polishEngine: String
 
     public init(
         subcommand: Subcommand,
@@ -90,13 +93,14 @@ public struct DesktopRecordRequest: Equatable, Sendable {
         polishInput: String? = nil,
         polishEvents: String? = nil,
         polishOutput: String? = nil,
-        showClickRipples: Bool = true,
+        showClickRipples: Bool = false,
         showKeystrokes: Bool = true,
         showCursorGhost: Bool = true,
         idleSpeedup: Bool = true,
         smartZoom: Bool = true,
         idleRate: Double = 3.0,
-        cursorStyle: String = "mellow"
+        cursorStyle: String = "mellow",
+        polishEngine: String = "ffmpeg"
     ) {
         self.subcommand = subcommand
         self.output = output
@@ -116,6 +120,7 @@ public struct DesktopRecordRequest: Equatable, Sendable {
         self.smartZoom = smartZoom
         self.idleRate = idleRate
         self.cursorStyle = cursorStyle
+        self.polishEngine = polishEngine
     }
 
     public var polishOptions: DesktopPolishOptions {
@@ -465,6 +470,7 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
     var smartZoom = true
     var idleRate = 3.0
     var cursorStyle = "mellow"
+    var polishEngine = "ffmpeg"
     var index = 0
     while index < rest.count {
         switch rest[index] {
@@ -486,6 +492,17 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
                 throw OpenComputerUseCLIError(message: "--output requires a value")
             }
             polishOutput = rest[index]
+        case "--engine":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--engine requires a value (compositor|ffmpeg)")
+            }
+            let value = rest[index].lowercased()
+            guard ["compositor", "ffmpeg", "default", "legacy", "filter"].contains(value) else {
+                throw OpenComputerUseCLIError(message: "invalid --engine \"\(rest[index])\" (compositor|ffmpeg)")
+            }
+            // Full CPU compositor is Linux/Windows; macOS keeps the ffmpeg filter path.
+            polishEngine = "ffmpeg"
         case "--no-ripples":
             showClickRipples = false
         case "--ripples":
@@ -536,7 +553,8 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
         idleSpeedup: idleSpeedup,
         smartZoom: smartZoom,
         idleRate: idleRate,
-        cursorStyle: cursorStyle
+        cursorStyle: cursorStyle,
+        polishEngine: polishEngine
     )
 }
 
@@ -2259,7 +2277,7 @@ enum DesktopRecord {
             opts: request.polishOptions
         )
         let elapsedMs = Int((Date().timeIntervalSince(started) * 1000.0).rounded())
-        return "recording polished: input=\(input) events=\(events) output=\(output) elapsed=\(elapsedMs)ms"
+        return "recording polished: engine=\(request.polishEngine) input=\(input) events=\(events) output=\(output) elapsed=\(elapsedMs)ms"
     }
 
     static func relocateRecordOutput(current: String, saveAs: String) throws -> String {
