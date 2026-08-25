@@ -76,6 +76,7 @@ public struct DesktopRecordRequest: Equatable, Sendable {
     public let idleSpeedup: Bool
     public let smartZoom: Bool
     public let idleRate: Double
+    public let cursorStyle: String
 
     public init(
         subcommand: Subcommand,
@@ -94,7 +95,8 @@ public struct DesktopRecordRequest: Equatable, Sendable {
         showCursorGhost: Bool = true,
         idleSpeedup: Bool = true,
         smartZoom: Bool = true,
-        idleRate: Double = 3.0
+        idleRate: Double = 3.0,
+        cursorStyle: String = "mellow"
     ) {
         self.subcommand = subcommand
         self.output = output
@@ -113,6 +115,7 @@ public struct DesktopRecordRequest: Equatable, Sendable {
         self.idleSpeedup = idleSpeedup
         self.smartZoom = smartZoom
         self.idleRate = idleRate
+        self.cursorStyle = cursorStyle
     }
 
     public var polishOptions: DesktopPolishOptions {
@@ -122,7 +125,8 @@ public struct DesktopRecordRequest: Equatable, Sendable {
             showCursorGhost: showCursorGhost,
             idleSpeedup: idleSpeedup,
             smartZoom: smartZoom,
-            idleRate: idleRate
+            idleRate: idleRate,
+            cursorStyle: cursorStyle
         )
     }
 }
@@ -139,6 +143,12 @@ public struct DesktopPolishOptions: Equatable, Sendable {
     public var zoomFactor: Double
     public var zoomDurationMs: Int64
     public var maxZooms: Int
+    /// Matches recording-renderer zoomImportanceThreshold (default 60).
+    public var zoomImportance: Int
+    /// Matches recording-renderer minZoomIntervalMs (default 1500).
+    public var minZoomIntervalMs: Int64
+    /// slow|mellow|quick|rapid — spring / cubic-bezier cursor motion style.
+    public var cursorStyle: String
 
     public init(
         showClickRipples: Bool = true,
@@ -146,11 +156,14 @@ public struct DesktopPolishOptions: Equatable, Sendable {
         showCursorGhost: Bool = true,
         idleSpeedup: Bool = true,
         smartZoom: Bool = true,
-        minIdleMs: Int64 = 1500,
+        minIdleMs: Int64 = 500,
         idleRate: Double = 3.0,
-        zoomFactor: Double = 1.45,
+        zoomFactor: Double = 1.5,
         zoomDurationMs: Int64 = 1400,
-        maxZooms: Int = 8
+        maxZooms: Int = 8,
+        zoomImportance: Int = 60,
+        minZoomIntervalMs: Int64 = 1500,
+        cursorStyle: String = "mellow"
     ) {
         self.showClickRipples = showClickRipples
         self.showKeystrokes = showKeystrokes
@@ -162,6 +175,9 @@ public struct DesktopPolishOptions: Equatable, Sendable {
         self.zoomFactor = zoomFactor
         self.zoomDurationMs = zoomDurationMs
         self.maxZooms = maxZooms
+        self.zoomImportance = zoomImportance
+        self.minZoomIntervalMs = minZoomIntervalMs
+        self.cursorStyle = cursorStyle
     }
 
     public static func `default`() -> DesktopPolishOptions {
@@ -448,6 +464,7 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
     var idleSpeedup = true
     var smartZoom = true
     var idleRate = 3.0
+    var cursorStyle = "mellow"
     var index = 0
     while index < rest.count {
         switch rest[index] {
@@ -479,6 +496,16 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
             idleSpeedup = false
         case "--no-zoom":
             smartZoom = false
+        case "--cursor-style":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--cursor-style requires a value")
+            }
+            let value = rest[index].lowercased()
+            guard ["slow", "mellow", "quick", "rapid"].contains(value) else {
+                throw OpenComputerUseCLIError(message: "invalid --cursor-style \"\(rest[index])\" (slow|mellow|quick|rapid)")
+            }
+            cursorStyle = value
         case "--idle-rate":
             index += 1
             guard index < rest.count, let parsed = Double(rest[index]), parsed >= 1 else {
@@ -506,7 +533,8 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
         showCursorGhost: showCursorGhost,
         idleSpeedup: idleSpeedup,
         smartZoom: smartZoom,
-        idleRate: idleRate
+        idleRate: idleRate,
+        cursorStyle: cursorStyle
     )
 }
 
@@ -1238,56 +1266,84 @@ public func buildIdleSegments(
     durationMs: Int64,
     opts: DesktopPolishOptions
 ) -> [DesktopPolishSegment] {
-    if !opts.idleSpeedup || opts.idleRate <= 1.01 {
+    if !opts.idleSpeedup {
         return [DesktopPolishSegment(startMs: 0, endMs: durationMs, rate: 1)]
     }
-    var actionTimes: [Int64] = []
-    for ev in events where ev.type != "wait" {
-        if ev.tMs >= 0 && ev.tMs <= durationMs {
-            actionTimes.append(ev.tMs)
+    // Idle classification aligned with recording-renderer idle-classifier.js:
+    // LOADING_WAIT (4x), THINKING_PAUSE (3x), VIEWING_RESULT (preserve 1x),
+    // LONG_OPERATION (4x). Falls back to opts.idleRate when classification
+    // suggests a generic speedup.
+    let minIdle = opts.minIdleMs > 0 ? opts.minIdleMs : 500
+    func actionType(_ ev: DesktopRecordEvent) -> String {
+        switch ev.type {
+        case "click":
+            if (ev.count ?? 1) >= 3 { return "triple_click" }
+            if (ev.count ?? 1) == 2 { return "double_click" }
+            return "click"
+        default:
+            return ev.type
         }
     }
-    actionTimes.sort()
+    func classify(duration: Int64, preceding: String, following: String) -> Double {
+        if duration >= 10000 { return 4.0 }
+        if (preceding == "click" || preceding == "double_click" || preceding == "triple_click") &&
+            (following == "screenshot" || following == "none") {
+            return 4.0
+        }
+        if preceding == "screenshot" && duration >= 500 && duration <= 3000 {
+            return 1.0 // VIEWING_RESULT
+        }
+        if (preceding == "type" || preceding == "key") && (following == "type" || following == "key") && duration >= 5000 {
+            return 3.0
+        }
+        if duration >= 5000 { return 3.0 }
+        if duration >= 1000 &&
+            (preceding == "click" || preceding == "double_click" || preceding == "type" || preceding == "key" || preceding == "scroll") {
+            return 4.0
+        }
+        if duration >= minIdle {
+            return max(opts.idleRate, 2.0)
+        }
+        return 1.0
+    }
 
-    var segments: [DesktopPolishSegment] = []
-    var cursor: Int64 = 0
-    let pad: Int64 = 350
-    for t in actionTimes {
-        let gapStart = cursor
-        let gapEnd = t - pad
-        if gapEnd - gapStart >= opts.minIdleMs {
-            if gapStart < gapEnd {
-                segments.append(DesktopPolishSegment(startMs: gapStart, endMs: gapEnd, rate: opts.idleRate))
-            }
-            var actionStart = gapEnd
-            if actionStart < cursor {
-                actionStart = cursor
-            }
-            var actionEnd = t + pad
-            if actionEnd > durationMs {
-                actionEnd = durationMs
-            }
-            if actionEnd > actionStart {
-                segments.append(DesktopPolishSegment(startMs: actionStart, endMs: actionEnd, rate: 1))
-            }
-            cursor = actionEnd
-        } else {
-            var actionEnd = t + pad
-            if actionEnd > durationMs {
-                actionEnd = durationMs
-            }
-            if actionEnd > cursor {
-                segments.append(DesktopPolishSegment(startMs: cursor, endMs: actionEnd, rate: 1))
-                cursor = actionEnd
-            }
-        }
+    if events.isEmpty {
+        let rate = classify(duration: durationMs, preceding: "none", following: "none")
+        return [DesktopPolishSegment(startMs: 0, endMs: durationMs, rate: rate)]
     }
-    if cursor < durationMs {
-        if durationMs - cursor >= opts.minIdleMs {
-            segments.append(DesktopPolishSegment(startMs: cursor, endMs: durationMs, rate: opts.idleRate))
-        } else {
-            segments.append(DesktopPolishSegment(startMs: cursor, endMs: durationMs, rate: 1))
+
+    var periods: [(Int64, Int64, Double)] = []
+    let first = events[0].tMs
+    if first >= minIdle {
+        periods.append((0, first, classify(duration: first, preceding: "none", following: actionType(events[0]))))
+    }
+    for i in 0..<(events.count - 1) {
+        let gap = events[i + 1].tMs - events[i].tMs
+        if gap < minIdle { continue }
+        let rate = classify(duration: gap, preceding: actionType(events[i]), following: actionType(events[i + 1]))
+        periods.append((events[i].tMs, events[i + 1].tMs, rate))
+    }
+    if let last = events.last, durationMs - last.tMs >= minIdle {
+        periods.append((last.tMs, durationMs, classify(duration: durationMs - last.tMs, preceding: actionType(last), following: "none")))
+    }
+
+    var cuts: Set<Int64> = [0, durationMs]
+    for p in periods {
+        cuts.insert(p.0)
+        cuts.insert(p.1)
+    }
+    let points = cuts.sorted()
+    var segments: [DesktopPolishSegment] = []
+    for i in 0..<(points.count - 1) {
+        let a = points[i]
+        let b = points[i + 1]
+        if b <= a { continue }
+        var rate = 1.0
+        for p in periods where a >= p.0 && a < p.1 {
+            rate = p.2
+            break
         }
+        segments.append(DesktopPolishSegment(startMs: a, endMs: b, rate: rate))
     }
     if segments.isEmpty {
         return [DesktopPolishSegment(startMs: 0, endMs: durationMs, rate: 1)]
@@ -1324,48 +1380,115 @@ func selectZoomWindows(
     durationMs: Int64,
     opts: DesktopPolishOptions
 ) -> [DesktopZoomWindow] {
+    // Port of recording-renderer click-importance + zoom selection:
+    // base 50 + bonuses/penalties, threshold 60, min interval 1500ms, max 8/min.
     struct Candidate {
         var tMs: Int64
         var x: Int
         var y: Int
         var score: Int
     }
+    let width = 1920
+    let height = 1200
+    var clicks: [(index: Int, ev: DesktopRecordEvent)] = []
+    for (i, ev) in events.enumerated() where ev.type == "click" {
+        let x = ev.x ?? 0
+        let y = ev.y ?? 0
+        if x == 0 && y == 0 { continue }
+        clicks.append((i, ev))
+    }
+
     var cands: [Candidate] = []
+    var lastClickT: Int64 = 0
+    var lastX = 0
+    var lastY = 0
+    var lastNonClick: Int64 = 0
+    let rapidMs: Int64 = 500
+    let idleMs: Int64 = 3000
+    let sameArea = 50.0
+    let edge = 100
+
+    for (pos, item) in clicks.enumerated() {
+        let ev = item.ev
+        let x = ev.x ?? 0
+        let y = ev.y ?? 0
+        var score = 50
+        let count = ev.count ?? 1
+        if count >= 2 { score += 25 }
+        if count >= 3 { score += 20 }
+        if (ev.button ?? "").lowercased() == "right" { score += 15 }
+        if lastClickT > 0 {
+            let dt = ev.tMs - lastClickT
+            if dt < rapidMs { score -= 25 }
+            if dt > idleMs { score += 15 }
+            let dist = hypot(Double(x - lastX), Double(y - lastY))
+            if dist < sameArea { score -= 15 }
+        }
+        if x < edge || y < edge || x > width - edge || y > height - edge {
+            score -= 20
+        }
+        if ev.tMs - lastNonClick > idleMs {
+            score += 25
+        }
+        let nextIdx = item.index + 1
+        if nextIdx < events.count {
+            let nxt = events[nextIdx].type
+            if nxt == "type" || nxt == "key" { score += 30 }
+        }
+        score = max(0, min(100, score))
+        cands.append(Candidate(tMs: ev.tMs, x: x, y: y, score: score))
+        lastClickT = ev.tMs
+        lastX = x
+        lastY = y
+        lastNonClick = ev.tMs
+        _ = pos
+    }
+    // Advance lastNonClick for non-click events chronologically (approx via re-scan)
+    lastNonClick = 0
+    var clickPos = 0
     for ev in events {
-        var score = 0
-        var x = ev.x ?? 0
-        var y = ev.y ?? 0
-        switch ev.type {
-        case "click":
-            score = 80
-            if (ev.count ?? 1) >= 2 { score = 95 }
-        case "drag":
-            score = 70
-        case "type", "key":
-            score = 40
-        default:
+        if clickPos < cands.count && ev.type == "click" && ev.tMs == cands[clickPos].tMs {
+            if ev.tMs - lastNonClick > idleMs {
+                cands[clickPos].score = max(0, min(100, cands[clickPos].score + 0)) // already applied
+            }
+            lastNonClick = ev.tMs
+            clickPos += 1
             continue
         }
-        if score < 60 { continue }
-        if x == 0 && y == 0 && ev.type != "click" { continue }
-        cands.append(Candidate(tMs: ev.tMs, x: x, y: y, score: score))
+        if ev.type != "wait" {
+            lastNonClick = ev.tMs
+        }
     }
+
     cands.sort { lhs, rhs in
         if lhs.score != rhs.score { return lhs.score > rhs.score }
         return lhs.tMs < rhs.tMs
     }
 
+    var maxZooms = opts.maxZooms
+    if durationMs > 0 {
+        let perMin = Int((Double(durationMs) / 60000.0) * 8.0 + 0.999)
+        maxZooms = max(1, min(maxZooms, max(1, perMin)))
+    }
+
     var zooms: [DesktopZoomWindow] = []
-    var lastZoom = -opts.zoomDurationMs
+    var lastStart = -opts.minZoomIntervalMs
     for c in cands {
-        if zooms.count >= opts.maxZooms { break }
+        if c.score < opts.zoomImportance { continue }
+        if zooms.count >= maxZooms { break }
         var start = c.tMs - 200
         if start < 0 { start = 0 }
         var end = start + opts.zoomDurationMs
         if end > durationMs { end = durationMs }
-        if start < lastZoom + 800 { continue }
+        if start < lastStart + opts.minZoomIntervalMs { continue }
+        var overlap = false
+        for z in zooms where start < z.endMs && end > z.startMs {
+            overlap = true
+            break
+        }
+        if overlap { continue }
         zooms.append(DesktopZoomWindow(startMs: start, endMs: end, x: c.x, y: c.y, factor: opts.zoomFactor))
-        lastZoom = start
+        lastStart = start
     }
     zooms.sort { $0.startMs < $1.startMs }
     return zooms
@@ -1446,23 +1569,39 @@ func writeKeystrokeASS(events: [DesktopRecordEvent]) -> String {
 }
 
 func writeRippleASS(events: [DesktopRecordEvent]) -> String {
+    // Thin expanding rings (transparent fill + border stroke). Never use filled
+    // ASS \p1 boxes — those rendered as large opaque "blobs" on demos.
     var b = ""
+    var lastT: Int64 = Int64.min / 4
     for ev in events {
         guard ev.type == "click" || ev.type == "drag" else { continue }
         var x = ev.x ?? 0
         var y = ev.y ?? 0
         if ev.type == "drag" {
-            x = ev.toX ?? 0
-            y = ev.toY ?? 0
+            x = ev.toX ?? x
+            y = ev.toY ?? y
         }
         if x == 0 && y == 0 { continue }
-        for (i, radius) in [12, 22, 34, 48].enumerated() {
-            let start = ev.tMs + Int64(i * 70)
-            let end = start + 180
-            let draw = "{\\pos(0,0)\\p1\\alpha&H60&\\c&H00FFFF&}m \(x - radius) \(y - radius) l \(x + radius) \(y - radius) l \(x + radius) \(y + radius) l \(x - radius) \(y + radius) l \(x - radius) \(y - radius){\\p0}"
+        let count = ev.count ?? 1
+        if ev.tMs - lastT < 200 && count < 2 { continue }
+        lastT = ev.tMs
+
+        // Brief center flash (small glyph, not a filled disc).
+        b += "Dialogue: 2,\(formatASSTime(ev.tMs)),\(formatASSTime(ev.tMs + 90)),Ripple,,0,0,0,,{\\pos(\(x),\(y))\\fs10\\c&H00D7FF&\\alpha&H40&●}\n"
+
+        // Radii stay compact (~cursor scale). ASS colours are &HAABBGGRR&.
+        for (i, radius) in [6, 11, 16, 22].enumerated() {
+            let start = ev.tMs + Int64(i * 55)
+            let end = start + 120
+            let outlineAlpha = 0x30 + i * 0x28
+            // Bezier circle approximation; \1a&HFF& = fully transparent fill,
+            // \bord draws the visible thin ring.
+            let draw =
+                "{\\an5\\pos(\(x),\(y))\\p1\\1a&HFF&\\bord2\\3c&H00D7FF&\\3a&H" +
+                String(format: "%02X", outlineAlpha) +
+                "&\\shad0}m 0 \(-radius) b \(radius) \(-radius) \(radius) \(radius) 0 \(radius) b \(-radius) \(radius) \(-radius) \(-radius) 0 \(-radius){\\p0}"
             b += "Dialogue: 1,\(formatASSTime(start)),\(formatASSTime(end)),Ripple,,0,0,0,,\(draw)\n"
         }
-        b += "Dialogue: 2,\(formatASSTime(ev.tMs)),\(formatASSTime(ev.tMs + 220)),Ripple,,0,0,0,,{\\pos(\(x),\(y))\\fs28\\c&H00FFFF&●}\n"
     }
     return b
 }

@@ -288,6 +288,9 @@ final class DesktopCommandTests: XCTestCase {
         XCTAssertTrue(plan.ass.contains("Keystroke"), plan.ass)
         XCTAssertTrue(plan.ass.contains("hi"), plan.ass)
         XCTAssertTrue(plan.ass.contains("Ripple"), plan.ass)
+        XCTAssertTrue(plan.ass.contains("1a&HFF&"), "ripples must use transparent-fill rings, got:\n\(plan.ass)")
+        XCTAssertTrue(plan.ass.contains("\\bord2"), "ripples must stroke outline rings")
+        XCTAssertFalse(plan.ass.contains("\\p1\\alpha&H60&"), "should not use filled-square ripples")
         XCTAssertTrue(plan.ass.contains("Cursor"), plan.ass)
     }
 

@@ -110,7 +110,7 @@ open-computer-use screenshot --output shot.png   # whole-desktop PNG (base64 to 
 open-computer-use cursor-position                # pointer x/y + desktop size (JSON, identical shape)
 open-computer-use record start --output rec.mp4 --fps 60 --quality demo --polish
 open-computer-use record stop --save-as demo-take   # also writes demo-take.polished.mp4 when --polish
-open-computer-use record polish --input demo-take.mp4  # ripples / key captions / idle speedup / zoom / cursor
+open-computer-use record polish --input demo-take.mp4  # thin rings / key captions / idle classes / multi-zoom / spring cursor
 open-computer-use record discard                 # stop + delete (Cursor RecordScreen DISCARD parity)
 open-computer-use record status
 ```
@@ -125,7 +125,7 @@ open-computer-use record status
 | input gate | `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` | `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1` | `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1` |
 | record backend | `ffmpeg x11grab` (needs PATH) | `ffmpeg gdigrab` (needs PATH) | prefers `ffmpeg avfoundation` when on PATH; falls back to `/usr/sbin/screencapture -v` |
 | record quality | `--quality demo` (default) / `draft` / `proxy`; `--fps`, `--draw-mouse`, `discard`, `stop --save-as` | same | same flags; ffmpeg path honors them, screencapture fallback ignores encode knobs |
-| record polish | open-source ffmpeg+ASS pipeline aligned with Cursor RecordScreen overlays: click ripples, keystroke captions, idle speedup, smart zoom, cursor ghost (`record polish` / `--polish`). Logs display `input` into `<stem>.events.json`. | same | same |
+| record polish | open-source ffmpeg+ASS pipeline aligned with Cursor RecordScreen overlays: thin click rings, keystroke captions, idle classification (LOADING_WAIT/THINKING_PAUSE), multi-window smart zoom, spring cursor styles (`record polish` / `--polish`). Logs display `input` into `<stem>.events.json`. | same | same |
 
 The Linux commands accept `--display` (defaults `$DISPLAY`, then `:0`; a VNC/AnyOS desktop is usually `:1`); Windows and macOS operate on the whole desktop and have no `--display`. Global synthetic input moves the real pointer/keyboard, so each platform gates it behind its own opt-in flag (default off):
 
