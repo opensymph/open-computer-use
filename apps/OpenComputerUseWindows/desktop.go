@@ -36,12 +36,14 @@ type pointerInfo struct {
 // recordState is persisted to the record pidfile so a later `record stop` /
 // `record discard` can find and signal the detached ffmpeg process.
 type recordState struct {
-	PID       int    `json:"pid"`
-	Output    string `json:"output"`
-	FPS       int    `json:"fps,omitempty"`
-	Quality   string `json:"quality,omitempty"`
-	DrawMouse int    `json:"draw_mouse,omitempty"`
-	StartedAt string `json:"started_at,omitempty"`
+	PID        int    `json:"pid"`
+	Output     string `json:"output"`
+	FPS        int    `json:"fps,omitempty"`
+	Quality    string `json:"quality,omitempty"`
+	DrawMouse  int    `json:"draw_mouse,omitempty"`
+	StartedAt  string `json:"started_at,omitempty"`
+	AutoPolish bool   `json:"auto_polish,omitempty"`
+	EventsPath string `json:"events_path,omitempty"`
 }
 
 // recordOptions controls the ffmpeg capture/encode knobs shared with the
@@ -185,6 +187,9 @@ func runInputCommand(args []string, stdout io.Writer) error {
 			return err
 		}
 		time.Sleep(duration)
+		if ev, ok := buildRecordEventFromInput(action, rest); ok {
+			appendRecordEventIfRecording(defaultRecordPidfile(), ev)
+		}
 		fmt.Fprintf(stdout, "waited %s\n", duration)
 		return nil
 	}
@@ -201,6 +206,9 @@ func runInputCommand(args []string, stdout io.Writer) error {
 	}
 	if err := runInputOps(ops); err != nil {
 		return err
+	}
+	if ev, ok := buildRecordEventFromInput(action, rest); ok {
+		appendRecordEventIfRecording(defaultRecordPidfile(), ev)
 	}
 	fmt.Fprintf(stdout, "input %s ok\n", action)
 	return nil
@@ -383,14 +391,19 @@ func parseAmountFlag(rest []string, fallback int) (int, error) {
 
 func runRecordCommand(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("record requires a subcommand: start, stop, discard, or status")
+		return errors.New("record requires a subcommand: start, stop, discard, polish, or status")
 	}
 	sub := args[0]
 	rest := args[1:]
+	if sub == "polish" {
+		return runPolishCommand(rest, stdout)
+	}
 
 	var output, pidfile, saveAs, quality string
 	fps := 30
 	drawMouse := 1
+	autoPolish := false
+	drawMouseSet := false
 	for i := 0; i < len(rest); i++ {
 		switch rest[i] {
 		case "--output", "-o":
@@ -414,7 +427,7 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 		case "--quality":
 			i++
 			if i >= len(rest) {
-				return errors.New("--quality requires a value (demo or draft)")
+				return errors.New("--quality requires a value (demo, draft, or proxy)")
 			}
 			quality = rest[i]
 		case "--draw-mouse":
@@ -423,12 +436,15 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 				return errors.New("--draw-mouse requires 0 or 1")
 			}
 			drawMouse, _ = strconv.Atoi(rest[i])
+			drawMouseSet = true
 		case "--save-as":
 			i++
 			if i >= len(rest) {
 				return errors.New("--save-as requires a value")
 			}
 			saveAs = rest[i]
+		case "--polish":
+			autoPolish = true
 		default:
 			return fmt.Errorf("unknown record option: %s", rest[i])
 		}
@@ -440,6 +456,9 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if autoPolish && !drawMouseSet {
+		drawMouse = 0
+	}
 
 	switch sub {
 	case "start":
@@ -450,9 +469,12 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 			output = defaultRecordOutput(time.Now())
 		}
 		opts := recordOptions{fps: fps, quality: normalizedQuality, drawMouse: drawMouse}
+		width, height := 0, 0
 		if info, err := queryPointer(); err == nil && info.ScreenWidth > 0 && info.ScreenHeight > 0 {
 			opts.videoSize = fmt.Sprintf("%dx%d", info.ScreenWidth, info.ScreenHeight)
+			width, height = info.ScreenWidth, info.ScreenHeight
 		}
+		startedAt := time.Now().UTC()
 		pid, err := startRecordProcess(output, buildFfmpegRecordArgs(output, opts))
 		if err != nil {
 			return err
@@ -463,19 +485,23 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 			_ = os.Remove(output + ".log")
 			return err
 		}
+		eventsPath := recordEventsPath(output)
+		_ = initRecordEventLog(output, width, height, opts.fps, startedAt)
 		state := recordState{
-			PID:       pid,
-			Output:    output,
-			FPS:       opts.fps,
-			Quality:   opts.quality,
-			DrawMouse: opts.drawMouse,
-			StartedAt: time.Now().UTC().Format(time.RFC3339),
+			PID:        pid,
+			Output:     output,
+			FPS:        opts.fps,
+			Quality:    opts.quality,
+			DrawMouse:  opts.drawMouse,
+			StartedAt:  startedAt.Format(time.RFC3339),
+			AutoPolish: autoPolish,
+			EventsPath: eventsPath,
 		}
 		if err := writeRecordPidfile(pidfile, state); err != nil {
 			return fmt.Errorf("recording started (pid %d) but pidfile write failed: %w", pid, err)
 		}
-		fmt.Fprintf(stdout, "recording started: pid=%d fps=%d quality=%s draw_mouse=%d output=%s\n",
-			pid, state.FPS, state.Quality, state.DrawMouse, output)
+		fmt.Fprintf(stdout, "recording started: pid=%d fps=%d quality=%s draw_mouse=%d polish=%v output=%s\n",
+			pid, state.FPS, state.Quality, state.DrawMouse, autoPolish, output)
 		return nil
 
 	case "stop":
@@ -495,8 +521,24 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 				return fmt.Errorf("recording stopped but --save-as failed: %w", err)
 			}
 			finalOutput = moved
+			oldEvents := recordEventsPath(state.Output)
+			newEvents := recordEventsPath(finalOutput)
+			if oldEvents != newEvents {
+				if err := relocateFileBestEffort(oldEvents, newEvents); err != nil {
+					// Non-fatal: polish can still be pointed at the old events path.
+					fmt.Fprintf(stdout, "warning: could not move events sidecar: %v\n", err)
+				}
+			}
 		}
 		fmt.Fprintf(stdout, "recording stopped: output=%s\n", finalOutput)
+		if autoPolish || state.AutoPolish {
+			polished := defaultPolishedOutput(finalOutput)
+			events := recordEventsPath(finalOutput)
+			if err := polishRecording(finalOutput, events, polished, defaultPolishOptions()); err != nil {
+				return fmt.Errorf("recording stopped (%s) but polish failed: %w", finalOutput, err)
+			}
+			fmt.Fprintf(stdout, "recording polished: output=%s\n", polished)
+		}
 		return nil
 
 	case "discard":
@@ -506,8 +548,8 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 		}
 		stopErr := stopRecordProcess(state.PID)
 		_ = os.Remove(pidfile)
+		removeRecordSidecars(state.Output)
 		_ = os.Remove(state.Output)
-		_ = os.Remove(state.Output + ".log")
 		if stopErr != nil {
 			return fmt.Errorf("recording discarded (output removed=%s) but stop had a problem: %w", state.Output, stopErr)
 		}
@@ -532,8 +574,15 @@ func runRecordCommand(args []string, stdout io.Writer) error {
 			if state.DrawMouse == 0 || state.DrawMouse == 1 {
 				status["draw_mouse"] = state.DrawMouse
 			}
+			status["auto_polish"] = state.AutoPolish
+			if state.EventsPath != "" {
+				status["events_path"] = state.EventsPath
+			}
 			if fi, err := os.Stat(state.Output); err == nil {
 				status["output_bytes"] = fi.Size()
+			}
+			if log, err := readRecordEventLog(recordEventsPath(state.Output)); err == nil {
+				status["event_count"] = len(log.Events)
 			}
 		}
 		encoded, err := json.MarshalIndent(status, "", "  ")

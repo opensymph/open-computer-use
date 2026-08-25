@@ -1826,7 +1826,7 @@ func helpText(command string) string {
 	case "input":
 		return "Usage:\n  open-computer-use input <action> [--display <:N>] [options]\n\nActions (backed by xdotool; global synthetic input):\n  move <x> <y>\n  click [--button left|right|middle] [--count N] [--x X --y Y]\n  drag <from_x> <from_y> <to_x> <to_y> [--button left]\n  scroll <up|down|left|right> [--amount N]\n  type <text>\n  key <key-or-chord>          e.g. ctrl+s, Return, Page_Up\n  wait <seconds>\n\nEvery action except wait moves the real pointer/keyboard and requires\nOPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1.\n"
 	case "record":
-		return "Usage:\n  open-computer-use record start [--display <:N>] [--output <path.mp4>] [--fps N]\n                         [--quality demo|draft|proxy] [--draw-mouse 0|1] [--pidfile <path>]\n  open-computer-use record stop  [--pidfile <path>] [--save-as <name-or-path>]\n  open-computer-use record discard [--pidfile <path>]\n  open-computer-use record status [--pidfile <path>]\n\nRecord the X11 display with ffmpeg x11grab (H.264 mp4). start runs ffmpeg\ndetached; stop signals it so the mp4 is finalized; discard stops and deletes\nthe output (like Cursor RecordScreen DISCARD). Defaults: fps 30, quality demo\n(RecordScreen-aligned veryfast/crf17/High/faststart), draw-mouse 1, output in\n$TMPDIR, pidfile /tmp/open-computer-use-record.pid. Use --quality draft for the\nolder ultrafast encode, or --fps 60 for RecordScreen-like capture rate.\n"
+		return "Usage:\n  open-computer-use record start [--display <:N>] [--output <path.mp4>] [--fps N]\n                         [--quality demo|draft|proxy] [--draw-mouse 0|1] [--polish] [--pidfile <path>]\n  open-computer-use record stop  [--pidfile <path>] [--save-as <name-or-path>] [--polish]\n  open-computer-use record discard [--pidfile <path>]\n  open-computer-use record polish --input <raw.mp4> [--events <file>] [--output <polished.mp4>]\n                         [--no-ripples] [--no-keystrokes] [--no-cursor] [--no-idle-speedup] [--no-zoom]\n  open-computer-use record status [--pidfile <path>]\n\nRecord the X11 display with ffmpeg x11grab. While recording, display `input`\nactions append <output>.events.json. `record polish` (or start/stop --polish)\nadds Cursor RecordScreen-style overlays: click ripples, keystroke captions,\nidle speedup, smart zoom, and a cursor ghost. Defaults: fps 30, quality demo,\ndraw-mouse 1 (auto 0 with --polish).\n"
 	default:
 		return `Open Computer Use for Linux
 
@@ -1842,7 +1842,7 @@ Commands:
   screenshot           Capture the whole X11 display to PNG.
   cursor-position      Print the X11 pointer position as JSON.
   input <action>       Global xdotool input: move/click/drag/scroll/type/key/wait.
-  record <start|stop|discard|status>  Record the X11 display with ffmpeg x11grab.
+  record <start|stop|discard|polish|status>  Record + optional RecordScreen-style polish.
   help [command]       Show general or command-specific help.
   version              Print the CLI version.
 

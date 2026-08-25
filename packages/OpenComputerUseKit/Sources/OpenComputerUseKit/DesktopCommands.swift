@@ -44,6 +44,7 @@ public struct DesktopRecordRequest: Equatable, Sendable {
         case stop
         case discard
         case status
+        case polish
     }
 
     public let subcommand: Subcommand
@@ -59,6 +60,22 @@ public struct DesktopRecordRequest: Equatable, Sendable {
     public let drawMouse: Int
     /// Optional rename target for `record stop --save-as`.
     public let saveAs: String?
+    /// When true, start remembers polish-on-stop; stop with `--polish` also
+    /// triggers the post-process pipeline. Auto-defaults `drawMouse` to 0
+    /// unless `--draw-mouse` was set explicitly.
+    public let autoPolish: Bool
+    /// Raw video for `record polish --input`.
+    public let polishInput: String?
+    /// Optional events sidecar override for `record polish --events`.
+    public let polishEvents: String?
+    /// Optional polished output path for `record polish --output`.
+    public let polishOutput: String?
+    public let showClickRipples: Bool
+    public let showKeystrokes: Bool
+    public let showCursorGhost: Bool
+    public let idleSpeedup: Bool
+    public let smartZoom: Bool
+    public let idleRate: Double
 
     public init(
         subcommand: Subcommand,
@@ -67,7 +84,17 @@ public struct DesktopRecordRequest: Equatable, Sendable {
         pidfile: String?,
         quality: String = "demo",
         drawMouse: Int = 1,
-        saveAs: String? = nil
+        saveAs: String? = nil,
+        autoPolish: Bool = false,
+        polishInput: String? = nil,
+        polishEvents: String? = nil,
+        polishOutput: String? = nil,
+        showClickRipples: Bool = true,
+        showKeystrokes: Bool = true,
+        showCursorGhost: Bool = true,
+        idleSpeedup: Bool = true,
+        smartZoom: Bool = true,
+        idleRate: Double = 3.0
     ) {
         self.subcommand = subcommand
         self.output = output
@@ -76,6 +103,69 @@ public struct DesktopRecordRequest: Equatable, Sendable {
         self.quality = quality
         self.drawMouse = drawMouse
         self.saveAs = saveAs
+        self.autoPolish = autoPolish
+        self.polishInput = polishInput
+        self.polishEvents = polishEvents
+        self.polishOutput = polishOutput
+        self.showClickRipples = showClickRipples
+        self.showKeystrokes = showKeystrokes
+        self.showCursorGhost = showCursorGhost
+        self.idleSpeedup = idleSpeedup
+        self.smartZoom = smartZoom
+        self.idleRate = idleRate
+    }
+
+    public var polishOptions: DesktopPolishOptions {
+        DesktopPolishOptions(
+            showClickRipples: showClickRipples,
+            showKeystrokes: showKeystrokes,
+            showCursorGhost: showCursorGhost,
+            idleSpeedup: idleSpeedup,
+            smartZoom: smartZoom,
+            idleRate: idleRate
+        )
+    }
+}
+
+/// Options for the ffmpeg+ASS polish pipeline (Cursor RecordScreen-style).
+public struct DesktopPolishOptions: Equatable, Sendable {
+    public var showClickRipples: Bool
+    public var showKeystrokes: Bool
+    public var showCursorGhost: Bool
+    public var idleSpeedup: Bool
+    public var smartZoom: Bool
+    public var minIdleMs: Int64
+    public var idleRate: Double
+    public var zoomFactor: Double
+    public var zoomDurationMs: Int64
+    public var maxZooms: Int
+
+    public init(
+        showClickRipples: Bool = true,
+        showKeystrokes: Bool = true,
+        showCursorGhost: Bool = true,
+        idleSpeedup: Bool = true,
+        smartZoom: Bool = true,
+        minIdleMs: Int64 = 1500,
+        idleRate: Double = 3.0,
+        zoomFactor: Double = 1.45,
+        zoomDurationMs: Int64 = 1400,
+        maxZooms: Int = 8
+    ) {
+        self.showClickRipples = showClickRipples
+        self.showKeystrokes = showKeystrokes
+        self.showCursorGhost = showCursorGhost
+        self.idleSpeedup = idleSpeedup
+        self.smartZoom = smartZoom
+        self.minIdleMs = minIdleMs
+        self.idleRate = idleRate
+        self.zoomFactor = zoomFactor
+        self.zoomDurationMs = zoomDurationMs
+        self.maxZooms = maxZooms
+    }
+
+    public static func `default`() -> DesktopPolishOptions {
+        DesktopPolishOptions()
     }
 }
 
@@ -249,17 +339,22 @@ public func parseDesktopInputArguments(_ arguments: [String]) throws -> DesktopI
     }
 }
 
-/// Parses `record <start|stop|discard|status> [options]`.
+/// Parses `record <start|stop|discard|polish|status> [options]`.
 public func parseDesktopRecordArguments(_ arguments: [String]) throws -> DesktopRecordRequest {
     guard let subcommandName = arguments.first else {
-        throw OpenComputerUseCLIError(message: "record requires a subcommand: start, stop, discard, or status")
+        throw OpenComputerUseCLIError(message: "record requires a subcommand: start, stop, discard, polish, or status")
     }
     let subcommand: DesktopRecordRequest.Subcommand
     switch subcommandName {
-    case "start", "stop", "discard", "status":
+    case "start", "stop", "discard", "status", "polish":
         subcommand = DesktopRecordRequest.Subcommand(rawValue: subcommandName)!
     default:
         throw OpenComputerUseCLIError(message: "unknown record subcommand: \(subcommandName)")
+    }
+
+    let rest = Array(arguments.dropFirst())
+    if subcommand == .polish {
+        return try parseDesktopRecordPolishArguments(rest)
     }
 
     var output: String?
@@ -267,8 +362,9 @@ public func parseDesktopRecordArguments(_ arguments: [String]) throws -> Desktop
     var pidfile: String?
     var quality = "demo"
     var drawMouse = 1
+    var drawMouseSet = false
     var saveAs: String?
-    let rest = Array(arguments.dropFirst())
+    var autoPolish = false
     var index = 0
     while index < rest.count {
         switch rest[index] {
@@ -290,9 +386,9 @@ public func parseDesktopRecordArguments(_ arguments: [String]) throws -> Desktop
                 throw OpenComputerUseCLIError(message: "--pidfile requires a value")
             }
             pidfile = rest[index]
-		case "--quality":
-			index += 1
-			guard index < rest.count else {
+        case "--quality":
+            index += 1
+            guard index < rest.count else {
                 throw OpenComputerUseCLIError(message: "--quality requires a value (demo, draft, or proxy)")
             }
             switch rest[index].lowercased() {
@@ -311,16 +407,23 @@ public func parseDesktopRecordArguments(_ arguments: [String]) throws -> Desktop
                 throw OpenComputerUseCLIError(message: "--draw-mouse requires 0 or 1")
             }
             drawMouse = parsed
+            drawMouseSet = true
         case "--save-as":
             index += 1
             guard index < rest.count else {
                 throw OpenComputerUseCLIError(message: "--save-as requires a value")
             }
             saveAs = rest[index]
+        case "--polish":
+            autoPolish = true
         default:
             throw OpenComputerUseCLIError(message: "unknown record option: \(rest[index])")
         }
         index += 1
+    }
+
+    if autoPolish && !drawMouseSet {
+        drawMouse = 0
     }
 
     return DesktopRecordRequest(
@@ -330,7 +433,80 @@ public func parseDesktopRecordArguments(_ arguments: [String]) throws -> Desktop
         pidfile: pidfile,
         quality: quality,
         drawMouse: drawMouse,
-        saveAs: saveAs
+        saveAs: saveAs,
+        autoPolish: autoPolish
+    )
+}
+
+func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecordRequest {
+    var polishInput: String?
+    var polishEvents: String?
+    var polishOutput: String?
+    var showClickRipples = true
+    var showKeystrokes = true
+    var showCursorGhost = true
+    var idleSpeedup = true
+    var smartZoom = true
+    var idleRate = 3.0
+    var index = 0
+    while index < rest.count {
+        switch rest[index] {
+        case "--input", "-i":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--input requires a value")
+            }
+            polishInput = rest[index]
+        case "--events":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--events requires a value")
+            }
+            polishEvents = rest[index]
+        case "--output", "-o":
+            index += 1
+            guard index < rest.count else {
+                throw OpenComputerUseCLIError(message: "--output requires a value")
+            }
+            polishOutput = rest[index]
+        case "--no-ripples":
+            showClickRipples = false
+        case "--no-keystrokes":
+            showKeystrokes = false
+        case "--no-cursor":
+            showCursorGhost = false
+        case "--no-idle-speedup":
+            idleSpeedup = false
+        case "--no-zoom":
+            smartZoom = false
+        case "--idle-rate":
+            index += 1
+            guard index < rest.count, let parsed = Double(rest[index]), parsed >= 1 else {
+                throw OpenComputerUseCLIError(message: "invalid --idle-rate \"\(index < rest.count ? rest[index] : "")\"")
+            }
+            idleRate = parsed
+        default:
+            throw OpenComputerUseCLIError(message: "unknown polish option: \(rest[index])")
+        }
+        index += 1
+    }
+    guard let polishInput, !polishInput.isEmpty else {
+        throw OpenComputerUseCLIError(message: "record polish requires --input <raw.mp4>")
+    }
+    return DesktopRecordRequest(
+        subcommand: .polish,
+        output: nil,
+        fps: 30,
+        pidfile: nil,
+        polishInput: polishInput,
+        polishEvents: polishEvents,
+        polishOutput: polishOutput,
+        showClickRipples: showClickRipples,
+        showKeystrokes: showKeystrokes,
+        showCursorGhost: showCursorGhost,
+        idleSpeedup: idleSpeedup,
+        smartZoom: smartZoom,
+        idleRate: idleRate
     )
 }
 
@@ -374,6 +550,9 @@ public enum DesktopCommandRunner {
     /// `input <action>`: global synthetic input behind the opt-in gate.
     public static func runInput(_ action: DesktopInputAction) throws -> String {
         try DesktopInput.perform(action)
+        if let event = buildRecordEvent(from: action) {
+            appendRecordEventIfRecording(pidfile: nil, event: event)
+        }
         switch action {
         case .move, .click, .drag, .scroll, .type, .key:
             return "input \(DesktopInput.actionName(action)) ok"
@@ -382,17 +561,23 @@ public enum DesktopCommandRunner {
         }
     }
 
-    /// `record <start|stop|discard|status>`.
+    /// `record <start|stop|discard|polish|status>`.
     public static func runRecord(_ request: DesktopRecordRequest) throws -> String {
         switch request.subcommand {
         case .start:
             return try DesktopRecord.start(request)
         case .stop:
-            return try DesktopRecord.stop(pidfilePath: request.pidfile, saveAs: request.saveAs)
+            return try DesktopRecord.stop(
+                pidfilePath: request.pidfile,
+                saveAs: request.saveAs,
+                polish: request.autoPolish
+            )
         case .discard:
             return try DesktopRecord.discard(pidfilePath: request.pidfile)
         case .status:
             return try DesktopRecord.status(pidfilePath: request.pidfile)
+        case .polish:
+            return try DesktopRecord.runPolish(request)
         }
     }
 }
@@ -740,6 +925,817 @@ enum DesktopInput {
     }
 }
 
+// MARK: - Record Events
+
+/// Schema version 1 timeline event for `<stem>.events.json`.
+public struct DesktopRecordEvent: Equatable, Sendable {
+    public var tMs: Int64
+    public var type: String
+    public var x: Int?
+    public var y: Int?
+    public var toX: Int?
+    public var toY: Int?
+    public var button: String?
+    public var count: Int?
+    public var direction: String?
+    public var amount: Int?
+    public var text: String?
+    public var key: String?
+    public var seconds: Double?
+
+    public init(
+        tMs: Int64 = 0,
+        type: String,
+        x: Int? = nil,
+        y: Int? = nil,
+        toX: Int? = nil,
+        toY: Int? = nil,
+        button: String? = nil,
+        count: Int? = nil,
+        direction: String? = nil,
+        amount: Int? = nil,
+        text: String? = nil,
+        key: String? = nil,
+        seconds: Double? = nil
+    ) {
+        self.tMs = tMs
+        self.type = type
+        self.x = x
+        self.y = y
+        self.toX = toX
+        self.toY = toY
+        self.button = button
+        self.count = count
+        self.direction = direction
+        self.amount = amount
+        self.text = text
+        self.key = key
+        self.seconds = seconds
+    }
+}
+
+extension DesktopRecordEvent: Codable {
+    enum CodingKeys: String, CodingKey {
+        case tMs = "t_ms"
+        case type
+        case x
+        case y
+        case toX = "to_x"
+        case toY = "to_y"
+        case button
+        case count
+        case direction
+        case amount
+        case text
+        case key
+        case seconds
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        tMs = try container.decodeIfPresent(Int64.self, forKey: .tMs) ?? 0
+        type = try container.decode(String.self, forKey: .type)
+        x = try container.decodeIfPresent(Int.self, forKey: .x)
+        y = try container.decodeIfPresent(Int.self, forKey: .y)
+        toX = try container.decodeIfPresent(Int.self, forKey: .toX)
+        toY = try container.decodeIfPresent(Int.self, forKey: .toY)
+        button = try container.decodeIfPresent(String.self, forKey: .button)
+        count = try container.decodeIfPresent(Int.self, forKey: .count)
+        direction = try container.decodeIfPresent(String.self, forKey: .direction)
+        amount = try container.decodeIfPresent(Int.self, forKey: .amount)
+        text = try container.decodeIfPresent(String.self, forKey: .text)
+        key = try container.decodeIfPresent(String.self, forKey: .key)
+        seconds = try container.decodeIfPresent(Double.self, forKey: .seconds)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(tMs, forKey: .tMs)
+        try container.encode(type, forKey: .type)
+        try container.encodeIfPresent(x, forKey: .x)
+        try container.encodeIfPresent(y, forKey: .y)
+        try container.encodeIfPresent(toX, forKey: .toX)
+        try container.encodeIfPresent(toY, forKey: .toY)
+        try container.encodeIfPresent(button, forKey: .button)
+        try container.encodeIfPresent(count, forKey: .count)
+        try container.encodeIfPresent(direction, forKey: .direction)
+        try container.encodeIfPresent(amount, forKey: .amount)
+        try container.encodeIfPresent(text, forKey: .text)
+        try container.encodeIfPresent(key, forKey: .key)
+        try container.encodeIfPresent(seconds, forKey: .seconds)
+    }
+}
+
+/// Sidecar event log written next to a recording.
+public struct DesktopRecordEventLog: Equatable, Codable, Sendable {
+    public var version: Int
+    public var startedAtMs: Int64
+    public var width: Int?
+    public var height: Int?
+    public var fps: Int?
+    public var events: [DesktopRecordEvent]
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case startedAtMs = "started_at_ms"
+        case width
+        case height
+        case fps
+        case events
+    }
+
+    public init(
+        version: Int = 1,
+        startedAtMs: Int64,
+        width: Int? = nil,
+        height: Int? = nil,
+        fps: Int? = nil,
+        events: [DesktopRecordEvent] = []
+    ) {
+        self.version = version
+        self.startedAtMs = startedAtMs
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.events = events
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        startedAtMs = try container.decode(Int64.self, forKey: .startedAtMs)
+        width = try container.decodeIfPresent(Int.self, forKey: .width)
+        height = try container.decodeIfPresent(Int.self, forKey: .height)
+        fps = try container.decodeIfPresent(Int.self, forKey: .fps)
+        events = try container.decodeIfPresent([DesktopRecordEvent].self, forKey: .events) ?? []
+    }
+}
+
+/// Pure helper: turns a successful input action into a timeline event.
+public func buildRecordEvent(from action: DesktopInputAction, tMs: Int64 = 0) -> DesktopRecordEvent? {
+    switch action {
+    case let .move(x, y):
+        return DesktopRecordEvent(tMs: tMs, type: "move", x: x, y: y)
+    case let .click(button, count, x, y):
+        return DesktopRecordEvent(tMs: tMs, type: "click", x: x, y: y, button: button, count: count)
+    case let .drag(fromX, fromY, toX, toY, button):
+        return DesktopRecordEvent(tMs: tMs, type: "drag", x: fromX, y: fromY, toX: toX, toY: toY, button: button)
+    case let .scroll(direction, amount):
+        return DesktopRecordEvent(tMs: tMs, type: "scroll", direction: direction, amount: amount)
+    case let .type(text):
+        return DesktopRecordEvent(tMs: tMs, type: "type", text: text)
+    case let .key(specification):
+        return DesktopRecordEvent(tMs: tMs, type: "key", key: specification)
+    case let .wait(seconds):
+        return DesktopRecordEvent(tMs: tMs, type: "wait", seconds: seconds)
+    }
+}
+
+public func recordEventsPath(forOutput output: String) -> String {
+    let url = URL(fileURLWithPath: output)
+    let ext = url.pathExtension
+    if ext.isEmpty {
+        return output + ".events.json"
+    }
+    let stem = String(output.dropLast(ext.count + 1))
+    return stem + ".events.json"
+}
+
+public func defaultPolishedOutput(forRaw raw: String) -> String {
+    let url = URL(fileURLWithPath: raw)
+    let ext = url.pathExtension
+    if ext.isEmpty {
+        return raw + ".polished.mp4"
+    }
+    let stem = String(raw.dropLast(ext.count + 1))
+    return stem + ".polished." + ext
+}
+
+func initRecordEventLog(output: String, width: Int, height: Int, fps: Int, started: Date) throws {
+    let log = DesktopRecordEventLog(
+        startedAtMs: Int64((started.timeIntervalSince1970 * 1000.0).rounded()),
+        width: width > 0 ? width : nil,
+        height: height > 0 ? height : nil,
+        fps: fps > 0 ? fps : nil,
+        events: []
+    )
+    try writeRecordEventLog(path: recordEventsPath(forOutput: output), log: log)
+}
+
+func writeRecordEventLog(path: String, log: DesktopRecordEventLog) throws {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(log)
+    try data.write(to: URL(fileURLWithPath: path))
+}
+
+func readRecordEventLog(path: String) throws -> DesktopRecordEventLog {
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    return try JSONDecoder().decode(DesktopRecordEventLog.self, from: data)
+}
+
+private let recordEventLock = NSLock()
+
+/// Appends an event to the active recording's sidecar when a pidfile points
+/// at a live recorder. Failures are ignored so event logging never breaks input.
+func appendRecordEventIfRecording(pidfile: String?, event: DesktopRecordEvent) {
+    recordEventLock.lock()
+    defer { recordEventLock.unlock() }
+
+    let path = pidfile ?? DesktopRecord.defaultPidfilePath()
+    guard let state = DesktopRecord.readStateForEvents(pidfilePath: path),
+          DesktopRecord.isProcessAlive(state.pid),
+          !state.output.isEmpty
+    else {
+        return
+    }
+    let eventsPath = recordEventsPath(forOutput: state.output)
+    var log: DesktopRecordEventLog
+    if let existing = try? readRecordEventLog(path: eventsPath) {
+        log = existing
+    } else {
+        var startedMs = Int64((Date().timeIntervalSince1970 * 1000.0).rounded())
+        if let startedAt = state.startedAt {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime]
+            if let date = formatter.date(from: startedAt) {
+                startedMs = Int64((date.timeIntervalSince1970 * 1000.0).rounded())
+            }
+        }
+        log = DesktopRecordEventLog(startedAtMs: startedMs, fps: state.fps, events: [])
+    }
+    var event = event
+    if event.tMs == 0 {
+        let nowMs = Int64((Date().timeIntervalSince1970 * 1000.0).rounded())
+        event.tMs = max(0, nowMs - log.startedAtMs)
+    }
+    log.events.append(event)
+    try? writeRecordEventLog(path: eventsPath, log: log)
+}
+
+func removeRecordSidecars(output: String) {
+    let fm = FileManager.default
+    try? fm.removeItem(atPath: recordEventsPath(forOutput: output))
+    try? fm.removeItem(atPath: output + ".log")
+    try? fm.removeItem(atPath: output + ".ass")
+    try? fm.removeItem(atPath: output + ".polish.log")
+}
+
+// MARK: - Record Polish (ffmpeg + ASS)
+
+public struct DesktopPolishSegment: Equatable, Sendable {
+    public var startMs: Int64
+    public var endMs: Int64
+    public var rate: Double
+
+    public init(startMs: Int64, endMs: Int64, rate: Double) {
+        self.startMs = startMs
+        self.endMs = endMs
+        self.rate = rate
+    }
+}
+
+public struct DesktopZoomWindow: Equatable, Sendable {
+    public var startMs: Int64
+    public var endMs: Int64
+    public var x: Int
+    public var y: Int
+    public var factor: Double
+
+    public init(startMs: Int64, endMs: Int64, x: Int, y: Int, factor: Double) {
+        self.startMs = startMs
+        self.endMs = endMs
+        self.x = x
+        self.y = y
+        self.factor = factor
+    }
+}
+
+/// Pure analysis over the event log + duration.
+public func buildPolishPlan(
+    log: DesktopRecordEventLog,
+    durationMs: Int64,
+    opts: DesktopPolishOptions
+) -> (segments: [DesktopPolishSegment], zooms: [DesktopZoomWindow], ass: String) {
+    var durationMs = durationMs
+    if durationMs <= 0 {
+        durationMs = 1
+    }
+    let events = log.events.sorted { $0.tMs < $1.tMs }
+    var width = log.width ?? 0
+    var height = log.height ?? 0
+    if width <= 0 { width = 1920 }
+    if height <= 0 { height = 1200 }
+
+    let segments = buildIdleSegments(events: events, durationMs: durationMs, opts: opts)
+    let zooms = opts.smartZoom ? selectZoomWindows(events: events, durationMs: durationMs, opts: opts) : []
+    let ass = buildPolishASS(events: events, width: width, height: height, opts: opts)
+    return (segments, zooms, ass)
+}
+
+public func buildIdleSegments(
+    events: [DesktopRecordEvent],
+    durationMs: Int64,
+    opts: DesktopPolishOptions
+) -> [DesktopPolishSegment] {
+    if !opts.idleSpeedup || opts.idleRate <= 1.01 {
+        return [DesktopPolishSegment(startMs: 0, endMs: durationMs, rate: 1)]
+    }
+    var actionTimes: [Int64] = []
+    for ev in events where ev.type != "wait" {
+        if ev.tMs >= 0 && ev.tMs <= durationMs {
+            actionTimes.append(ev.tMs)
+        }
+    }
+    actionTimes.sort()
+
+    var segments: [DesktopPolishSegment] = []
+    var cursor: Int64 = 0
+    let pad: Int64 = 350
+    for t in actionTimes {
+        let gapStart = cursor
+        let gapEnd = t - pad
+        if gapEnd - gapStart >= opts.minIdleMs {
+            if gapStart < gapEnd {
+                segments.append(DesktopPolishSegment(startMs: gapStart, endMs: gapEnd, rate: opts.idleRate))
+            }
+            var actionStart = gapEnd
+            if actionStart < cursor {
+                actionStart = cursor
+            }
+            var actionEnd = t + pad
+            if actionEnd > durationMs {
+                actionEnd = durationMs
+            }
+            if actionEnd > actionStart {
+                segments.append(DesktopPolishSegment(startMs: actionStart, endMs: actionEnd, rate: 1))
+            }
+            cursor = actionEnd
+        } else {
+            var actionEnd = t + pad
+            if actionEnd > durationMs {
+                actionEnd = durationMs
+            }
+            if actionEnd > cursor {
+                segments.append(DesktopPolishSegment(startMs: cursor, endMs: actionEnd, rate: 1))
+                cursor = actionEnd
+            }
+        }
+    }
+    if cursor < durationMs {
+        if durationMs - cursor >= opts.minIdleMs {
+            segments.append(DesktopPolishSegment(startMs: cursor, endMs: durationMs, rate: opts.idleRate))
+        } else {
+            segments.append(DesktopPolishSegment(startMs: cursor, endMs: durationMs, rate: 1))
+        }
+    }
+    if segments.isEmpty {
+        return [DesktopPolishSegment(startMs: 0, endMs: durationMs, rate: 1)]
+    }
+    return mergePolishSegments(segments)
+}
+
+public func mergePolishSegments(_ input: [DesktopPolishSegment]) -> [DesktopPolishSegment] {
+    guard !input.isEmpty else { return input }
+    var out: [DesktopPolishSegment] = [input[0]]
+    for seg in input.dropFirst() {
+        var seg = seg
+        var last = out[out.count - 1]
+        if seg.startMs <= last.endMs && abs(seg.rate - last.rate) < 0.001 {
+            if seg.endMs > last.endMs {
+                last.endMs = seg.endMs
+                out[out.count - 1] = last
+            }
+            continue
+        }
+        if seg.startMs < last.endMs {
+            seg.startMs = last.endMs
+        }
+        if seg.endMs <= seg.startMs {
+            continue
+        }
+        out.append(seg)
+    }
+    return out
+}
+
+func selectZoomWindows(
+    events: [DesktopRecordEvent],
+    durationMs: Int64,
+    opts: DesktopPolishOptions
+) -> [DesktopZoomWindow] {
+    struct Candidate {
+        var tMs: Int64
+        var x: Int
+        var y: Int
+        var score: Int
+    }
+    var cands: [Candidate] = []
+    for ev in events {
+        var score = 0
+        var x = ev.x ?? 0
+        var y = ev.y ?? 0
+        switch ev.type {
+        case "click":
+            score = 80
+            if (ev.count ?? 1) >= 2 { score = 95 }
+        case "drag":
+            score = 70
+        case "type", "key":
+            score = 40
+        default:
+            continue
+        }
+        if score < 60 { continue }
+        if x == 0 && y == 0 && ev.type != "click" { continue }
+        cands.append(Candidate(tMs: ev.tMs, x: x, y: y, score: score))
+    }
+    cands.sort { lhs, rhs in
+        if lhs.score != rhs.score { return lhs.score > rhs.score }
+        return lhs.tMs < rhs.tMs
+    }
+
+    var zooms: [DesktopZoomWindow] = []
+    var lastZoom = -opts.zoomDurationMs
+    for c in cands {
+        if zooms.count >= opts.maxZooms { break }
+        var start = c.tMs - 200
+        if start < 0 { start = 0 }
+        var end = start + opts.zoomDurationMs
+        if end > durationMs { end = durationMs }
+        if start < lastZoom + 800 { continue }
+        zooms.append(DesktopZoomWindow(startMs: start, endMs: end, x: c.x, y: c.y, factor: opts.zoomFactor))
+        lastZoom = start
+    }
+    zooms.sort { $0.startMs < $1.startMs }
+    return zooms
+}
+
+public func buildPolishASS(
+    events: [DesktopRecordEvent],
+    width: Int,
+    height: Int,
+    opts: DesktopPolishOptions
+) -> String {
+    var b = ""
+    b += "[Script Info]\n"
+    b += "Title: open-computer-use polish\n"
+    b += "ScriptType: v4.00+\n"
+    b += "PlayResX: \(width)\nPlayResY: \(height)\n\n"
+    b += "[V4+ Styles]\n"
+    b += "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+    b += "Style: Keystroke,Menlo,42,&H00FFFFFF,&H000000FF,&H64000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,0,2,40,40,60,1\n"
+    b += "Style: Ripple,Arial,20,&H0000FFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n"
+    b += "Style: Cursor,Arial,28,&H0000D7FF,&H000000FF,&H64000000,&H00000000,-1,0,0,0,100,100,0,0,1,1,0,5,0,0,0,1\n\n"
+    b += "[Events]\n"
+    b += "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+
+    if opts.showKeystrokes {
+        b += writeKeystrokeASS(events: events)
+    }
+    if opts.showClickRipples {
+        b += writeRippleASS(events: events)
+    }
+    if opts.showCursorGhost {
+        b += writeCursorGhostASS(events: events)
+    }
+    return b
+}
+
+func writeKeystrokeASS(events: [DesktopRecordEvent]) -> String {
+    let displayMs: Int64 = 1500
+    let combineMs: Int64 = 500
+    var pendingText = ""
+    var pendingStart: Int64 = 0
+    var pendingEnd: Int64 = 0
+    var b = ""
+
+    func flush() {
+        guard !pendingText.isEmpty else { return }
+        var text = pendingText
+        if text.count > 30 {
+            text = String(text.prefix(27)) + "…"
+        }
+        b += "Dialogue: 0,\(formatASSTime(pendingStart)),\(formatASSTime(pendingEnd)),Keystroke,,0,0,0,,\(escapeASS(text))\n"
+        pendingText = ""
+    }
+
+    for ev in events {
+        switch ev.type {
+        case "type":
+            let text = ev.text ?? ""
+            if !pendingText.isEmpty && ev.tMs - pendingEnd <= combineMs {
+                pendingText += text
+                pendingEnd = ev.tMs + displayMs
+            } else {
+                flush()
+                pendingText = text
+                pendingStart = ev.tMs
+                pendingEnd = ev.tMs + displayMs
+            }
+        case "key":
+            flush()
+            let label = keyDisplayLabel(ev.key ?? "")
+            b += "Dialogue: 0,\(formatASSTime(ev.tMs)),\(formatASSTime(ev.tMs + displayMs)),Keystroke,,0,0,0,,\(escapeASS(label))\n"
+        default:
+            flush()
+        }
+    }
+    flush()
+    return b
+}
+
+func writeRippleASS(events: [DesktopRecordEvent]) -> String {
+    var b = ""
+    for ev in events {
+        guard ev.type == "click" || ev.type == "drag" else { continue }
+        var x = ev.x ?? 0
+        var y = ev.y ?? 0
+        if ev.type == "drag" {
+            x = ev.toX ?? 0
+            y = ev.toY ?? 0
+        }
+        if x == 0 && y == 0 { continue }
+        for (i, radius) in [12, 22, 34, 48].enumerated() {
+            let start = ev.tMs + Int64(i * 70)
+            let end = start + 180
+            let draw = "{\\pos(0,0)\\p1\\alpha&H60&\\c&H00FFFF&}m \(x - radius) \(y - radius) l \(x + radius) \(y - radius) l \(x + radius) \(y + radius) l \(x - radius) \(y + radius) l \(x - radius) \(y - radius){\\p0}"
+            b += "Dialogue: 1,\(formatASSTime(start)),\(formatASSTime(end)),Ripple,,0,0,0,,\(draw)\n"
+        }
+        b += "Dialogue: 2,\(formatASSTime(ev.tMs)),\(formatASSTime(ev.tMs + 220)),Ripple,,0,0,0,,{\\pos(\(x),\(y))\\fs28\\c&H00FFFF&●}\n"
+    }
+    return b
+}
+
+func writeCursorGhostASS(events: [DesktopRecordEvent]) -> String {
+    struct Point {
+        var t: Int64
+        var x: Int
+        var y: Int
+    }
+    var points: [Point] = []
+    for ev in events {
+        switch ev.type {
+        case "move", "click":
+            let x = ev.x ?? 0
+            let y = ev.y ?? 0
+            if x != 0 || y != 0 {
+                points.append(Point(t: ev.tMs, x: x, y: y))
+            }
+        case "drag":
+            points.append(Point(t: ev.tMs, x: ev.x ?? 0, y: ev.y ?? 0))
+            points.append(Point(t: ev.tMs + 200, x: ev.toX ?? 0, y: ev.toY ?? 0))
+        default:
+            break
+        }
+    }
+    var b = ""
+    for (i, p) in points.enumerated() {
+        var end = p.t + 120
+        if i + 1 < points.count {
+            end = points[i + 1].t
+        }
+        if end <= p.t {
+            end = p.t + 80
+        }
+        b += "Dialogue: 3,\(formatASSTime(p.t)),\(formatASSTime(end)),Cursor,,0,0,0,,{\\pos(\(p.x),\(p.y))}▶\n"
+    }
+    return b
+}
+
+public func keyDisplayLabel(_ key: String) -> String {
+    let replacements: [String: String] = [
+        "Return": "↵ Enter", "Enter": "↵ Enter", "Tab": "⇥ Tab", "Escape": "⎋ Esc",
+        "BackSpace": "⌫", "Delete": "⌦ Del", "space": "␣ Space", "Up": "↑", "Down": "↓",
+        "Left": "←", "Right": "→", "Home": "⇱ Home", "End": "⇲ End",
+        "Page_Up": "⇞ PgUp", "Page_Down": "⇟ PgDn",
+        "return": "↵ Enter", "enter": "↵ Enter", "tab": "⇥ Tab", "escape": "⎋ Esc",
+        "backspace": "⌫", "delete": "⌦ Del",
+    ]
+    let parts = key.split(separator: "+", omittingEmptySubsequences: false).map(String.init)
+    let mapped = parts.map { part -> String in
+        if let rep = replacements[part] { return rep }
+        if let rep = replacements[part.lowercased()] { return rep }
+        if part.count == 1 { return part.uppercased() }
+        return part
+    }
+    return mapped.joined(separator: " + ")
+}
+
+public func escapeASS(_ text: String) -> String {
+    text
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "{", with: "\\[")
+        .replacingOccurrences(of: "}", with: "\\]")
+        .replacingOccurrences(of: "\n", with: "\\N")
+}
+
+public func formatASSTime(_ ms: Int64) -> String {
+    var ms = ms
+    if ms < 0 { ms = 0 }
+    let h = ms / 3_600_000
+    ms %= 3_600_000
+    let m = ms / 60_000
+    ms %= 60_000
+    let s = ms / 1000
+    let cs = (ms % 1000) / 10
+    return String(format: "%d:%02d:%02d.%02d", h, m, s, cs)
+}
+
+func escapeFFmpegFilterPath(_ path: String) -> String {
+    path
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: ":", with: "\\:")
+        .replacingOccurrences(of: "'", with: "\\'")
+        .replacingOccurrences(of: "[", with: "\\[")
+        .replacingOccurrences(of: "]", with: "\\]")
+}
+
+public func buildPolishFilterComplex(
+    segments: [DesktopPolishSegment],
+    zooms: [DesktopZoomWindow],
+    assPath: String,
+    width: Int,
+    height: Int
+) throws -> String {
+    guard !segments.isEmpty else {
+        throw ComputerUseError.message("no polish segments")
+    }
+    return try buildPolishFilterComplexSplit(
+        segments: segments,
+        zooms: zooms,
+        assEscaped: escapeFFmpegFilterPath(assPath),
+        width: width,
+        height: height
+    )
+}
+
+func buildPolishFilterComplexSplit(
+    segments: [DesktopPolishSegment],
+    zooms: [DesktopZoomWindow],
+    assEscaped: String,
+    width: Int,
+    height: Int
+) throws -> String {
+    guard !segments.isEmpty else {
+        throw ComputerUseError.message("no segments")
+    }
+    var b = ""
+    var pre = "[0:v]"
+    // Like Go: only apply the first zoom window (multi-zoom simplified).
+    if let z = zooms.first {
+        var zf = z.factor
+        if zf < 1.05 { zf = 1.45 }
+        b += String(
+            format: "[0:v]zoompan=z='if(between(time,%0.3f,%0.3f),%0.3f,1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=%dx%d:fps=30[zoomed];",
+            Double(z.startMs) / 1000.0,
+            Double(z.endMs) / 1000.0,
+            zf,
+            width,
+            height
+        )
+        pre = "[zoomed]"
+    }
+    b += "\(pre)ass=filename='\(assEscaped)'[annotated];"
+
+    if segments.count == 1, abs(segments[0].rate - 1) < 0.001 {
+        b += "[annotated]copy[outv]"
+        return b
+    }
+
+    let n = segments.count
+    b += "[annotated]split=\(n)"
+    for i in 0..<n {
+        b += "[s\(i)]"
+    }
+    b += ";"
+
+    var concatInputs = ""
+    var used = 0
+    for (i, seg) in segments.enumerated() {
+        let start = Double(seg.startMs) / 1000.0
+        let end = Double(seg.endMs) / 1000.0
+        if end <= start { continue }
+        var rate = seg.rate
+        if rate < 1.01 { rate = 1 }
+        b += String(format: "[s%d]trim=start=%0.3f:end=%0.3f,setpts=(PTS-STARTPTS)/%0.3f[v%d];", i, start, end, rate, used)
+        concatInputs += "[v\(used)]"
+        used += 1
+    }
+    if used == 0 {
+        throw ComputerUseError.message("no usable polish segments")
+    }
+    if used == 1 {
+        b += "[v0]copy[outv]"
+        return b
+    }
+    b += "\(concatInputs)concat=n=\(used):v=1:a=0[outv]"
+    return b
+}
+
+func probeVideoDurationMs(path: String) throws -> (durationMs: Int64, width: Int, height: Int) {
+    let ffprobe = DesktopRecord.resolveFfprobeURL()
+        ?? URL(fileURLWithPath: "/usr/bin/ffprobe")
+    let process = Process()
+    process.executableURL = ffprobe
+    process.arguments = [
+        "-v", "error",
+        "-show_entries", "format=duration:stream=width,height",
+        "-of", "json",
+        path,
+    ]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+    try process.run()
+    process.waitUntilExit()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard process.terminationStatus == 0 else {
+        throw ComputerUseError.message("ffprobe failed for \(path)")
+    }
+    guard
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let format = obj["format"] as? [String: Any],
+        let durationStr = format["duration"] as? String,
+        let seconds = Double(durationStr)
+    else {
+        throw ComputerUseError.message("invalid ffprobe duration for \(path)")
+    }
+    var width = 0
+    var height = 0
+    if let streams = obj["streams"] as? [[String: Any]] {
+        for stream in streams {
+            if let w = stream["width"] as? Int, let h = stream["height"] as? Int, w > 0, h > 0 {
+                width = w
+                height = h
+                break
+            }
+        }
+    }
+    return (Int64(seconds * 1000.0), width, height)
+}
+
+func polishRecording(
+    inputVideo: String,
+    eventsPath: String,
+    outputVideo: String,
+    opts: DesktopPolishOptions
+) throws {
+    guard let ffmpegURL = DesktopRecord.resolveFfmpegURL() else {
+        throw ComputerUseError.message("ffmpeg is required for record polish but was not found on PATH")
+    }
+    var log = try readRecordEventLog(path: eventsPath)
+    let probed = try probeVideoDurationMs(path: inputVideo)
+    if (log.width ?? 0) <= 0 { log.width = probed.width }
+    if (log.height ?? 0) <= 0 { log.height = probed.height }
+
+    let plan = buildPolishPlan(log: log, durationMs: probed.durationMs, opts: opts)
+    let assPath = inputVideo + ".ass"
+    try plan.ass.write(to: URL(fileURLWithPath: assPath), atomically: true, encoding: .utf8)
+
+    let filter = try buildPolishFilterComplex(
+        segments: plan.segments,
+        zooms: plan.zooms,
+        assPath: assPath,
+        width: log.width ?? probed.width,
+        height: log.height ?? probed.height
+    )
+    let args = [
+        "-nostdin", "-y",
+        "-i", inputVideo,
+        "-filter_complex", filter,
+        "-map", "[outv]",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-movflags", "+faststart",
+        outputVideo,
+    ]
+    let process = Process()
+    process.executableURL = ffmpegURL
+    process.arguments = args
+    let logURL = URL(fileURLWithPath: outputVideo + ".polish.log")
+    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+    let logHandle = try? FileHandle(forWritingTo: logURL)
+    defer { try? logHandle?.close() }
+    process.standardOutput = logHandle ?? FileHandle.nullDevice
+    process.standardError = logHandle ?? FileHandle.nullDevice
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        var detail = ""
+        if let data = FileManager.default.contents(atPath: logURL.path),
+           let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !text.isEmpty
+        {
+            detail = text.count > 600 ? String(text.suffix(600)) : text
+        }
+        throw ComputerUseError.message("ffmpeg polish failed: \(detail)")
+    }
+}
+
 // MARK: - Record
 
 enum DesktopRecord {
@@ -751,6 +1747,8 @@ enum DesktopRecord {
         let quality: String?
         let drawMouse: Int?
         let startedAt: String?
+        let autoPolish: Bool?
+        let eventsPath: String?
 
         init(
             pid: Int32,
@@ -759,7 +1757,9 @@ enum DesktopRecord {
             fps: Int? = nil,
             quality: String? = nil,
             drawMouse: Int? = nil,
-            startedAt: String? = nil
+            startedAt: String? = nil,
+            autoPolish: Bool? = nil,
+            eventsPath: String? = nil
         ) {
             self.pid = pid
             self.output = output
@@ -768,6 +1768,8 @@ enum DesktopRecord {
             self.quality = quality
             self.drawMouse = drawMouse
             self.startedAt = startedAt
+            self.autoPolish = autoPolish
+            self.eventsPath = eventsPath
         }
     }
 
@@ -835,14 +1837,31 @@ enum DesktopRecord {
     }
 
     static func resolveFfmpegURL() -> URL? {
-        let candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        resolveToolURL(named: "ffmpeg")
+    }
+
+    static func resolveFfprobeURL() -> URL? {
+        if let ffmpeg = resolveFfmpegURL() {
+            let sibling = ffmpeg.deletingLastPathComponent().appendingPathComponent("ffprobe")
+            if FileManager.default.isExecutableFile(atPath: sibling.path) {
+                return sibling
+            }
+        }
+        return resolveToolURL(named: "ffprobe")
+    }
+
+    private static func resolveToolURL(named name: String) -> URL? {
+        let candidates = [
+            "/opt/homebrew/bin/\(name)",
+            "/usr/local/bin/\(name)",
+            "/usr/bin/\(name)",
+        ]
         for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
             return URL(fileURLWithPath: path)
         }
-        // Fall back to PATH lookup via /usr/bin/env.
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        process.arguments = ["ffmpeg"]
+        process.arguments = [name]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
@@ -924,8 +1943,18 @@ enum DesktopRecord {
         // exits, exactly like the Linux/Windows detached ffmpeg recorders.
         try waitRecordProcessReady(pid: pid, output: output, timeout: 3.0)
 
+        let started = Date()
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
+        let pointer = DesktopCursor.current()
+        let eventsPath = recordEventsPath(forOutput: output)
+        try? initRecordEventLog(
+            output: output,
+            width: pointer.screen_width,
+            height: pointer.screen_height,
+            fps: request.fps,
+            started: started
+        )
         let state = RecordState(
             pid: pid,
             output: output,
@@ -933,17 +1962,19 @@ enum DesktopRecord {
             fps: request.fps,
             quality: request.quality,
             drawMouse: request.drawMouse,
-            startedAt: formatter.string(from: Date())
+            startedAt: formatter.string(from: started),
+            autoPolish: request.autoPolish,
+            eventsPath: eventsPath
         )
         do {
             try writeState(state, pidfilePath: pidfilePath)
         } catch {
             throw ComputerUseError.message("recording started (pid \(pid)) but pidfile write failed: \(error.localizedDescription)")
         }
-        return "recording started: pid=\(pid) backend=\(backend) fps=\(request.fps) quality=\(request.quality) draw_mouse=\(request.drawMouse) output=\(output)"
+        return "recording started: pid=\(pid) backend=\(backend) fps=\(request.fps) quality=\(request.quality) draw_mouse=\(request.drawMouse) polish=\(request.autoPolish) output=\(output)"
     }
 
-    static func stop(pidfilePath: String?, saveAs: String?) throws -> String {
+    static func stop(pidfilePath: String?, saveAs: String?, polish: Bool) throws -> String {
         let path = pidfilePath ?? defaultPidfilePath()
         guard let state = readState(pidfilePath: path) else {
             throw ComputerUseError.message("no recording in progress (pidfile not found)")
@@ -973,9 +2004,33 @@ enum DesktopRecord {
         }
         var finalOutput = state.output
         if let saveAs, !saveAs.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            finalOutput = try relocateRecordOutput(current: state.output, saveAs: saveAs)
+            let previous = state.output
+            finalOutput = try relocateRecordOutput(current: previous, saveAs: saveAs)
+            let oldEvents = recordEventsPath(forOutput: previous)
+            let newEvents = recordEventsPath(forOutput: finalOutput)
+            if oldEvents != newEvents, FileManager.default.fileExists(atPath: oldEvents) {
+                try? FileManager.default.moveItem(atPath: oldEvents, toPath: newEvents)
+            }
         }
-        return "recording stopped: output=\(finalOutput)"
+        var message = "recording stopped: output=\(finalOutput)"
+        if polish || (state.autoPolish == true) {
+            let polished = defaultPolishedOutput(forRaw: finalOutput)
+            let events = recordEventsPath(forOutput: finalOutput)
+            do {
+                try polishRecording(
+                    inputVideo: finalOutput,
+                    eventsPath: events,
+                    outputVideo: polished,
+                    opts: .default()
+                )
+                message += "\nrecording polished: output=\(polished)"
+            } catch {
+                throw ComputerUseError.message(
+                    "recording stopped (\(finalOutput)) but polish failed: \(error.localizedDescription)"
+                )
+            }
+        }
+        return message
     }
 
     static func discard(pidfilePath: String?) throws -> String {
@@ -995,8 +2050,8 @@ enum DesktopRecord {
             }
         }
         try? FileManager.default.removeItem(atPath: path)
+        removeRecordSidecars(output: state.output)
         try? FileManager.default.removeItem(atPath: state.output)
-        try? FileManager.default.removeItem(atPath: state.output + ".log")
         if let stopError {
             throw ComputerUseError.message(
                 "recording discarded (output removed=\(state.output)) but stop had a problem: \(stopError.localizedDescription)"
@@ -1030,16 +2085,40 @@ enum DesktopRecord {
         if let startedAt = state.startedAt {
             report["started_at"] = startedAt
         }
+        report["auto_polish"] = state.autoPolish ?? false
+        if let eventsPath = state.eventsPath {
+            report["events_path"] = eventsPath
+        }
         if let attrs = try? FileManager.default.attributesOfItem(atPath: state.output),
            let size = attrs[.size] as? NSNumber
         {
             report["output_bytes"] = size.intValue
+        }
+        if let log = try? readRecordEventLog(path: recordEventsPath(forOutput: state.output)) {
+            report["event_count"] = log.events.count
         }
         let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
         guard let json = String(data: data, encoding: .utf8) else {
             throw ComputerUseError.message("cannot encode recording status")
         }
         return json
+    }
+
+    static func runPolish(_ request: DesktopRecordRequest) throws -> String {
+        guard let input = request.polishInput, !input.isEmpty else {
+            throw ComputerUseError.message("record polish requires --input <raw.mp4>")
+        }
+        let events = request.polishEvents ?? recordEventsPath(forOutput: input)
+        let output = request.polishOutput ?? defaultPolishedOutput(forRaw: input)
+        let started = Date()
+        try polishRecording(
+            inputVideo: input,
+            eventsPath: events,
+            outputVideo: output,
+            opts: request.polishOptions
+        )
+        let elapsedMs = Int((Date().timeIntervalSince(started) * 1000.0).rounded())
+        return "recording polished: input=\(input) events=\(events) output=\(output) elapsed=\(elapsedMs)ms"
     }
 
     static func relocateRecordOutput(current: String, saveAs: String) throws -> String {
@@ -1118,6 +2197,15 @@ enum DesktopRecord {
             return nil
         }
         return state
+    }
+
+    /// Visible to event-append helper without exposing private processAlive.
+    static func readStateForEvents(pidfilePath: String) -> RecordState? {
+        readState(pidfilePath: pidfilePath)
+    }
+
+    static func isProcessAlive(_ pid: Int32) -> Bool {
+        processAlive(pid)
     }
 
     private static func processAlive(_ pid: Int32) -> Bool {

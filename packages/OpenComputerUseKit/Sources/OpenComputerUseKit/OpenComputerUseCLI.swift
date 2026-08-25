@@ -131,7 +131,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
           screenshot           Capture the whole desktop to PNG (Screen Recording permission).
           cursor-position      Print the pointer position and desktop size as JSON.
           input <action>       Global CGEvent input: move/click/drag/scroll/type/key/wait.
-          record <start|stop|discard|status>  Record the screen with ffmpeg (preferred) or screencapture.
+          record <start|stop|discard|polish|status>  Record screen; polish overlays via ffmpeg+ASS.
           help [command]       Show general or command-specific help.
           version              Print the CLI version.
 
@@ -249,19 +249,25 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
         return """
         Usage:
           open-computer-use record start [--output <path.mp4|.mov>] [--fps N]
-                                         [--quality demo|draft|proxy] [--draw-mouse 0|1] [--pidfile <path>]
-          open-computer-use record stop  [--pidfile <path>] [--save-as <name-or-path>]
+                                         [--quality demo|draft|proxy] [--draw-mouse 0|1] [--polish] [--pidfile <path>]
+          open-computer-use record stop  [--pidfile <path>] [--save-as <name-or-path>] [--polish]
           open-computer-use record discard [--pidfile <path>]
+          open-computer-use record polish --input <raw.mp4> [--events <file>] [--output <polished.mp4>]
+                                         [--no-ripples] [--no-keystrokes] [--no-cursor] [--no-idle-speedup] [--no-zoom]
           open-computer-use record status [--pidfile <path>]
 
         Record the screen. Prefers ffmpeg avfoundation when ffmpeg is on PATH
         (same demo-quality H.264 mp4 encode as Linux/Windows / Cursor RecordScreen:
         veryfast + crf 17 + High + faststart). Falls back to /usr/sbin/screencapture
-        -v (.mov; --fps/--quality/--draw-mouse ignored). discard stops and deletes
-        the output. Defaults: fps 30, quality demo, draw-mouse 1, output in $TMPDIR,
-        pidfile $TMPDIR/open-computer-use-record.pid. Requires Screen Recording
-        permission (run `open-computer-use doctor` to grant). Override the
-        avfoundation device with OPEN_COMPUTER_USE_AVFOUNDATION_SCREEN.
+        -v (.mov; --fps/--quality/--draw-mouse ignored). While recording, display
+        `input` actions append <output>.events.json. `record polish` (or start/stop
+        --polish) adds Cursor RecordScreen-style overlays: click ripples, keystroke
+        captions, idle speedup, smart zoom, and a cursor ghost. --polish on start
+        defaults draw-mouse to 0 (ffmpeg -capture_cursor 0). discard stops and
+        deletes the output plus sidecars. Defaults: fps 30, quality demo,
+        draw-mouse 1, output in $TMPDIR, pidfile $TMPDIR/open-computer-use-record.pid.
+        Requires Screen Recording permission (run `open-computer-use doctor` to grant).
+        Override the avfoundation device with OPEN_COMPUTER_USE_AVFOUNDATION_SCREEN.
         """
     case "version":
         return """

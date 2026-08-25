@@ -257,7 +257,12 @@ func TestRecordPidfileRoundTrip(t *testing.T) {
 	if _, ok := readRecordPidfile(path); ok {
 		t.Fatal("missing pidfile should not be ok")
 	}
-	state := recordState{PID: 4321, Output: "C:\\tmp\\o.mp4"}
+	state := recordState{
+		PID:        4321,
+		Output:     "C:\\tmp\\o.mp4",
+		AutoPolish: true,
+		EventsPath: "C:\\tmp\\o.events.json",
+	}
 	if err := writeRecordPidfile(path, state); err != nil {
 		t.Fatal(err)
 	}
@@ -274,12 +279,21 @@ func TestScreenshotHelpAndDispatch(t *testing.T) {
 			t.Fatalf("helpText(%q) missing usage:\n%s", topic, text)
 		}
 	}
+	recordHelp := helpText("record")
+	for _, needle := range []string{"polish", "--polish", "events.json"} {
+		if !strings.Contains(recordHelp, needle) {
+			t.Fatalf("record help missing %q:\n%s", needle, recordHelp)
+		}
+	}
 	// The top-level help should list the new commands.
 	top := helpText("")
 	for _, cmd := range []string{"screenshot", "cursor-position", "input", "record"} {
 		if !strings.Contains(top, cmd) {
 			t.Fatalf("top-level help missing %q", cmd)
 		}
+	}
+	if !strings.Contains(top, "polish") {
+		t.Fatalf("top-level help missing polish subcommand:\n%s", top)
 	}
 }
 

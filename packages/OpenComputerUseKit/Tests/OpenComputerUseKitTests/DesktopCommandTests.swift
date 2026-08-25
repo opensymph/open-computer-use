@@ -62,8 +62,31 @@ final class DesktopCommandTests: XCTestCase {
             try parseOpenComputerUseCLI(arguments: ["record", "status"]),
             .record(DesktopRecordRequest(subcommand: .status, output: nil, fps: 30, pidfile: nil))
         )
+        XCTAssertEqual(
+            try parseOpenComputerUseCLI(arguments: ["record", "start", "--polish", "--output", "/tmp/p.mp4"]),
+            .record(DesktopRecordRequest(subcommand: .start, output: "/tmp/p.mp4", fps: 30, pidfile: nil, quality: "demo", drawMouse: 0, saveAs: nil, autoPolish: true))
+        )
+        XCTAssertEqual(
+            try parseOpenComputerUseCLI(arguments: ["record", "start", "--polish", "--draw-mouse", "1"]),
+            .record(DesktopRecordRequest(subcommand: .start, output: nil, fps: 30, pidfile: nil, quality: "demo", drawMouse: 1, saveAs: nil, autoPolish: true))
+        )
+        XCTAssertEqual(
+            try parseOpenComputerUseCLI(arguments: [
+                "record", "polish", "--input", "/tmp/a.mp4", "--no-ripples", "--idle-rate", "4",
+            ]),
+            .record(DesktopRecordRequest(
+                subcommand: .polish,
+                output: nil,
+                fps: 30,
+                pidfile: nil,
+                polishInput: "/tmp/a.mp4",
+                showClickRipples: false,
+                idleRate: 4
+            ))
+        )
         XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["record"]))
         XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["record", "pause"]))
+        XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["record", "polish"]))
     }
 
     func testBuildFfmpegAvfoundationArgsDemoQuality() {
@@ -95,10 +118,15 @@ final class DesktopCommandTests: XCTestCase {
         for topic in ["screenshot", "cursor-position", "input", "record"] {
             XCTAssertTrue(openComputerUseHelpText(command: topic).contains("Usage:"))
         }
+        let recordHelp = openComputerUseHelpText(command: "record")
+        for needle in ["polish", "--polish", "events.json"] {
+            XCTAssertTrue(recordHelp.contains(needle), "record help missing \(needle):\n\(recordHelp)")
+        }
         let top = openComputerUseHelpText(command: nil)
         for command in ["screenshot", "cursor-position", "input", "record"] {
             XCTAssertTrue(top.contains(command), "top-level help missing \(command)")
         }
+        XCTAssertTrue(top.contains("polish"), "top-level help missing polish subcommand:\n\(top)")
     }
 
     func testDisplayCommandsRideTheAppAgentProxy() {
@@ -219,5 +247,82 @@ final class DesktopCommandTests: XCTestCase {
 
         let mov = DesktopRecord.defaultOutputPath(preferMP4: false)
         XCTAssertTrue(mov.hasSuffix(".mov"), mov)
+    }
+
+    // MARK: - Record events + polish
+
+    func testBuildRecordEventFromInputActions() {
+        let move = buildRecordEvent(from: .move(x: 10, y: 20))
+        XCTAssertEqual(move?.type, "move")
+        XCTAssertEqual(move?.x, 10)
+        XCTAssertEqual(move?.y, 20)
+
+        let click = buildRecordEvent(from: .click(button: "right", count: 2, x: 5, y: 6))
+        XCTAssertEqual(click?.button, "right")
+        XCTAssertEqual(click?.count, 2)
+        XCTAssertEqual(click?.x, 5)
+        XCTAssertEqual(click?.y, 6)
+
+        let typed = buildRecordEvent(from: .type(text: "hello world"))
+        XCTAssertEqual(typed?.text, "hello world")
+
+        let key = buildRecordEvent(from: .key(specification: "ctrl+s"))
+        XCTAssertEqual(key?.key, "ctrl+s")
+    }
+
+    func testBuildPolishPlanKeystrokesAndIdle() {
+        let log = DesktopRecordEventLog(
+            startedAtMs: 0,
+            width: 800,
+            height: 600,
+            events: [
+                DesktopRecordEvent(tMs: 500, type: "click", x: 100, y: 120, button: "left", count: 1),
+                DesktopRecordEvent(tMs: 800, type: "type", text: "hi"),
+                DesktopRecordEvent(tMs: 5000, type: "key", key: "Return"),
+            ]
+        )
+        let plan = buildPolishPlan(log: log, durationMs: 7000, opts: .default())
+        XCTAssertGreaterThanOrEqual(plan.segments.count, 2, "expected idle speedup segments, got \(plan.segments)")
+        XCTAssertTrue(plan.segments.contains(where: { $0.rate > 1.5 }), "expected an idle speedup segment, got \(plan.segments)")
+        XCTAssertFalse(plan.zooms.isEmpty, "expected at least one zoom window around the click")
+        XCTAssertTrue(plan.ass.contains("Keystroke"), plan.ass)
+        XCTAssertTrue(plan.ass.contains("hi"), plan.ass)
+        XCTAssertTrue(plan.ass.contains("Ripple"), plan.ass)
+        XCTAssertTrue(plan.ass.contains("Cursor"), plan.ass)
+    }
+
+    func testFormatASSTimeAndPolishedOutputPath() {
+        XCTAssertEqual(formatASSTime(3_661_020), "1:01:01.02")
+        XCTAssertEqual(defaultPolishedOutput(forRaw: "/tmp/a.mp4"), "/tmp/a.polished.mp4")
+        XCTAssertEqual(recordEventsPath(forOutput: "/tmp/a.mp4"), "/tmp/a.events.json")
+    }
+
+    func testKeyDisplayLabelMapsReturn() {
+        let label = keyDisplayLabel("ctrl+Return")
+        XCTAssertTrue(label.contains("↵ Enter"), label)
+    }
+
+    func testBuildPolishFilterComplexSingleSegment() throws {
+        let filter = try buildPolishFilterComplex(
+            segments: [DesktopPolishSegment(startMs: 0, endMs: 1000, rate: 1)],
+            zooms: [],
+            assPath: "/tmp/x.ass",
+            width: 1920,
+            height: 1080
+        )
+        XCTAssertTrue(filter.contains("ass=filename="), filter)
+        XCTAssertTrue(filter.contains("[outv]"), filter)
+    }
+
+    func testMergePolishSegments() {
+        let got = mergePolishSegments([
+            DesktopPolishSegment(startMs: 0, endMs: 100, rate: 1),
+            DesktopPolishSegment(startMs: 100, endMs: 200, rate: 1),
+            DesktopPolishSegment(startMs: 200, endMs: 500, rate: 3),
+        ])
+        XCTAssertEqual(got, [
+            DesktopPolishSegment(startMs: 0, endMs: 200, rate: 1),
+            DesktopPolishSegment(startMs: 200, endMs: 500, rate: 3),
+        ])
     }
 }
