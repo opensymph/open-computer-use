@@ -1,20 +1,18 @@
 package main
 
-// Open-source record polish pipeline aligned with Cursor's recording-renderer
-// analysis + polished-renderer compositor behavior (without linking the
-// proprietary native addon):
+// Open-source record polish pipeline aligned with Cursor polished-renderer
+// compositor behavior (clean-room; does NOT vendor proprietary source):
 //
-//   - click ripples as thin expanding rings (PNG overlays, not filled blobs)
-//   - keystroke captions (ASS)
-//   - idle classification (LOADING_WAIT / VIEWING_RESULT / THINKING_PAUSE /
-//     LONG_OPERATION) with per-class speedups
-//   - click importance scoring → multi-window smart zoom
-//   - cursor path with cubic-bezier motion styles (slow/mellow/quick/rapid)
+//   - SVG-style cursor ghost with click depress (scale ~0.75)
+//   - Screen Studio cursor easing between click waypoints
+//   - smart zoom with 700ms ease-in / ease-out (not hard cuts)
+//   - idle classification speedups + keystroke captions
+//   - optional thin click rings (--ripples); proprietary compositor does
+//     NOT draw ripples — "click effects" there drive cursor/depress only
 //
-// Reference constants were taken from recording-renderer preprocessing
-// (idle_classifier / click-importance / cursor-path / DEFAULT_PREPROCESSING_CONFIG)
-// visible in the host agent bundle; the .node binary itself is a compiled
-// Rust N-API addon (not source).
+// Algorithm references: recording-renderer preprocessing constants and the
+// publicly dumped polished-renderer effect parameters (cursor move 600ms,
+// depress 50/80/150ms, zoom ease 700ms). No proprietary code is copied.
 
 import (
 	"encoding/json"
@@ -70,7 +68,8 @@ type polishOptions struct {
 
 func defaultPolishOptions() polishOptions {
 	return polishOptions{
-		ShowClickRipples: true,
+		// Proprietary polished-renderer has no yellow ripples; keep off by default.
+		ShowClickRipples: false,
 		ShowKeystrokes:   true,
 		ShowCursorGhost:  true,
 		IdleSpeedup:      true,
@@ -78,7 +77,7 @@ func defaultPolishOptions() polishOptions {
 		CursorStyle:      cursorStyleMellow,
 		MinIdleMs:        500,
 		ZoomFactor:       1.5,
-		ZoomDurationMs:   1400,
+		ZoomDurationMs:   2000, // hold ≈ 600ms + 700 in + 700 out
 		MaxZooms:         8,
 		ZoomImportance:   60,
 		MinZoomInterval:  1500,
@@ -118,9 +117,10 @@ type clickEffect struct {
 }
 
 type cursorKeyframe struct {
-	TMs int64
-	X   int
-	Y   int
+	TMs   int64
+	X     int
+	Y     int
+	Scale float64 // 1.0 normal; ~0.75 during click depress
 }
 
 type polishPlan struct {
@@ -167,7 +167,7 @@ func buildPolishPlan(log recordEventLog, durationMs int64, opts polishOptions) p
 	idles := detectIdlePeriods(events, durationMs, opts)
 	var zooms []zoomWindow
 	if opts.SmartZoom {
-		zooms = selectZoomWindowsFromClicks(clicks, durationMs, opts)
+		zooms = expandZoomEases(selectZoomWindowsFromClicks(clicks, durationMs, opts))
 	}
 	segments := buildPlaybackSegments(idles, zooms, durationMs, opts)
 	cursor := []cursorKeyframe{}
@@ -323,13 +323,20 @@ func selectZoomWindowsFromClicks(clicks []clickEffect, durationMs int64, opts po
 		if len(zooms) >= maxZooms {
 			break
 		}
-		start := c.TMs - 200
+		start := c.TMs - int64(zoomInDurationMs*0.3)
 		if start < 0 {
 			start = 0
 		}
+		// in (700) + hold + out (700); ZoomDurationMs is total window
 		end := start + opts.ZoomDurationMs
 		if end > durationMs {
 			end = durationMs
+		}
+		if end-start < int64(zoomInDurationMs+zoomOutDurationMs)+200 {
+			end = start + int64(zoomInDurationMs+zoomOutDurationMs) + 400
+			if end > durationMs {
+				end = durationMs
+			}
 		}
 		if start < lastStart+opts.MinZoomInterval {
 			continue
@@ -350,6 +357,87 @@ func selectZoomWindowsFromClicks(clicks []clickEffect, durationMs int64, opts po
 	}
 	sort.Slice(zooms, func(i, j int) bool { return zooms[i].StartMs < zooms[j].StartMs })
 	return zooms
+}
+
+// expandZoomEases turns each hard zoom window into ease-in / hold / ease-out
+// sub-windows (clean-room of polished-renderer zoom_in_ease / zoom_out_ease).
+func expandZoomEases(zooms []zoomWindow) []zoomWindow {
+	if len(zooms) == 0 {
+		return zooms
+	}
+	const steps = 6
+	var out []zoomWindow
+	for _, z := range zooms {
+		dur := z.EndMs - z.StartMs
+		inDur := int64(zoomInDurationMs)
+		outDur := int64(zoomOutDurationMs)
+		if dur < inDur+outDur+100 {
+			inDur = dur / 3
+			outDur = dur / 3
+		}
+		holdStart := z.StartMs + inDur
+		holdEnd := z.EndMs - outDur
+		if holdEnd < holdStart {
+			holdEnd = holdStart
+		}
+		// Ease in
+		stepIn := inDur / steps
+		if stepIn < 1 {
+			stepIn = 1
+		}
+		for i := 0; i < steps; i++ {
+			a := z.StartMs + int64(i)*stepIn
+			b := a + stepIn
+			if i == steps-1 {
+				b = holdStart
+			}
+			if b <= a {
+				continue
+			}
+			u := float64(i+1) / float64(steps)
+			factor := 1.0 + (z.Factor-1.0)*zoomInEase(u)
+			out = append(out, zoomWindow{StartMs: a, EndMs: b, X: z.X, Y: z.Y, Factor: factor, Score: z.Score})
+		}
+		if holdEnd > holdStart {
+			out = append(out, zoomWindow{StartMs: holdStart, EndMs: holdEnd, X: z.X, Y: z.Y, Factor: z.Factor, Score: z.Score})
+		}
+		// Ease out
+		stepOut := outDur / steps
+		if stepOut < 1 {
+			stepOut = 1
+		}
+		for i := 0; i < steps; i++ {
+			a := holdEnd + int64(i)*stepOut
+			b := a + stepOut
+			if i == steps-1 {
+				b = z.EndMs
+			}
+			if b <= a {
+				continue
+			}
+			u := float64(i+1) / float64(steps)
+			factor := 1.0 + (z.Factor-1.0)*(1.0-zoomOutEase(u))
+			if factor < 1.02 {
+				continue
+			}
+			out = append(out, zoomWindow{StartMs: a, EndMs: b, X: z.X, Y: z.Y, Factor: factor, Score: z.Score})
+		}
+	}
+	return out
+}
+
+func zoomInEase(t float64) float64 {
+	// 1 - (1-t)^4
+	u := 1 - t
+	return 1 - u*u*u*u
+}
+
+func zoomOutEase(t float64) float64 {
+	if t < 0.5 {
+		return 4 * t * t * t
+	}
+	u := -2*t + 2
+	return 1 - (u*u*u)/2
 }
 
 // --- idle classification (ported from idle-classifier.js) ---
@@ -546,30 +634,44 @@ func evenInt(v int) int {
 	return v - (v % 2)
 }
 
-// --- cursor path with cubic-bezier easing (cursor-path.js) ---
+// --- cursor path (clean-room of polished-renderer cursor.rs motion) ---
+
+const (
+	cursorMoveMs           = 600.0
+	depressAnticipationMs = 50.0
+	depressMs              = 80.0
+	releaseMs              = 150.0
+	depressScaleMin        = 0.75
+	zoomInDurationMs       = 700.0
+	zoomOutDurationMs      = 700.0
+)
 
 func generateCursorPath(events []recordEvent, durationMs int64, width, height int, style cursorStyle) []cursorKeyframe {
 	type wp struct {
-		t    int64
-		x, y int
+		t     int64
+		x, y  int
+		click bool
 	}
 	var waypoints []wp
 	for _, ev := range events {
 		switch ev.Type {
-		case "move", "click":
+		case "move":
 			if ev.X != 0 || ev.Y != 0 {
-				waypoints = append(waypoints, wp{ev.TMs, ev.X, ev.Y})
+				waypoints = append(waypoints, wp{ev.TMs, ev.X, ev.Y, false})
+			}
+		case "click":
+			if ev.X != 0 || ev.Y != 0 {
+				waypoints = append(waypoints, wp{ev.TMs, ev.X, ev.Y, true})
 			}
 		case "drag":
-			waypoints = append(waypoints, wp{ev.TMs, ev.X, ev.Y})
-			waypoints = append(waypoints, wp{ev.TMs + 180, ev.ToX, ev.ToY})
+			waypoints = append(waypoints, wp{ev.TMs, ev.X, ev.Y, true})
+			waypoints = append(waypoints, wp{ev.TMs + 180, ev.ToX, ev.ToY, false})
 		}
 	}
 	if len(waypoints) == 0 {
-		return []cursorKeyframe{{0, width / 2, height / 2}, {durationMs, width / 2, height / 2}}
+		return []cursorKeyframe{{0, width / 2, height / 2, 1}, {durationMs, width / 2, height / 2, 1}}
 	}
 	sort.Slice(waypoints, func(i, j int) bool { return waypoints[i].t < waypoints[j].t })
-	// Dedup near-identical times
 	dedup := waypoints[:1]
 	for _, w := range waypoints[1:] {
 		if w.t-dedup[len(dedup)-1].t < 16 {
@@ -580,53 +682,113 @@ func generateCursorPath(events []recordEvent, durationMs int64, width, height in
 	}
 	waypoints = dedup
 
+	// Click times for depress animation
+	var clickTimes []int64
+	for _, w := range waypoints {
+		if w.click {
+			clickTimes = append(clickTimes, w.t)
+		}
+	}
+
 	const fps = 30
 	frameMs := int64(1000 / fps)
 	var frames []cursorKeyframe
+
 	// Hold at first point from 0
 	if waypoints[0].t > 0 {
 		for t := int64(0); t < waypoints[0].t; t += frameMs {
-			frames = append(frames, cursorKeyframe{t, waypoints[0].x, waypoints[0].y})
+			frames = append(frames, cursorKeyframe{t, waypoints[0].x, waypoints[0].y, cursorDepressScale(t, clickTimes)})
 		}
 	}
+
 	for i := 0; i+1 < len(waypoints); i++ {
 		a, b := waypoints[i], waypoints[i+1]
-		dur := b.t - a.t
-		if dur <= 0 {
+		gap := float64(b.t - a.t)
+		if gap <= 0 {
 			continue
 		}
-		// Add a slight arc (perpendicular offset) for natural motion.
-		steps := int(dur/frameMs) + 1
+		dist := math.Hypot(float64(b.x-a.x), float64(b.y-a.y))
+		// Proprietary: move_duration = clamp(600 * sqrt(dist/400), 1, gap*0.8)
+		distanceFactor := math.Sqrt(dist / 400.0)
+		if distanceFactor > 1.5 {
+			distanceFactor = 1.5
+		}
+		moveDur := cursorMoveMs * distanceFactor
+		if moveDur < 1 {
+			moveDur = 1
+		}
+		if moveDur > gap*0.8 {
+			moveDur = gap * 0.8
+		}
+		moveStart := float64(b.t) - moveDur
+
+		// Hold at `a` until move starts
+		for t := a.t; float64(t) < moveStart; t += frameMs {
+			frames = append(frames, cursorKeyframe{t, a.x, a.y, cursorDepressScale(t, clickTimes)})
+		}
+		steps := int(moveDur/float64(frameMs)) + 1
 		for s := 0; s <= steps; s++ {
 			u := float64(s) / float64(steps)
-			e := bezierEase(style, u)
+			// Screen Studio ease is the compositor default for click-to-click moves.
+			// Style springs still available for --cursor-style slow|quick|rapid.
+			var e float64
+			if style == cursorStyleMellow {
+				e = screenStudioCursorEase(u)
+			} else {
+				e = bezierEase(style, u)
+			}
 			x := float64(a.x) + (float64(b.x)-float64(a.x))*e
 			y := float64(a.y) + (float64(b.y)-float64(a.y))*e
-			// Arc amplitude ~8% of travel distance
-			dx, dy := float64(b.x-a.x), float64(b.y-a.y)
-			dist := math.Hypot(dx, dy)
-			if dist > 1 {
-				nx, ny := -dy/dist, dx/dist
-				arc := math.Sin(u*math.Pi) * dist * 0.08
-				x += nx * arc
-				y += ny * arc
-			}
-			frames = append(frames, cursorKeyframe{a.t + int64(float64(dur)*u), int(x + 0.5), int(y + 0.5)})
+			t := int64(moveStart + moveDur*u)
+			frames = append(frames, cursorKeyframe{t, int(x + 0.5), int(y + 0.5), cursorDepressScale(t, clickTimes)})
 		}
 	}
 	last := waypoints[len(waypoints)-1]
 	for t := last.t; t <= durationMs; t += frameMs {
-		frames = append(frames, cursorKeyframe{t, last.x, last.y})
+		frames = append(frames, cursorKeyframe{t, last.x, last.y, cursorDepressScale(t, clickTimes)})
 	}
 	return frames
 }
 
-func bezierEase(style cursorStyle, t float64) float64 {
-	// Prefer spring-physics progress (polished-renderer SPRING_CONFIGS), with
-	// cubic-bezier as a stable fallback for pathological samples.
-	if p := springEase(style, t); p >= 0 {
-		return p
+// cursorDepressScale mirrors polished-renderer depress_scale (anticipation/press/release).
+func cursorDepressScale(tMs int64, clicks []int64) float64 {
+	best := 1.0
+	for _, c := range clicks {
+		dt := float64(tMs - c)
+		s := depressScaleAt(dt)
+		if s < best {
+			best = s
+		}
 	}
+	return best
+}
+
+func depressScaleAt(t float64) float64 {
+	totalPress := depressAnticipationMs + depressMs
+	total := totalPress + releaseMs
+	if t < -depressAnticipationMs || t > total {
+		return 1.0
+	}
+	if t < 0 {
+		progress := (t + depressAnticipationMs) / depressAnticipationMs
+		eased := progress * progress
+		return 1.0 - (1.0-depressScaleMin)*eased*0.5
+	}
+	if t < depressMs {
+		progress := t / depressMs
+		eased := 1.0 - (1.0-progress)*(1.0-progress)
+		return 1.0 - (1.0-depressScaleMin)*(0.5+eased*0.5)
+	}
+	releaseProgress := (t - depressMs) / releaseMs
+	eased := 1.0 - math.Pow(1.0-releaseProgress, 3)
+	return depressScaleMin + (1.0-depressScaleMin)*eased
+}
+
+func screenStudioCursorEase(t float64) float64 {
+	return cubicBezier(0.19, 1.0, 0.22, 1.0, t)
+}
+
+func bezierEase(style cursorStyle, t float64) float64 {
 	switch style {
 	case cursorStyleSlow:
 		return cubicBezier(0.25, 0.1, 0.25, 1.0, t)
@@ -634,50 +796,9 @@ func bezierEase(style cursorStyle, t float64) float64 {
 		return cubicBezier(0.0, 0.0, 0.2, 1.0, t)
 	case cursorStyleRapid:
 		return cubicBezier(0.4, 0.0, 0.2, 1.0, t)
-	default: // mellow
-		return cubicBezier(0.42, 0.0, 0.58, 1.0, t)
+	default: // mellow → Screen Studio (matches compositor click moves)
+		return screenStudioCursorEase(t)
 	}
-}
-
-// springEase integrates a damped spring toward 1.0 over normalized time t∈[0,1],
-// using proprietary MotionStyle spring configs (tension/friction/mass).
-func springEase(style cursorStyle, t float64) float64 {
-	if t <= 0 {
-		return 0
-	}
-	if t >= 1 {
-		return 1
-	}
-	var tension, friction, mass float64
-	switch style {
-	case cursorStyleSlow:
-		tension, friction, mass = 120, 30, 1.2
-	case cursorStyleQuick:
-		tension, friction, mass = 280, 24, 0.8
-	case cursorStyleRapid:
-		tension, friction, mass = 400, 30, 0.5
-	default: // mellow / unspecified
-		tension, friction, mass = 170, 26, 1.0
-	}
-	// Simulate ~0.45s of spring motion mapped onto t∈[0,1].
-	const durationSec = 0.45
-	dt := 1.0 / 120.0
-	steps := int(durationSec*t/dt) + 1
-	pos, vel := 0.0, 0.0
-	target := 1.0
-	for i := 0; i < steps; i++ {
-		force := -tension*(pos-target) - friction*vel
-		acc := force / mass
-		vel += acc * dt
-		pos += vel * dt
-	}
-	if pos < 0 {
-		pos = 0
-	}
-	if pos > 1 {
-		pos = 1
-	}
-	return pos
 }
 
 func cubicBezier(x1, y1, x2, y2, t float64) float64 {
@@ -1132,30 +1253,43 @@ func buildAdvancedFilterComplex(plan polishPlan, inputVideo, assPath string, rin
 		current = label
 	}
 
-	// 2) Cursor ghost — subsample keyframes (~10 fps overlays via enable windows)
+	// 2) Cursor ghost — subsample keyframes; apply depress scale near clicks.
 	if cursorIdx >= 0 {
 		label := current
-		step := 3 // every 3rd 30fps keyframe ≈ 10 overlays/sec
-		if step < 1 {
-			step = 1
-		}
+		step := 2 // denser sampling so depress reads clearly (~15 overlays/sec)
 		n := 0
+		baseSize := 18 // matches writeCursorArrowPNG
 		for i := 0; i < len(plan.Cursor); i += step {
 			kf := plan.Cursor[i]
 			start := float64(kf.TMs) / 1000.0
-			end := start + 0.12
+			end := start + 0.08
 			if i+step < len(plan.Cursor) {
 				end = float64(plan.Cursor[i+step].TMs) / 1000.0
 			}
 			if end <= start {
-				end = start + 0.05
+				end = start + 0.04
 			}
+			scale := kf.Scale
+			if scale <= 0 {
+				scale = 1
+			}
+			size := int(float64(baseSize)*scale + 0.5)
+			if size < 8 {
+				size = 8
+			}
+			// Hotspot ≈ (1,1) on the 18px arrow; keep tip anchored while scaling.
+			hotX := int(1.0 * scale)
+			hotY := int(1.0 * scale)
+			x := kf.X - hotX
+			y := kf.Y - hotY
+			scaled := fmt.Sprintf("[cus%d]", n)
 			out := fmt.Sprintf("[cu%d]", n)
-			fmt.Fprintf(&b, "%s[%d:v]overlay=x=%d:y=%d:enable='between(t,%0.3f,%0.3f)'%s;",
-				label, cursorIdx, kf.X, kf.Y, start, end, out)
+			fmt.Fprintf(&b, "[%d:v]format=rgba,scale=%d:%d%s;", cursorIdx, size, size, scaled)
+			fmt.Fprintf(&b, "%s%soverlay=x=%d:y=%d:enable='between(t,%0.3f,%0.3f)'%s;",
+				label, scaled, x, y, start, end, out)
 			label = out
 			n++
-			if n > 400 {
+			if n > 500 {
 				break
 			}
 		}
@@ -1267,6 +1401,9 @@ func runPolishCommand(args []string, stdout io.Writer) error {
 			output = args[i]
 		case "--no-ripples":
 			opts.ShowClickRipples = false
+		case "--ripples":
+			// Optional: proprietary compositor has no yellow rings.
+			opts.ShowClickRipples = true
 		case "--no-keystrokes":
 			opts.ShowKeystrokes = false
 		case "--no-cursor":

@@ -281,7 +281,9 @@ final class DesktopCommandTests: XCTestCase {
                 DesktopRecordEvent(tMs: 5000, type: "key", key: "Return"),
             ]
         )
-        let plan = buildPolishPlan(log: log, durationMs: 7000, opts: .default())
+        var opts = DesktopPolishOptions.default()
+        opts.showClickRipples = true
+        let plan = buildPolishPlan(log: log, durationMs: 7000, opts: opts)
         XCTAssertGreaterThanOrEqual(plan.segments.count, 2, "expected idle speedup segments, got \(plan.segments)")
         XCTAssertTrue(plan.segments.contains(where: { $0.rate > 1.5 }), "expected an idle speedup segment, got \(plan.segments)")
         XCTAssertFalse(plan.zooms.isEmpty, "expected at least one zoom window around the click")

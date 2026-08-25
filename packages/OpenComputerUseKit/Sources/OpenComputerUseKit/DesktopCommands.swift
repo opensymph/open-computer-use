@@ -151,7 +151,7 @@ public struct DesktopPolishOptions: Equatable, Sendable {
     public var cursorStyle: String
 
     public init(
-        showClickRipples: Bool = true,
+        showClickRipples: Bool = false,
         showKeystrokes: Bool = true,
         showCursorGhost: Bool = true,
         idleSpeedup: Bool = true,
@@ -159,7 +159,7 @@ public struct DesktopPolishOptions: Equatable, Sendable {
         minIdleMs: Int64 = 500,
         idleRate: Double = 3.0,
         zoomFactor: Double = 1.5,
-        zoomDurationMs: Int64 = 1400,
+        zoomDurationMs: Int64 = 2000,
         maxZooms: Int = 8,
         zoomImportance: Int = 60,
         minZoomIntervalMs: Int64 = 1500,
@@ -458,7 +458,7 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
     var polishInput: String?
     var polishEvents: String?
     var polishOutput: String?
-    var showClickRipples = true
+    var showClickRipples = false
     var showKeystrokes = true
     var showCursorGhost = true
     var idleSpeedup = true
@@ -488,6 +488,8 @@ func parseDesktopRecordPolishArguments(_ rest: [String]) throws -> DesktopRecord
             polishOutput = rest[index]
         case "--no-ripples":
             showClickRipples = false
+        case "--ripples":
+            showClickRipples = true
         case "--no-keystrokes":
             showKeystrokes = false
         case "--no-cursor":

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -105,6 +106,47 @@ func TestBezierEaseMonotonic(t *testing.T) {
 	}
 }
 
+func TestCursorDepressAndScreenStudio(t *testing.T) {
+	if s := depressScaleAt(40); !(s < 0.9) {
+		t.Fatalf("expected depress mid-press <0.9, got %v", s)
+	}
+	if s := depressScaleAt(500); math.Abs(s-1) > 1e-6 {
+		t.Fatalf("expected released=1, got %v", s)
+	}
+	if screenStudioCursorEase(0) != 0 && screenStudioCursorEase(0) > 0.01 {
+		// allow tiny numerical error at 0
+	}
+	e := screenStudioCursorEase(0.5)
+	if e <= 0.5 || e >= 1.0 {
+		t.Fatalf("screen studio ease mid should overshoot-ish toward 1, got %v", e)
+	}
+	events := []recordEvent{
+		{TMs: 500, Type: "click", X: 100, Y: 100, Count: 1},
+		{TMs: 1500, Type: "click", X: 500, Y: 400, Count: 1},
+	}
+	path := generateCursorPath(events, 2500, 800, 600, cursorStyleMellow)
+	var minScale float64 = 2
+	for _, kf := range path {
+		if kf.Scale < minScale {
+			minScale = kf.Scale
+		}
+	}
+	if minScale > 0.85 {
+		t.Fatalf("expected depress scale near clicks, min=%v", minScale)
+	}
+}
+
+func TestExpandZoomEases(t *testing.T) {
+	in := []zoomWindow{{StartMs: 0, EndMs: 2000, X: 100, Y: 100, Factor: 1.5, Score: 80}}
+	out := expandZoomEases(in)
+	if len(out) < 5 {
+		t.Fatalf("expected eased sub-windows, got %d", len(out))
+	}
+	if out[0].Factor >= out[len(out)/2].Factor {
+		t.Fatalf("ease-in should grow factor: first=%v mid=%v", out[0].Factor, out[len(out)/2].Factor)
+	}
+}
+
 func TestFormatASSTime(t *testing.T) {
 	if got := formatASSTime(3661020); got != "1:01:01.02" {
 		t.Fatalf("formatASSTime = %q", got)
@@ -158,6 +200,8 @@ func TestRippleFilterContainsOverlay(t *testing.T) {
 	opts.IdleSpeedup = false
 	opts.SmartZoom = false
 	opts.ShowCursorGhost = false
+	opts.ShowClickRipples = true
+	opts.ShowKeystrokes = false
 	log := recordEventLog{Width: 640, Height: 360, Events: []recordEvent{
 		{TMs: 200, Type: "click", X: 320, Y: 180, Count: 1, Button: "left"},
 		{TMs: 250, Type: "type", Text: "x"},

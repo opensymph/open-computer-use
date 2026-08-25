@@ -253,7 +253,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
           open-computer-use record stop  [--pidfile <path>] [--save-as <name-or-path>] [--polish]
           open-computer-use record discard [--pidfile <path>]
           open-computer-use record polish --input <raw.mp4> [--events <file>] [--output <polished.mp4>]
-                                         [--cursor-style slow|mellow|quick|rapid]
+                                         [--cursor-style slow|mellow|quick|rapid] [--ripples]
                                          [--no-ripples] [--no-keystrokes] [--no-cursor] [--no-idle-speedup] [--no-zoom]
           open-computer-use record status [--pidfile <path>]
 

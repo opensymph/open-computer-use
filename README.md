@@ -125,7 +125,7 @@ open-computer-use record status
 | input gate | `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` | `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1` | `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1` |
 | record backend | `ffmpeg x11grab` (needs PATH) | `ffmpeg gdigrab` (needs PATH) | prefers `ffmpeg avfoundation` when on PATH; falls back to `/usr/sbin/screencapture -v` |
 | record quality | `--quality demo` (default) / `draft` / `proxy`; `--fps`, `--draw-mouse`, `discard`, `stop --save-as` | same | same flags; ffmpeg path honors them, screencapture fallback ignores encode knobs |
-| record polish | open-source ffmpeg+ASS pipeline aligned with Cursor RecordScreen overlays: thin click rings, keystroke captions, idle classification (LOADING_WAIT/THINKING_PAUSE), multi-window smart zoom, spring cursor styles (`record polish` / `--polish`). Logs display `input` into `<stem>.events.json`. | same | same |
+| record polish | open-source ffmpeg+ASS pipeline aligned with Cursor RecordScreen overlays: cursor depress + Screen Studio easing, ease-in/out zoom, keystroke captions (optional --ripples), idle classification (LOADING_WAIT/THINKING_PAUSE), multi-window smart zoom, spring cursor styles (`record polish` / `--polish`). Logs display `input` into `<stem>.events.json`. | same | same |
 
 The Linux commands accept `--display` (defaults `$DISPLAY`, then `:0`; a VNC/AnyOS desktop is usually `:1`); Windows and macOS operate on the whole desktop and have no `--display`. Global synthetic input moves the real pointer/keyboard, so each platform gates it behind its own opt-in flag (default off):
 
