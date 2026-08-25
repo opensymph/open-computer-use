@@ -98,8 +98,8 @@ func cursorHotspotRatio(cursorType string) (hx, hy float64) {
 	case "wait", "crosshair":
 		return 0.5, 0.5
 	default:
-		// Proprietary SVG viewBox hotspot ≈ (3/24, 2/24).
-		return 3.0 / 24.0, 2.0 / 24.0
+		// Tip of drawArrow sits at (4,4) on the 48px sprite.
+		return 4.0 / 48.0, 4.0 / 48.0
 	}
 }
 
@@ -197,6 +197,99 @@ func cursorTipInFrame(srcX, srcY float64, z zoomState, w, h int) (float64, float
 	tx := (srcX-cx)*z.Scale + cx + z.TranslateX
 	ty := (srcY-cy)*z.Scale + cy + z.TranslateY
 	return tx, ty
+}
+
+// overlayClickRipples draws thin yellow expanding rings centered on click points
+// (same stagger as the ffmpeg ripple path), transformed through the active zoom.
+func overlayClickRipples(dst *rgbaFrame, clicks []clickEffect, tMs float64, z zoomState) {
+	if dst == nil || len(clicks) == 0 {
+		return
+	}
+	radii := []float64{6, 11, 16, 22}
+	const (
+		staggerMs = 70.0
+		lifeMs    = 75.0
+		thickness = 2.0
+	)
+	scale := float64(dst.W) / 1920.0
+	if scale < 0.5 {
+		scale = 0.5
+	}
+	for _, c := range clicks {
+		age := tMs - float64(c.TMs)
+		if age < -5 || age > staggerMs*float64(len(radii))+lifeMs {
+			continue
+		}
+		cx, cy := cursorTipInFrame(float64(c.X), float64(c.Y), z, dst.W, dst.H)
+		for i, baseR := range radii {
+			start := float64(i) * staggerMs
+			end := start + lifeMs
+			if age < start || age > end {
+				continue
+			}
+			progress := (age - start) / lifeMs
+			// Keep rings readable after downscale/upscale; fade late.
+			alpha := 0.95 - progress*0.55
+			if alpha < 0.15 {
+				continue
+			}
+			r := baseR * scale
+			if z.Scale > 1.02 {
+				r *= z.Scale
+			}
+			if r < 3 {
+				r = 3
+			}
+			drawCircleOutline(dst, cx, cy, r, thickness+0.5, 255, 215, 0, alpha)
+		}
+	}
+}
+
+func drawCircleOutline(dst *rgbaFrame, cx, cy, radius, thickness float64, cr, cg, cb byte, alpha float64) {
+	if alpha <= 0 || radius <= 0 {
+		return
+	}
+	outer := radius + thickness*0.5 + 1.5
+	minX := int(math.Floor(cx - outer))
+	maxX := int(math.Ceil(cx + outer))
+	minY := int(math.Floor(cy - outer))
+	maxY := int(math.Ceil(cy + outer))
+	innerR := radius - thickness*0.5
+	outerR := radius + thickness*0.5
+	if innerR < 0 {
+		innerR = 0
+	}
+	for y := minY; y <= maxY; y++ {
+		for x := minX; x <= maxX; x++ {
+			if x < 0 || y < 0 || x >= dst.W || y >= dst.H {
+				continue
+			}
+			dx := float64(x) + 0.5 - cx
+			dy := float64(y) + 0.5 - cy
+			d := math.Hypot(dx, dy)
+			if d < innerR-0.6 || d > outerR+0.6 {
+				continue
+			}
+			coverage := 1.0
+			if d < innerR {
+				coverage = 1 - (innerR - d)
+			} else if d > outerR {
+				coverage = 1 - (d - outerR)
+			}
+			if coverage <= 0 {
+				continue
+			}
+			a := alpha * coverage
+			if a > 1 {
+				a = 1
+			}
+			dr, dg, db, _ := dst.at(x, y)
+			nr := float64(dr)*(1-a) + float64(cr)*a
+			ng := float64(dg)*(1-a) + float64(cg)*a
+			nb := float64(db)*(1-a) + float64(cb)*a
+			dst.set(x, y, byte(nr+0.5), byte(ng+0.5), byte(nb+0.5), 255)
+		}
+	}
 }
 
 func overlayCursorWithMotionBlur(dst *rgbaFrame, sprite *compositorCursor, curr, prev cursorKeyframe, currZ, prevZ zoomState, videoW int, cfg motionBlurConfig) {

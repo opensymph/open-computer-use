@@ -63,6 +63,70 @@ func TestIdleClassification(t *testing.T) {
 	}
 }
 
+func TestIdlePeriodsProtectClickMoments(t *testing.T) {
+	events := []recordEvent{
+		{TMs: 1000, Type: "wait", Seconds: 0.2},
+		{TMs: 8000, Type: "click", X: 100, Y: 100, Count: 1, Button: "left"},
+		{TMs: 9000, Type: "wait", Seconds: 0.2},
+	}
+	idles := detectIdlePeriods(events, 10000, defaultPolishOptions())
+	for _, p := range idles {
+		// Click instant ± hold must not be inside a sped-up idle span.
+		if p.StartMs < 8000 && p.EndMs > 8000 {
+			t.Fatalf("idle spans across click: %#v", p)
+		}
+		if p.SuggestedSpeed > 1.01 && p.StartMs <= 8000 && p.EndMs >= 8000 {
+			t.Fatalf("speedup covers click: %#v", p)
+		}
+	}
+	protected := false
+	for _, p := range idles {
+		if p.EndMs <= 8000-actionHoldPreMs(events[1]) && p.StartMs >= 1000 {
+			protected = true
+		}
+	}
+	if len(idles) == 0 {
+		t.Fatal("expected idle before click")
+	}
+	_ = protected
+	// Ensure pre-click hold is excluded from the long gap.
+	found := false
+	for _, p := range idles {
+		if p.StartMs == 1000 && p.EndMs == 8000-actionHoldPreMs(events[1]) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected padded idle before click, got %#v", idles)
+	}
+}
+
+func TestAlignEventLogToVideo(t *testing.T) {
+	log := recordEventLog{
+		Width: 1280, Height: 800,
+		Events: []recordEvent{
+			{TMs: 1, Type: "click", X: 640, Y: 400, Count: 1},
+			{TMs: 2, Type: "drag", X: 100, Y: 100, ToX: 200, ToY: 200},
+		},
+	}
+	alignEventLogToVideo(&log, 1920, 1200)
+	if log.Width != 1920 || log.Height != 1200 {
+		t.Fatalf("meta=%dx%d", log.Width, log.Height)
+	}
+	if log.Events[0].X != 960 || log.Events[0].Y != 600 {
+		t.Fatalf("click scaled to %d,%d", log.Events[0].X, log.Events[0].Y)
+	}
+	if log.Events[1].ToX != 300 || log.Events[1].ToY != 300 {
+		t.Fatalf("drag end scaled to %d,%d", log.Events[1].ToX, log.Events[1].ToY)
+	}
+}
+
+func TestDefaultRipplesEnabled(t *testing.T) {
+	if !defaultPolishOptions().ShowClickRipples {
+		t.Fatal("yellow ripples should default on")
+	}
+}
+
 func TestPolishPlanIdleAndKeystrokes(t *testing.T) {
 	log := recordEventLog{
 		Width:  800,

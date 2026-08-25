@@ -5,11 +5,11 @@ package main
 //
 // Default engine (`--engine compositor`): frame compositor pipeline
 //   idle remap → zoom → lens warp → camera motion blur →
-//   cursor (+depress + cursor motion blur) → keystroke chips
+//   cursor (+depress + cursor motion blur) → yellow click ripples →
+//   keystroke chips
 //
-// Legacy (`--engine ffmpeg`): filter_complex + ASS overlays.
-// Optional `--ripples` forces the ffmpeg path for thin click rings
-// (proprietary compositor does not draw ripples).
+// Legacy (`--engine ffmpeg`): filter_complex + ASS overlays (+ ripples).
+// Yellow click ripples are on by default (`--no-ripples` to disable).
 //
 // Algorithm references: recording-renderer preprocessing constants and the
 // publicly dumped polished-renderer effect parameters (cursor move 600ms,
@@ -69,8 +69,8 @@ type polishOptions struct {
 
 func defaultPolishOptions() polishOptions {
 	return polishOptions{
-		// Proprietary polished-renderer has no yellow ripples; keep off by default.
-		ShowClickRipples: false,
+		// Yellow click rings help viewers see aim; compositor draws them natively.
+		ShowClickRipples: true,
 		ShowKeystrokes:   true,
 		ShowCursorGhost:  true,
 		IdleSpeedup:      true,
@@ -444,6 +444,34 @@ func zoomOutEase(t float64) float64 {
 
 // --- idle classification (ported from idle-classifier.js) ---
 
+// actionHoldPreMs / actionHoldPostMs keep click/type moments at 1× so ripples,
+// cursor depress, and the actual UI change remain visible after idle remap.
+func actionHoldPreMs(ev recordEvent) int64 {
+	switch ev.Type {
+	case "click", "drag", "scroll", "mouse_down", "mouse_up":
+		return 250
+	case "type", "key":
+		return 120
+	default:
+		return 0
+	}
+}
+
+func actionHoldPostMs(ev recordEvent) int64 {
+	switch ev.Type {
+	case "click", "drag", "mouse_down", "mouse_up":
+		return 500
+	case "scroll":
+		return 300
+	case "type":
+		return 400
+	case "key":
+		return 250
+	default:
+		return 0
+	}
+}
+
 func detectIdlePeriods(events []recordEvent, durationMs int64, opts polishOptions) []idlePeriod {
 	cfgMin := opts.MinIdleMs
 	if cfgMin <= 0 {
@@ -457,23 +485,27 @@ func detectIdlePeriods(events []recordEvent, durationMs int64, opts polishOption
 	}
 	var periods []idlePeriod
 	first := events[0].TMs
-	if first >= cfgMin {
-		c, speed := classifyIdlePeriod(first, "none", eventActionType(events[0]))
-		periods = append(periods, idlePeriod{0, first, c, speed})
+	gapEnd := first - actionHoldPreMs(events[0])
+	if gapEnd >= cfgMin {
+		c, speed := classifyIdlePeriod(gapEnd, "none", eventActionType(events[0]))
+		periods = append(periods, idlePeriod{0, gapEnd, c, speed})
 	}
 	for i := 0; i < len(events)-1; i++ {
 		cur, next := events[i], events[i+1]
-		gap := next.TMs - cur.TMs
+		gapStart := cur.TMs + actionHoldPostMs(cur)
+		gapEnd := next.TMs - actionHoldPreMs(next)
+		gap := gapEnd - gapStart
 		if gap < cfgMin {
 			continue
 		}
 		c, speed := classifyIdlePeriod(gap, eventActionType(cur), eventActionType(next))
-		periods = append(periods, idlePeriod{cur.TMs, next.TMs, c, speed})
+		periods = append(periods, idlePeriod{gapStart, gapEnd, c, speed})
 	}
 	last := events[len(events)-1]
-	if durationMs-last.TMs >= cfgMin {
-		c, speed := classifyIdlePeriod(durationMs-last.TMs, eventActionType(last), "none")
-		periods = append(periods, idlePeriod{last.TMs, durationMs, c, speed})
+	gapStart := last.TMs + actionHoldPostMs(last)
+	if durationMs-gapStart >= cfgMin {
+		c, speed := classifyIdlePeriod(durationMs-gapStart, eventActionType(last), "none")
+		periods = append(periods, idlePeriod{gapStart, durationMs, c, speed})
 	}
 	return periods
 }
@@ -593,7 +625,7 @@ func buildPlaybackSegments(idles []idlePeriod, zooms []zoomWindow, durationMs in
 		if b <= a {
 			continue
 		}
-		mid := a
+		mid := a + (b-a)/2
 		seg := polishSegment{StartMs: a, EndMs: b, Rate: rateAt(mid)}
 		if z := zoomAt(mid); z != nil {
 			cp := *z
@@ -634,6 +666,37 @@ func evenInt(v int) int {
 		v = 0
 	}
 	return v - (v % 2)
+}
+
+// alignEventLogToVideo scales pointer event coordinates when the events sidecar
+// canvas differs from the recorded video (resolution / API-size mismatch).
+func alignEventLogToVideo(log *recordEventLog, vidW, vidH int) {
+	if log == nil || vidW <= 0 || vidH <= 0 {
+		return
+	}
+	lw, lh := log.Width, log.Height
+	if lw <= 0 || lh <= 0 {
+		log.Width, log.Height = vidW, vidH
+		return
+	}
+	if lw == vidW && lh == vidH {
+		return
+	}
+	sx := float64(vidW) / float64(lw)
+	sy := float64(vidH) / float64(lh)
+	for i := range log.Events {
+		e := &log.Events[i]
+		switch e.Type {
+		case "move", "click", "drag", "scroll", "mouse_down", "mouse_up":
+			e.X = int(float64(e.X)*sx + 0.5)
+			e.Y = int(float64(e.Y)*sy + 0.5)
+			if e.Type == "drag" {
+				e.ToX = int(float64(e.ToX)*sx + 0.5)
+				e.ToY = int(float64(e.ToY)*sy + 0.5)
+			}
+		}
+	}
+	log.Width, log.Height = vidW, vidH
 }
 
 // --- cursor path (clean-room of polished-renderer cursor.rs motion) ---
@@ -1161,6 +1224,7 @@ func polishRecordingFFmpeg(inputVideo, eventsPath, outputVideo string, opts poli
 	if log.Height <= 0 {
 		log.Height = height
 	}
+	alignEventLogToVideo(&log, width, height)
 	plan := buildPolishPlan(log, durationMs, opts)
 
 	workDir, err := os.MkdirTemp("", "ocu-polish-*")
@@ -1310,9 +1374,15 @@ func buildAdvancedFilterComplex(plan polishPlan, inputVideo, assPath string, rin
 			if size < 8 {
 				size = 8
 			}
-			// Hotspot ≈ (1,1) on the 18px arrow; keep tip anchored while scaling.
-			hotX := int(1.0 * scale)
-			hotY := int(1.0 * scale)
+			// Hotspot matches writeCursorArrowPNG tip at (1,1) on the 18px sprite.
+			hotX := int(float64(size)/18.0 + 0.5)
+			hotY := int(float64(size)/18.0 + 0.5)
+			if hotX < 1 {
+				hotX = 1
+			}
+			if hotY < 1 {
+				hotY = 1
+			}
 			x := kf.X - hotX
 			y := kf.Y - hotY
 			scaled := fmt.Sprintf("[cus%d]", n)
@@ -1462,8 +1532,6 @@ func runPolishCommand(args []string, stdout io.Writer) error {
 		case "--no-ripples":
 			opts.ShowClickRipples = false
 		case "--ripples":
-			// Optional: proprietary compositor has no yellow rings.
-			// Ripples only apply to the legacy ffmpeg engine.
 			opts.ShowClickRipples = true
 		case "--no-keystrokes":
 			opts.ShowKeystrokes = false
@@ -1504,10 +1572,6 @@ func runPolishCommand(args []string, stdout io.Writer) error {
 	}
 	if writePlan && writePlanPath == "" {
 		writePlanPath = defaultRenderPlanPath(input)
-	}
-	// Ripples are an OCU ffmpeg-only overlay; force legacy engine when requested.
-	if opts.ShowClickRipples && engine == polishEngineCompositor {
-		engine = polishEngineFFmpeg
 	}
 	started := time.Now()
 	if planPath != "" {

@@ -3,7 +3,8 @@ package main
 // Clean-room frame compositor engine (default for record polish).
 // Pipeline mirrors polished-renderer:
 //   remap idle timeline → zoom → lens warp → camera motion blur →
-//   cursor (+depress + cursor motion blur) → keystroke chips → encode
+//   yellow click ripples → cursor (+depress + cursor motion blur) →
+//   keystroke chips → encode
 //
 // Does not vendor proprietary source; parameters were re-derived from public dumps.
 
@@ -69,6 +70,7 @@ func polishRecordingCompositor(inputVideo, eventsPath, outputVideo string, opts 
 	if log.Height <= 0 {
 		log.Height = height
 	}
+	alignEventLogToVideo(&log, width, height)
 	if opts.FPS <= 0 {
 		opts.FPS = 30
 	}
@@ -91,7 +93,7 @@ func polishRecordingCompositor(inputVideo, eventsPath, outputVideo string, opts 
 		polishPlan{Zooms: zooms, Clicks: clicks, Cursor: cursorPath, Width: log.Width, Height: log.Height},
 		segments,
 	))
-	return polishRecordingCompositorCore(inputVideo, outputVideo, width, height, events, segments, zooms, cursorPath, opts)
+	return polishRecordingCompositorCore(inputVideo, outputVideo, width, height, events, segments, zooms, cursorPath, clicks, opts)
 }
 
 func polishRecordingCompositorFromPlan(inputVideo, eventsPath, outputVideo string, opts compositorOptions, segments []polishSegment, zooms []zoomWindow, cursor []cursorKeyframe) error {
@@ -103,16 +105,18 @@ func polishRecordingCompositorFromPlan(inputVideo, eventsPath, outputVideo strin
 	if err != nil {
 		return err
 	}
+	alignEventLogToVideo(&log, width, height)
 	events := append([]recordEvent(nil), log.Events...)
 	sort.Slice(events, func(i, j int) bool { return events[i].TMs < events[j].TMs })
+	clicks := analyzeClickEffects(events, log.Width, log.Height)
 	if len(segments) == 0 {
 		durationMs, _, _, _ := probeVideoDurationMs(inputVideo)
 		segments = buildPlaybackSegments(nil, zooms, durationMs, opts.polishOptions)
 	}
-	return polishRecordingCompositorCore(inputVideo, outputVideo, width, height, events, segments, zooms, cursor, opts)
+	return polishRecordingCompositorCore(inputVideo, outputVideo, width, height, events, segments, zooms, cursor, clicks, opts)
 }
 
-func polishRecordingCompositorCore(inputVideo, outputVideo string, width, height int, events []recordEvent, segments []polishSegment, zooms []zoomWindow, cursorPath []cursorKeyframe, opts compositorOptions) error {
+func polishRecordingCompositorCore(inputVideo, outputVideo string, width, height int, events []recordEvent, segments []polishSegment, zooms []zoomWindow, cursorPath []cursorKeyframe, clicks []clickEffect, opts compositorOptions) error {
 	workDir, err := os.MkdirTemp("", "ocu-comp-*")
 	if err != nil {
 		return err
@@ -146,6 +150,10 @@ func polishRecordingCompositorCore(inputVideo, outputVideo string, width, height
 			cursorPath[i].X = int(float64(cursorPath[i].X)*scale + 0.5)
 			cursorPath[i].Y = int(float64(cursorPath[i].Y)*scale + 0.5)
 		}
+		for i := range clicks {
+			clicks[i].X = int(float64(clicks[i].X)*scale + 0.5)
+			clicks[i].Y = int(float64(clicks[i].Y)*scale + 0.5)
+		}
 	}
 
 	linearPath := filepath.Join(workDir, "linear.mp4")
@@ -165,18 +173,22 @@ func polishRecordingCompositorCore(inputVideo, outputVideo string, width, height
 
 	outCursor := remapCursorPath(cursorPath, srcToOut, outDurationMs)
 	outZooms := remapZooms(zooms, srcToOut)
+	outClicks := remapClickEffects(clicks, srcToOut)
 	outChips := buildKeystrokeChips(events, func(srcMs int64) float64 {
 		return srcToOut(float64(srcMs))
 	})
 	if !opts.ShowKeystrokes {
 		outChips = nil
 	}
+	if !opts.ShowClickRipples {
+		outClicks = nil
+	}
 
 	compOut := outputVideo
 	if scale < 1.0 {
 		compOut = filepath.Join(workDir, "comp.mp4")
 	}
-	if err := renderCompositorPass(linearPath, compOut, width, height, opts.FPS, outDurationMs, outZooms, outCursor, outChips, opts); err != nil {
+	if err := renderCompositorPass(linearPath, compOut, width, height, opts.FPS, outDurationMs, outZooms, outCursor, outClicks, outChips, opts); err != nil {
 		return err
 	}
 	if scale < 1.0 {
@@ -277,6 +289,17 @@ func remapZooms(zooms []zoomWindow, mapFn func(float64) float64) []zoomWindow {
 	return out
 }
 
+func remapClickEffects(clicks []clickEffect, mapFn func(float64) float64) []clickEffect {
+	out := make([]clickEffect, 0, len(clicks))
+	for _, c := range clicks {
+		out = append(out, clickEffect{
+			TMs: int64(mapFn(float64(c.TMs)) + 0.5),
+			X: c.X, Y: c.Y, Count: c.Count, Button: c.Button, Score: c.Score, Followed: c.Followed,
+		})
+	}
+	return out
+}
+
 func renderLinearTimeline(input, output string, segs []polishSegment) error {
 	if len(segs) == 0 {
 		segs = []polishSegment{{StartMs: 0, EndMs: 1, Rate: 1}}
@@ -344,7 +367,7 @@ func trimTail(s string, n int) string {
 	return s
 }
 
-func renderCompositorPass(linearVideo, output string, width, height, fps int, outDurationMs int64, zooms []zoomWindow, cursor []cursorKeyframe, chips []keystrokeChip, opts compositorOptions) error {
+func renderCompositorPass(linearVideo, output string, width, height, fps int, outDurationMs int64, zooms []zoomWindow, cursor []cursorKeyframe, clicks []clickEffect, chips []keystrokeChip, opts compositorOptions) error {
 	probedDur, _, _, _ := probeVideoDurationMs(linearVideo)
 	if probedDur > 0 {
 		outDurationMs = probedDur
@@ -439,6 +462,10 @@ func renderCompositorPass(linearVideo, output string, width, height, fps int, ou
 		applyCameraMotionBlur(scene, blurred, z, prevZoom, opts.MotionBlur)
 		zoomForCursorPrev := prevZoom
 		prevZoom = z
+
+		if opts.ShowClickRipples && len(clicks) > 0 {
+			overlayClickRipples(blurred, clicks, tMs, z)
+		}
 
 		if opts.ShowCursorGhost && len(cursor) > 0 {
 			kf := cursorAt(cursor, tMs)
