@@ -48,6 +48,21 @@ func TestClickImportanceAndMultiZoom(t *testing.T) {
 	}
 }
 
+func TestClickFollowedSkipsWait(t *testing.T) {
+	events := []recordEvent{
+		{TMs: 100, Type: "click", X: 400, Y: 300, Count: 1, Button: "left"},
+		{TMs: 200, Type: "wait", Seconds: 0.3},
+		{TMs: 500, Type: "type", Text: "baidu.com"},
+	}
+	clicks := analyzeClickEffects(events, 1920, 1200)
+	if len(clicks) != 1 || !clicks[0].Followed {
+		t.Fatalf("click before wait+type should be Followed: %#v", clicks)
+	}
+	if clicks[0].Score < 60 {
+		t.Fatalf("expected boosted score, got %d", clicks[0].Score)
+	}
+}
+
 func TestIdleClassification(t *testing.T) {
 	c, speed := classifyIdlePeriod(6000, "type", "key")
 	if c != idleThinkingPause || speed < 2.5 {

@@ -223,8 +223,14 @@ func analyzeClickEffects(events []recordEvent, width, height int) []clickEffect 
 			continue
 		}
 		followed := false
-		if i+1 < len(events) && (events[i+1].Type == "type" || events[i+1].Type == "key") {
-			followed = true
+		for j := i + 1; j < len(events); j++ {
+			if events[j].Type == "wait" {
+				continue
+			}
+			if events[j].Type == "type" || events[j].Type == "key" {
+				followed = true
+			}
+			break
 		}
 		clicks = append(clicks, clickEffect{
 			TMs: ev.TMs, X: ev.X, Y: ev.Y, Count: ev.Count, Button: ev.Button, Followed: followed,
