@@ -4,6 +4,7 @@
 
 | 日期 | 功能域 | 用户价值 | 变更摘要 |
 | --- | --- | --- | --- |
+| 2026-08-26 | record polish 默认合成器与点击对准 | 默认开启黄环与 clean-room 帧合成器；事件坐标对齐视频分辨率；点击/输入瞬间不被 idle 快进吃掉；浏览器地址栏 click→type 流程 zoom 更跟手；Computer Use 坐标缩放与三端 record/polish 能力收口到可发版。 | 发布 `1.2.0`：Linux/Windows compositor 默认引擎 + 黄环；`alignEventLogToVideo`、action hold、Followed 跳过 wait；API size / mouse_down/up / proxy / anyos；真实桌面 baidu.com e2e。 |
 | 2026-08-25 | record polish 事件日志与后处理 | 三端 `record` 在录制期间写入 `<stem>.events.json`，并用开源 ffmpeg+ASS 管线（click ripples / keystroke captions / idle speedup / smart zoom / cursor ghost）对齐 Cursor RecordScreen 风格后处理；`start`/`stop --polish` 与独立 `record polish` 子命令可用。 | Linux/Windows 先落地 `record_events.go` + `record_polish.go`；macOS OpenComputerUseKit 同步 `DesktopCommands` 事件 sidecar、ASS/filter_complex polish、CLI help 与单测。未调用专有 polished-renderer。 |
 | 2026-08-25 | polish 对齐专有渲染器细化 | Linux/Windows PNG 细环涟漪（去除 ASS 填充大方块）、多段 zoom、click importance、LOADING_WAIT/THINKING_PAUSE 空闲分类、mellow/quick/rapid spring 光标；macOS ASS 改为透明填充描边圆环；`--cursor-style`。参考 polished-renderer.node 符号与 recording-renderer 常量，未链接专有 .node。 | 三端同步；视觉上修复“一大片”点击块。 |
 | 2026-08-25 | polish 对齐真实 compositor | 对照 cursor-agent-architecture 中 polished-renderer 源码：专有合成器不画黄环；clean-room 实现 Screen Studio 光标缓动、点击 depress、700ms zoom ease-in/out；默认关闭 ripples（`--ripples` 可选）。未 vendoring 专有源码。 | Linux/Windows/macOS |
