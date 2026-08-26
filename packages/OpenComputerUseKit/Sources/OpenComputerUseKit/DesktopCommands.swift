@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
 
@@ -2345,9 +2346,6 @@ func buildPolishFilterComplexSplit(
         return b
     }
     b += "\(concatInputs)concat=n=\(used):v=1:a=0[outv]"
-    return b
-}
-
     return b
 }
 
