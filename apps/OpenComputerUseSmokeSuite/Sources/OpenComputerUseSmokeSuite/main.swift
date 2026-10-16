@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import CoreGraphics
 import Foundation
 import OpenComputerUseKit
@@ -70,6 +71,22 @@ final class MCPClient {
         }
 
         return text
+    }
+
+    /// Tool-error variant of `callTool`: expected-failure steps need the
+    /// error text instead of a thrown exception.
+    func callToolResult(_ name: String, arguments: [String: Any]) throws -> (text: String?, isError: Bool) {
+        let response = try request(method: "tools/call", params: [
+            "name": name,
+            "arguments": arguments,
+        ])
+
+        if let error = response.error {
+            throw SmokeError.message("JSON-RPC error: \(error)")
+        }
+
+        let result = response.result ?? [:]
+        return (extractText(from: result), (result["isError"] as? Bool) == true)
     }
 
     func terminate() {
@@ -181,13 +198,23 @@ enum OpenComputerUseSmokeSuite {
 
         switch mode {
         case .full:
-            try runFullSmoke(serverURL: serverURL, appName: appName)
+            try runFullSmoke(
+                serverURL: serverURL,
+                appName: appName,
+                headlessFixture: fixture,
+                fixtureURL: fixtureURL
+            )
         case .cursorIdleOnly:
             try runCursorIdleSmoke(serverURL: serverURL, appName: appName)
         }
     }
 
-    private static func runFullSmoke(serverURL: URL, appName: String) throws {
+    private static func runFullSmoke(
+        serverURL: URL,
+        appName: String,
+        headlessFixture: Process,
+        fixtureURL: URL
+    ) throws {
         let client = try MCPClient(executableURL: serverURL, arguments: ["mcp"], environment: smokeServerEnvironment())
         defer {
             client.terminate()
@@ -298,7 +325,303 @@ enum OpenComputerUseSmokeSuite {
         try expect(state.contains("Last drag:"), "drag should update the drag status label")
         try expect(!state.contains("Last drag: none"), "drag should report a captured path")
 
+        // Optional window2 section (OPEN_COMPUTER_USE_SMOKE_WINDOW2=1): the
+        // fixture must be visible, so the headless instance above is stopped
+        // and a visible one takes over the shared state file.
+        if window2SmokeEnabled() {
+            try runWindow2Smoke(
+                client: client,
+                appName: appName,
+                headlessFixture: headlessFixture,
+                fixtureURL: fixtureURL
+            )
+        }
+
         print("Smoke suite completed.")
+    }
+
+    private static func window2SmokeEnabled(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        guard let rawValue = environment["OPEN_COMPUTER_USE_SMOKE_WINDOW2"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else {
+            return false
+        }
+
+        return ["1", "true", "yes", "on"].contains(rawValue)
+    }
+
+    /// Window2 surface smoke: real MCP round-trips against a visible
+    /// fixture with two top-level windows. Screenshot-dependent steps are
+    /// conditional because Screen Recording may be unavailable.
+    private static func runWindow2Smoke(
+        client: MCPClient,
+        appName: String,
+        headlessFixture: Process,
+        fixtureURL: URL
+    ) throws {
+        guard !NSScreen.screens.isEmpty else {
+            print("window2 smoke: skipped (no GUI session)")
+            return
+        }
+
+        print("W1. visible fixture takeover")
+        headlessFixture.terminate()
+        let headlessDeadline = Date().addingTimeInterval(5)
+        while headlessFixture.isRunning, Date() < headlessDeadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        try? FileManager.default.removeItem(at: FixtureBridge.stateFileURL)
+
+        let visibleFixture = Process()
+        visibleFixture.executableURL = fixtureURL
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "OPEN_COMPUTER_USE_FIXTURE_HEADLESS")
+        visibleFixture.environment = environment
+        visibleFixture.standardOutput = Pipe()
+        visibleFixture.standardError = Pipe()
+        try visibleFixture.run()
+        defer {
+            visibleFixture.terminate()
+        }
+
+        guard let mainWindows = waitForFixtureWindowCount(client: client, appName: appName, expected: 1),
+              mainWindows.count == 1
+        else {
+            throw SmokeError.message("window2 smoke: the visible fixture window never appeared in list_windows")
+        }
+        let mainID = mainWindows[0]
+
+        print("W2. list_windows shows the fixture window")
+
+        print("W3. second window appears in list_windows")
+        try FixtureBridge.post(FixtureCommand(
+            kind: "open_window",
+            identifier: "fixture-second",
+            value: "Smoke Second Window"
+        ))
+        guard let windowIDs = waitForFixtureWindowCount(client: client, appName: appName, expected: 2),
+              let secondID = windowIDs.first(where: { $0 != mainID })
+        else {
+            throw SmokeError.message("window2 smoke: the second fixture window never appeared in list_windows")
+        }
+
+        print("W4. get_window resolves the second window")
+        let secondRef = try client.callTool("get_window", arguments: [
+            "window": ["app": appName, "id": secondID],
+        ])
+        let secondRefObject = try decodeJSONObject(secondRef)
+        try expect(
+            (secondRefObject?["id"] as? Int) == secondID,
+            "get_window should echo the requested window id"
+        )
+
+        print("W5. get_window_state observes the main window")
+        let mainState = try client.callTool("get_window_state", arguments: [
+            "window": ["app": appName, "id": mainID],
+            "include_text": true,
+        ])
+        let mainStateObject = try decodeJSONObject(mainState)
+        try expect(
+            ((mainStateObject?["window"] as? [String: Any])?["id"] as? Int) == mainID,
+            "get_window_state should echo the observed window id"
+        )
+        let tree = (mainStateObject?["accessibility"] as? [String: Any])?["tree"] as? String
+        try expect(!(tree ?? "").isEmpty, "get_window_state should include a non-empty accessibility tree")
+
+        print("W6. get_window_state rejects empty observations")
+        let empty = try client.callToolResult("get_window_state", arguments: [
+            "window": ["id": mainID],
+            "include_screenshot": false,
+            "include_text": false,
+        ])
+        try expect(
+            empty.isError && (empty.text ?? "").contains("must request include_text, include_screenshot, or both"),
+            "get_window_state must reject include_screenshot=false + include_text=false"
+        )
+
+        print("W7. coordinate input requires a prior screenshot observation")
+        let unobserved = try client.callToolResult("click", arguments: [
+            "window": ["id": secondID],
+            "x": 5.0,
+            "y": 5.0,
+        ])
+        try expect(
+            unobserved.isError && (unobserved.text ?? "").contains("call get_window_state"),
+            "clicking an unobserved window with x/y must be rejected"
+        )
+
+        let screenshots = mainStateObject?["screenshots"] as? [[String: Any]] ?? []
+        let screenshotID = screenshots.first?["id"] as? String
+
+        if let screenshotID {
+            print("W8. screenshot id lifecycle (screen capture available)")
+            let incrementIndex = try parseTreeElementIndex(tree: tree ?? "", identifier: "fixture-increment")
+            let clicked = try client.callTool("click", arguments: [
+                "window": ["id": mainID],
+                "element_index": incrementIndex,
+                "screenshotId": screenshotID,
+            ])
+            try expect(!clicked.isEmpty, "click with a fresh screenshotId should succeed")
+
+            let stale = try client.callToolResult("click", arguments: [
+                "window": ["id": mainID],
+                "element_index": incrementIndex,
+                "screenshotId": screenshotID,
+            ])
+            try expect(
+                stale.isError && (stale.text ?? "").contains("stale screenshot id"),
+                "a successful action must invalidate the screenshotId"
+            )
+        } else {
+            print("W8. screenshot id lifecycle: no screenshot available (Screen Recording missing), checking text-only observation")
+            let textOnly = try client.callToolResult("click", arguments: [
+                "window": ["id": mainID],
+                "x": 5.0,
+                "y": 5.0,
+            ])
+            try expect(
+                textOnly.isError && (textOnly.text ?? "").contains("include_screenshot"),
+                "coordinate input after a text-only observation must be rejected"
+            )
+        }
+
+        print("W9. activate_window brings the second window forward")
+        let activation = try client.callToolResult("activate_window", arguments: [
+            "window": ["id": secondID],
+        ])
+        if activation.isError {
+            let message = activation.text ?? ""
+            let trustMissing = !AXIsProcessTrusted()
+            let permissionRelated = message.contains("Accessibility")
+                || message.contains("permission")
+                || message.contains("Permission")
+                || (trustMissing && message.contains("could not be brought to the foreground"))
+            if permissionRelated {
+                print("W9. activate_window verification skipped (accessibility trust unavailable): \(message)")
+            } else {
+                throw SmokeError.message("activate_window failed: \(message)")
+            }
+        }
+
+        print("W10. unknown window ids report stale handles")
+        let stale = try client.callToolResult("get_window", arguments: [
+            "window": ["id": 999999],
+        ])
+        try expect(
+            stale.isError && (stale.text ?? "").hasPrefix("staleWindowHandle(999999):"),
+            "get_window with an unknown id must report the official stale handle error"
+        )
+
+        print("W11. same-bounds windows resolve independently")
+        // A second window at exactly the main window's frame with the same
+        // title: frame-based matching cannot disambiguate this, so the ids
+        // must each resolve to their own window (identity-based matching,
+        // or an explicit ambiguity error when the mapping is unavailable).
+        try FixtureBridge.post(FixtureCommand(
+            kind: "open_window",
+            identifier: "fixture-second-same-bounds",
+            value: "Smoke Second Window"
+        ))
+        guard let sameBoundsIDs = waitForFixtureWindowCount(client: client, appName: appName, expected: 2) else {
+            throw SmokeError.message("window2 smoke: the same-bounds fixture window never appeared in list_windows")
+        }
+        let sameBoundsID = sameBoundsIDs.first(where: { $0 != mainID }) ?? sameBoundsIDs[0]
+        for id in [mainID, sameBoundsID] {
+            let ref = try client.callTool("get_window", arguments: [
+                "window": ["app": appName, "id": id],
+            ])
+            let refObject = try decodeJSONObject(ref)
+            try expect(
+                (refObject?["id"] as? Int) == id,
+                "get_window must echo each same-bounds window id (got \(ref))"
+            )
+        }
+        let sameBoundsActivation = try client.callToolResult("activate_window", arguments: [
+            "window": ["id": sameBoundsID],
+        ])
+        if sameBoundsActivation.isError {
+            let message = sameBoundsActivation.text ?? ""
+            // Without accessibility trust (or the identity mapping) the
+            // activation is either skipped or must fail with the explicit
+            // ambiguity error — never a silent wrong-window activation.
+            guard message.contains("ambiguousWindow(") || message.contains("Accessibility") || message.contains("could not be brought to the foreground") else {
+                throw SmokeError.message("same-bounds activate_window failed unexpectedly: \(message)")
+            }
+            print("W11. same-bounds activation reported: \(message)")
+        }
+
+        print("W12. closed window ids are rejected as stale")
+        try FixtureBridge.post(FixtureCommand(
+            kind: "close_window",
+            identifier: "fixture-second",
+        ))
+        let closedStaleMessage = "staleWindowHandle(\(sameBoundsID)): the window is no longer open; re-observe with list_windows."
+        let closedDeadline = Date().addingTimeInterval(5)
+        var closedRejected = false
+        while Date() < closedDeadline {
+            let result = try client.callToolResult("get_window", arguments: [
+                "window": ["id": sameBoundsID],
+            ])
+            if result.isError {
+                if (result.text ?? "") == closedStaleMessage {
+                    closedRejected = true
+                    break
+                }
+                // Any other error is a smoke failure; surface it.
+                throw SmokeError.message("window2 smoke: unexpected error for the closed window: \(result.text ?? "")")
+            }
+            // The close command is asynchronous; poll until it lands.
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        try expect(
+            closedRejected,
+            "get_window on the closed window must report the official stale handle error"
+        )
+    }
+
+    private static func decodeJSONObject(_ text: String) throws -> [String: Any]? {
+        guard let object = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else {
+            throw SmokeError.message("window2 smoke: expected a JSON object, got: \(text.prefix(120))")
+        }
+        return object
+    }
+
+    private static func waitForFixtureWindowCount(
+        client: MCPClient,
+        appName: String,
+        expected: Int,
+        timeout: TimeInterval = 20
+    ) -> [Int]? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let list = try? client.callTool("list_windows", arguments: [:]),
+               let entries = try? JSONSerialization.jsonObject(with: Data(list.utf8)) as? [[String: Any]]
+            {
+                let ids = entries
+                    .filter { $0["app"] as? String == appName }
+                    .compactMap { $0["id"] as? Int }
+                if ids.count == expected {
+                    return ids
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        return nil
+    }
+
+    private static func parseTreeElementIndex(tree: String, identifier: String) throws -> String {
+        for rawLine in tree.split(separator: "\n") {
+            let line = String(rawLine)
+            guard let identifierRange = line.range(of: " ID: \(identifier) ") else {
+                continue
+            }
+            let prefix = line[..<identifierRange.lowerBound].trimmingCharacters(in: .whitespaces)
+            if let index = prefix.split(separator: " ").first.map(String.init), Int(index) != nil {
+                return index
+            }
+        }
+        throw SmokeError.message("window2 smoke: could not find \(identifier) in the accessibility tree")
     }
 
     private static func runCursorIdleSmoke(serverURL: URL, appName: String) throws {

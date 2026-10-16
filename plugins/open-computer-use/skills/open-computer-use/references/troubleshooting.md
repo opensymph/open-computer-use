@@ -85,6 +85,15 @@ If an element-targeted action fails:
 4. Prefer `perform_secondary_action` only for actions exposed in the state result.
 5. Use coordinate `click`, `scroll`, or `drag` only after the semantic route is unavailable.
 
+## Key Input Not Landing (macOS)
+
+If `press_key` returns success but the key never reaches the target:
+
+1. Check the user's input activity first: plain unmodified keys are dropped while the user is actively typing and deliver when input is quiet. See [macos-input.md](macos-input.md).
+2. Check the launch context: after a binary rebuild, TCC attribution can go stale per launch context (launchd silently loses Accessibility; the interactive shell usually keeps working).
+3. Switch to an activity-independent path: `type_text` (AX value write) for text, `set_value` for settable controls, `perform_secondary_action` (`AXPress`) for menu commands.
+4. Verify delivery by re-reading the text state before and after and diffing; retry once after a short pause before declaring the path broken.
+
 ## Desktop Session Issues
 
 Windows UI Automation and Linux AT-SPI require a live user desktop. SSH sessions, CI jobs, launch daemons, or services often do not have access to the GUI session even when the CLI binary starts successfully.

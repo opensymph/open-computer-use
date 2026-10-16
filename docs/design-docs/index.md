@@ -11,3 +11,4 @@
 ## 初始文档
 
 - `core-beliefs.md`
+- `macos-window-identity.md`：macOS window2 的窗口身份解析——same-bounds 窗口的 AX 树错配与 closed-window ghost（CGWindow 残留条目）的调查结论、identity 方案（`_AXUIElementGetWindow` SPI + 显式歧义错误 + AX-identity 存活检查）与保证。

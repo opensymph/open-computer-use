@@ -13,17 +13,16 @@ The macOS runtime requires macOS 14.0 or later. Windows and Linux use their own 
 
 It supports the same core tool surface across macOS, Linux, and Windows:
 `list_apps`, `get_app_state`, `click`, `perform_secondary_action`, `scroll`,
-`drag`, `type_text`, `press_key`, and `set_value`. The Windows runtime
-additionally implements the official Codex `window2` tools: `list_windows`,
+`drag`, `type_text`, `press_key`, and `set_value`. The macOS and Windows
+runtimes implement the official Codex `window2` tools: `list_windows`,
 `get_window`, `launch_app`, `get_window_state`, and `activate_window`, and the
 action tools accept an optional `window` argument (`{app, id, title}` with an
 opaque id from `list_windows`/`get_window_state`) plus `screenshotId` for
-coordinate actions. The macOS runtime natively implements `launch_app`
-(NSWorkspace/LaunchServices: launch by app name or bundle id, reuse a running
+coordinate actions; on macOS the id is a CGWindowID. `launch_app` launches by
+app name or bundle id on macOS (NSWorkspace/LaunchServices: reuse a running
 instance, background launch without stealing focus, returns `pid`,
-`bundleIdentifier`, `name`, and `windows[]`); on macOS the remaining window2
-tools, and on Linux all five window2 tools, return an explicit
-"not supported yet" error.
+`bundleIdentifier`, `name`, and `windows[]`) and is gated on Windows. On
+Linux all five window2 tools return an explicit "not supported yet" error.
 
 ## Core Workflow
 
@@ -48,7 +47,7 @@ tools, and on Linux all five window2 tools, return an explicit
 - Prefer semantic actions and `set_value` for editable controls. Use coordinate `click`, `scroll`, and `drag` only when the element tree does not expose a safer target.
 - Never press the Windows/Meta key or chords containing it (`win`, `super`, `cmd`, `meta`, `OS`); the runtime rejects these outright per the official safety policy.
 - Never automate terminal apps (Windows Terminal, cmd, PowerShell), password managers, or Windows security apps; the runtime denies these apps regardless of opt-in flags. On Windows the deny list also covers third-party security suites by display name (AVG Internet Security, Avast Premium Security, Bitdefender Security Center).
-- Window2 coordinates, screenshot ids, and element indexes are valid only for the observation that produced them; re-observe (`get_window_state`) after any action or error before retrying. In coordinate scroll mode pass `x`/`y` plus `scrollX`/`scrollY` pixel deltas and never `element_index`. On Windows, coordinate clicks/scrolls/drags additionally require a prior `get_window_state` with `include_screenshot: true` for that window, and are rejected if the window has moved or resized since the observation (re-observe and retry) or the point falls outside the screenshot bounds.
+- Window2 coordinates, screenshot ids, and element indexes are valid only for the observation that produced them; re-observe (`get_window_state`) after any action or error before retrying. In coordinate scroll mode pass `x`/`y` plus `scrollX`/`scrollY` pixel deltas and never `element_index`. On macOS and Windows, coordinate clicks/scrolls/drags additionally require a prior `get_window_state` with `include_screenshot: true` for that window, and are rejected if the window has moved or resized since the observation (re-observe and retry) or the point falls outside the screenshot bounds.
 - `mouse_button: "right"` with `click_count >= 2` is rejected on Windows (official policy: right double click is not supported); `type_text` payloads above 8192 UTF-16 code units are rejected — split long text into chunks.
 - `launch_app` and `activate_window` on Windows are gated by `OPEN_COMPUTER_USE_WINDOWS_ALLOW_APP_LAUNCH=1` and `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS=1` respectively.
 - `launch_app` on macOS is not feature-gated, but deny-listed apps (password managers) are never launched, a running instance is reused instead of starting a second one, and the app launches in the background without stealing focus.
@@ -57,6 +56,19 @@ tools, and on Linux all five window2 tools, return an explicit
 - The Windows runtime is a single self-contained Go executable: all 14 tools (UI Automation tree reads, Win32 window-message and SendInput actions, and the WGC/PrintWindow/GDI screenshot chain) run in-process with no PowerShell/.NET dependency. `OPEN_COMPUTER_USE_WINDOWS_BACKEND` no longer selects anything (setting it only prints a one-line deprecation warning). For crash isolation, each tool operation executes in a short-lived child of the same executable and the screenshot chain runs in a grandchild worker; this is internal and invisible to tool callers.
 - On macOS, do not enable `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` unless the user explicitly requested `click_method: "global"` or other diagnostic behavior that may move the real pointer.
 - On Windows and Linux, confirm the command is running inside the logged-in desktop session before assuming GUI automation is available.
+
+## macOS Input Delivery & Background Operation
+
+Observed on a single macOS 27 dev machine (see [references/macos-input.md](references/macos-input.md)); re-validate on other machines:
+
+- `type_text` is the first choice for text into editable elements: when the element is settable it uses the AX value-write path, which works on background windows regardless of user activity; only unsettable elements (e.g. terminals) fall back to keyboard input.
+- Menu commands: `perform_secondary_action` (`AXPress`) on a menu item element — the macOS `get_app_state` tree includes the menu bar (the window2 `get_window_state` tree does not). It runs without activation and is activity-independent.
+- `press_key` chords containing `cmd` are accepted by the macOS runtime and delivered in every observed condition, including to background apps. Treat destructive chords (`cmd+q`, `cmd+w`, …) as destructive actions and ask first; the Windows/Meta-key rejection in Operating Rules applies to the Windows runtime.
+- Plain unmodified `press_key` keys are delivered when the user's input is quiet but **dropped while the user is actively typing** (0/14 vs 28/28 in trials), regardless of window state (foreground/background, visible/hidden, any frontmost app). After posting one to a text target, verify by re-reading the text state; if dropped, retry after a short pause or switch to `type_text`.
+- Flagged single keys (`shift+a`) and the gated global-HID `input` path are unreliable on macOS (context-dependent / dropped in all observed conditions) — prefer the paths above.
+- Background operation without activation: element clicks, `set_value`, `type_text`, `AXPress`, and app-targeted `press_key` all work without stealing focus. Use `activate_window` only when the task requires the foreground, and return focus to the user's app afterward.
+- A new window of a background app may become visible when it is created. Do not use AppleScript to hide apps or windows; use the Computer Use tools and ask the user first if a visible change would be disruptive.
+- After a binary rebuild, TCC grants can go stale per launch context (launchd silently loses Accessibility; the shell context usually keeps working). If AX behavior degrades after a rebuild, re-run from the interactive shell or re-grant before suspecting code.
 
 ## Common CLI Actions
 
@@ -83,13 +95,14 @@ open-computer-use call --calls '[
 ]'
 ```
 
-Windows window2 flow (multi-window / modal targeting, opaque window id = HWND):
+Window2 flow (multi-window / modal targeting; opaque window id = HWND on Windows, CGWindowID on macOS):
 
 ```sh
 open-computer-use call list_windows
 open-computer-use call get_window_state --args '{"window":{"app":"Notepad","id":1051836},"include_text":true}'
 open-computer-use call click --args '{"window":{"id":1051836},"x":40,"y":20}'
 open-computer-use call scroll --args '{"window":{"id":1051836},"x":200,"y":200,"scrollY":600}'
+open-computer-use call activate_window --args '{"window":{"app":"Safari","id":51234}}'
 ```
 
 ## MCP Usage
@@ -108,4 +121,5 @@ Read [references/usage.md](references/usage.md) for JSON config examples, direct
 
 - [references/installation.md](references/installation.md): one-time CLI install, agent MCP install commands, and macOS permissions.
 - [references/usage.md](references/usage.md): MCP config, direct CLI calls, sequencing, and platform behavior.
+- [references/macos-input.md](references/macos-input.md): macOS key-delivery matrix, verify-and-retry protocol, invisible background window creation, and environment caveats.
 - [references/troubleshooting.md](references/troubleshooting.md): permission, desktop-session, app discovery, and action failures.

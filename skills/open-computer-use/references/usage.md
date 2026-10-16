@@ -46,7 +46,7 @@ get_window_state
 activate_window
 ```
 
-The first nine are the core tool surface and work on macOS, Windows, and Linux. The last five follow the window2 API: `launch_app` is implemented on macOS and Windows (gated on Windows), and `list_windows`, `get_window`, `get_window_state`, and `activate_window` are implemented on Windows only; on macOS and Linux they return an explicit `not supported yet` error when called.
+The first nine are the core tool surface and work on macOS, Windows, and Linux. The last five follow the window2 API and work on macOS and Windows (`launch_app` is gated on Windows; on macOS it is not feature-gated but deny-listed apps are never launched); on Linux all five return an explicit `not supported yet` error when called. The window id is an opaque integer: a CGWindowID on macOS and an HWND on Windows.
 
 ## Direct CLI Tool Calls
 
@@ -199,6 +199,31 @@ CLI:
 open-computer-use call launch_app --args '{"app":"Safari"}'
 open-computer-use call launch_app --args '{"app":"TextEdit"}'
 ```
+
+## Window Management (`list_windows`, `get_window`, `get_window_state`, `activate_window`)
+
+These tools are available on macOS and Windows for multi-window and modal targeting. The window object is `{"app", "id", "title"}`; `id` is opaque (CGWindowID on macOS, HWND on Windows) and must come from `list_windows`, `get_window`, `get_window_state`, or `launch_app` — never guess one or reuse an id across sessions. The flat `window_id` argument is accepted as an alias for `{"window": {"id": ...}}`.
+
+```sh
+open-computer-use call list_windows
+open-computer-use call get_window --args '{"window":{"app":"Safari","id":51234}}'
+open-computer-use call get_window_state --args '{"window":{"app":"Safari","id":51234}}'
+open-computer-use call get_window_state --args '{"window":{"app":"Safari","id":51234},"include_text":true}'
+open-computer-use call activate_window --args '{"window":{"app":"Safari","id":51234}}'
+```
+
+`get_window_state` returns pretty-printed JSON with `window`, `accessibility.tree` (plus `focused_element` / `selected_text` when `include_text` is `true`), and `screenshots[]` entries with an `id`, a data-URL PNG, and the window bounds as `width` / `height`. Defaults: `include_screenshot: true`, `include_text: false`.
+
+Window-targeted rules:
+
+- Every action tool accepts an optional `window` argument, which takes precedence over the legacy `app` argument.
+- Coordinate actions (`click` with `x` / `y`, `drag`, coordinate `scroll`) require a prior `get_window_state` for that window whose observation included a screenshot; `screenshotId` binds the action to that observation.
+- If the window moved or resized since the observation the action is rejected (`window bounds changed; call get_window_state before continuing`); points outside the captured pixels are rejected too (`(x, y) is outside screenshot bounds`).
+- Any successful action invalidates the window's cached screenshot ids; a stale id is rejected with `stale screenshot id; re-observe with get_window_state before retrying.`
+- Window-targeted calls against a closed window or an exited owning process are rejected before any work with `staleWindowHandle(<id>): the window is no longer open; re-observe with list_windows.` (or the process-exited variant). On macOS the liveness check is identity-based: a CGWindow entry that lingers in the window list after close but has no live accessibility identity in the owning app is reported stale, while a minimized window still resolves. When the identity check cannot be completed (no accessibility mapping available), unverifiable windows are never rejected — no alpha/bounds/layer heuristics.
+- On macOS, windows with identical bounds are matched by exact window identity, not geometry, so one window's screenshot is never paired with another window's accessibility tree. If the identity mapping is unavailable and several windows share the same bounds without a unique title, the call fails with an explicit `ambiguousWindow(<id>): ...` error instead of guessing.
+- `activate_window` brings the window to the foreground (unminimize + app activate + AX raise on macOS) and verifies the outcome; on macOS it is not feature-gated.
+- Deny-listed apps (password managers) are never operated on through the window2 tools.
 
 ## Platform Notes
 

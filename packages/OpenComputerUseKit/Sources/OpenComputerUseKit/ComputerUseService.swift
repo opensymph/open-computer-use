@@ -387,6 +387,14 @@ func canUseKeyboardTextFallback(role: String?, roleDescription: String?, isValue
         || roleDescription.contains("text entry")
 }
 
+/// type_text settable gate: an AX query error means "unknown", which is
+/// treated as not settable so the keyboard fallback chain still runs —
+/// unlike `setValueAttributeIsSettable`, which hard-fails so the
+/// `set_value` tool surfaces broken AX state instead of writing through it.
+func typeTextValueIsSettable(result: AXError, settable: Bool) -> Bool {
+    result == .success && settable
+}
+
 func isElectronScopedWebRowClickOptimizationTarget(appName: String, bundleIdentifier: String?) -> Bool {
     let normalizedBundleIdentifier = bundleIdentifier?
         .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -430,6 +438,18 @@ func shouldPreferContainingWebRowAXClickCandidate(
     return role == kAXStaticTextRole as String || role == kAXGroupRole as String || isSyntheticText
 }
 
+/// Observation binding for one window2 `get_window_state` call: the screenshot
+/// id issued to the caller, whether that observation carried an image, the
+/// window bounds at observation time, and the screenshot's pixel size.
+/// A successful window-targeted action invalidates the entry (screenshot ids
+/// are only valid for the observation that produced them).
+struct WindowScreenshotMeta: Equatable {
+    let id: String
+    let hasImage: Bool
+    let bounds: CGRect
+    let screenshotPixelSize: CGSize?
+}
+
 public final class ComputerUseService {
     private var snapshotsByApp: [String: AppSnapshot] = [:]
     // Insertion order of the cache keys above, for FIFO eviction.
@@ -438,7 +458,103 @@ public final class ComputerUseService {
     // screenshot is stripped (see refreshSnapshot) and the cache is bounded.
     private static let maxCachedSnapshots = 8
 
+    // Latest get_window_state observation per CGWindowID (window2 flow).
+    // Internal (not private) so tests can exercise the gate with synthetic
+    // observations; production code only mutates it through the methods below.
+    var windowScreenshotMeta: [CGWindowID: WindowScreenshotMeta] = [:]
+    // Service-global screenshot id counter: ids are `shot-{windowID}-{n}` and
+    // must be unique per service instance, not per window.
+    private var nextWindowScreenshotID = 0
+
     public init() {}
+
+    // MARK: - window2 observation binding
+
+    func windowScreenshotID(windowID: CGWindowID, counter: Int) -> String {
+        "shot-\(windowID)-\(counter)"
+    }
+
+    func issueWindowScreenshotID(windowID: CGWindowID, hasImage: Bool, bounds: CGRect, screenshotPixelSize: CGSize?) -> String? {
+        guard hasImage else {
+            return nil
+        }
+
+        nextWindowScreenshotID += 1
+        let id = windowScreenshotID(windowID: windowID, counter: nextWindowScreenshotID)
+        windowScreenshotMeta[windowID] = WindowScreenshotMeta(
+            id: id,
+            hasImage: hasImage,
+            bounds: bounds,
+            screenshotPixelSize: screenshotPixelSize
+        )
+        return id
+    }
+
+    func recordWindowObservationWithoutImage(windowID: CGWindowID, bounds: CGRect) {
+        windowScreenshotMeta[windowID] = WindowScreenshotMeta(
+            id: windowScreenshotID(windowID: windowID, counter: 0),
+            hasImage: false,
+            bounds: bounds,
+            screenshotPixelSize: nil
+        )
+    }
+
+    func invalidateWindowScreenshot(for windowID: CGWindowID) {
+        windowScreenshotMeta[windowID] = nil
+    }
+
+    /// Enforces the official screenshotId binding: a screenshotId is only
+    /// valid for the window whose latest get_window_state produced it.
+    func checkScreenshotID(_ screenshotID: String?, windowID: CGWindowID?) throws {
+        let trimmed = screenshotID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else {
+            return
+        }
+
+        guard let windowID else {
+            throw ComputerUseError.message("screenshotId requires window targeting; pass window from get_window_state and re-observe.")
+        }
+
+        guard let meta = windowScreenshotMeta[windowID], meta.id == trimmed else {
+            throw ComputerUseError.message("stale screenshot id; re-observe with get_window_state before retrying.")
+        }
+    }
+
+    /// Enforces the official observation binding for window2-targeted
+    /// coordinate input (click at x/y, coordinate scroll, drag): the window
+    /// must have been observed by get_window_state, the observation must
+    /// include a screenshot, the window bounds must be unchanged since the
+    /// observation, and the point must lie inside the screenshot pixels.
+    /// Element-targeted actions and the legacy app-keyed flow never reach
+    /// this gate.
+    func checkCoordinateGate(windowID: CGWindowID, x: Double, y: Double, currentBounds: CGRect?) throws {
+        guard let meta = windowScreenshotMeta[windowID] else {
+            throw ComputerUseError.message("call get_window_state before issuing coordinate input")
+        }
+
+        guard meta.hasImage else {
+            throw ComputerUseError.message("call get_window_state with include_screenshot before issuing coordinate input")
+        }
+
+        if let currentBounds, !boundsApproxEqual(currentBounds, meta.bounds) {
+            throw ComputerUseError.message("window bounds changed; call get_window_state before continuing")
+        }
+
+        if let pixelSize = meta.screenshotPixelSize,
+           x < 0 || y < 0 || x >= pixelSize.width || y >= pixelSize.height
+        {
+            throw ComputerUseError.message("(\(Int(x)), \(Int(y))) is outside screenshot bounds")
+        }
+    }
+
+    /// Quartz window-list bounds are floats; allow a small tolerance so a
+    /// window that has not actually moved does not trip the gate.
+    func boundsApproxEqual(_ lhs: CGRect, _ rhs: CGRect, tolerance: CGFloat = 2) -> Bool {
+        abs(lhs.minX - rhs.minX) <= tolerance
+            && abs(lhs.minY - rhs.minY) <= tolerance
+            && abs(lhs.width - rhs.width) <= tolerance
+            && abs(lhs.height - rhs.height) <= tolerance
+    }
 
     public func listApps() -> ToolCallResult {
         ToolCallResult.text(
@@ -485,6 +601,195 @@ public final class ComputerUseService {
         snapshotResult(for: try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits), style: .fullState)
     }
 
+    // MARK: - window2 observation
+
+    public func listWindows() throws -> ToolCallResult {
+        let payload: [[String: Any]] = WindowDirectory.listWindows().map(\.jsonObject)
+        let data = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .withoutEscapingSlashes]
+        )
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ComputerUseError.message("Failed to encode list_windows result as JSON.")
+        }
+
+        return ToolCallResult.text(text)
+    }
+
+    public func getWindow(window: WindowRef) throws -> ToolCallResult {
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        return try windowRefResult(resolved.ref)
+    }
+
+    public func activateWindow(window: WindowRef) throws -> ToolCallResult {
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        let activated = try WindowDirectory.activate(resolved)
+        return try windowRefResult(activated)
+    }
+
+    private func windowRefResult(_ ref: WindowRef) throws -> ToolCallResult {
+        let data = try JSONSerialization.data(
+            withJSONObject: ref.jsonObject,
+            options: [.prettyPrinted, .withoutEscapingSlashes]
+        )
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ComputerUseError.message("Failed to encode window reference as JSON.")
+        }
+
+        return ToolCallResult.text(text)
+    }
+
+    public func getWindowState(
+        window: WindowRef,
+        includeScreenshot: Bool,
+        includeText: Bool,
+        textLimit: SnapshotTextLimit = .defaults,
+        treeLimits: AccessibilityTreeLimits = .defaults
+    ) throws -> ToolCallResult {
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        let snapshot = try SnapshotBuilder.buildWindow(
+            for: resolved,
+            includeScreenshot: includeScreenshot,
+            textLimit: textLimit,
+            treeLimits: treeLimits,
+            recoveryPolicy: .readOnly
+        )
+
+        // Cache the observation for window-targeted action tools (the PNG is
+        // stripped, same as the app-keyed flow).
+        cacheWindowSnapshot(snapshot, windowID: resolved.ref.id)
+
+        // Record the observation binding so coordinate input can distinguish
+        // "never observed" from "observed without a screenshot" and detect
+        // moved/resized windows. Every successful observation records its
+        // meta, with or without an image. The meta bounds come from the
+        // live window list (the gate compares against the same source).
+        let windowBounds = WindowDirectory.currentBounds(for: resolved.ref.id)
+            ?? snapshot.windowBounds
+            ?? resolved.entry.bounds
+        let screenshotPNGData = includeScreenshot ? snapshot.screenshotPNGData : nil
+
+        var accessibility: [String: Any] = [
+            "tree": snapshot.treeLines.joined(separator: "\n"),
+        ]
+        if includeText {
+            if let focusedSummary = snapshot.focusedSummary, !focusedSummary.isEmpty {
+                accessibility["focused_element"] = focusedSummary
+            }
+            if let selectedText = snapshot.selectedText, !selectedText.isEmpty {
+                accessibility["selected_text"] = selectedText
+            }
+        }
+
+        var screenshots: [[String: Any]] = []
+        if let screenshotPNGData {
+            let shotID = issueWindowScreenshotID(
+                windowID: resolved.ref.id,
+                hasImage: true,
+                bounds: windowBounds,
+                screenshotPixelSize: pngPixelSize(of: screenshotPNGData)
+            )
+            // width/height report the window bounds (points); the pixel
+            // size travels in the observation meta for coordinate input.
+            screenshots.append([
+                "id": shotID ?? "",
+                "url": "data:image/png;base64," + screenshotPNGData.base64EncodedString(),
+                "width": windowBounds.width,
+                "height": windowBounds.height,
+                "originX": windowBounds.minX,
+                "originY": windowBounds.minY,
+                "zIndex": 0,
+            ])
+        } else {
+            recordWindowObservationWithoutImage(windowID: resolved.ref.id, bounds: windowBounds)
+        }
+
+        // The response window ref mirrors the observed snapshot (app name and
+        // window title from the runtime), like the Windows implementation.
+        let responseWindow = WindowRef(
+            app: snapshot.app.name,
+            id: window.id,
+            title: snapshot.windowTitle
+        )
+
+        let payload: [String: Any] = [
+            "window": responseWindow.jsonObject,
+            "accessibility": accessibility,
+            "screenshots": screenshots,
+        ]
+        let data = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .withoutEscapingSlashes]
+        )
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ComputerUseError.message("Failed to encode get_window_state result as JSON.")
+        }
+
+        var content = [ToolResultContentItem.text(text)]
+        if let screenshotPNGData {
+            content.append(.pngImage(screenshotPNGData))
+        }
+        return ToolCallResult(content: content)
+    }
+
+    // MARK: - window2 snapshot cache
+
+    private func windowCacheKey(_ windowID: CGWindowID) -> String {
+        "win:\(windowID)"
+    }
+
+    private func cacheWindowSnapshot(_ snapshot: AppSnapshot, windowID: CGWindowID) {
+        let key = windowCacheKey(windowID)
+        let cached = cacheableSnapshot(snapshot)
+        if snapshotsByApp[key] == nil {
+            snapshotCacheOrder.append(key)
+        }
+        snapshotsByApp[key] = cached
+        while snapshotCacheOrder.count > Self.maxCachedSnapshots {
+            let oldest = snapshotCacheOrder.removeFirst()
+            snapshotsByApp.removeValue(forKey: oldest)
+        }
+    }
+
+    private func windowSnapshot(for windowID: CGWindowID) throws -> AppSnapshot {
+        if let snapshot = snapshotsByApp[windowCacheKey(windowID)] {
+            return snapshot
+        }
+
+        throw ComputerUseError.message("No window state is available for window id \(windowID). Run get_window_state before action tools.")
+    }
+
+    /// Rebuilds the window snapshot after an action. Re-resolves the window
+    /// first so a process that exited mid-operation yields the official
+    /// staleWindowHandle error instead of a confusing accessibility failure.
+    @discardableResult
+    private func refreshWindowSnapshot(
+        for resolved: ResolvedWindow,
+        textLimit: SnapshotTextLimit = .defaults,
+        treeLimits: AccessibilityTreeLimits = .defaults,
+        recoveryPolicy: SnapshotRecoveryPolicy = .readOnly
+    ) throws -> AppSnapshot {
+        let fresh = try WindowDirectory.resolve(id: resolved.ref.id)
+        let snapshot = try SnapshotBuilder.buildWindow(
+            for: fresh,
+            includeScreenshot: true,
+            textLimit: textLimit,
+            treeLimits: treeLimits,
+            recoveryPolicy: recoveryPolicy
+        )
+        cacheWindowSnapshot(snapshot, windowID: fresh.ref.id)
+        return snapshot
+    }
+
+    /// Shared tail for window-targeted actions: invalidate the observation
+    /// binding (the successful action makes any cached screenshot id stale),
+    /// refresh the window snapshot, and render the action result.
+    private func windowActionResult(for resolved: ResolvedWindow, recoveryPolicy: SnapshotRecoveryPolicy = .readOnly) throws -> ToolCallResult {
+        invalidateWindowScreenshot(for: resolved.ref.id)
+        let snapshot = try refreshWindowSnapshot(for: resolved, recoveryPolicy: recoveryPolicy)
+        return snapshotResult(for: snapshot, style: .actionResult)
+    }
+
     public func click(
         app query: String,
         elementIndex: String?,
@@ -492,7 +797,8 @@ public final class ComputerUseService {
         y: Double?,
         clickCount: Int,
         mouseButton: String,
-        clickMethod: ClickMethod = .auto
+        clickMethod: ClickMethod = .auto,
+        screenshotID: String? = nil
     ) throws -> ToolCallResult {
         try validateClickMethod(
             clickMethod,
@@ -504,9 +810,111 @@ public final class ComputerUseService {
             mouseButton: mouseButton,
             clickCount: clickCount
         )
+        let button = try mouseButtonKindForToolArgument(mouseButton)
+        try checkScreenshotID(screenshotID, windowID: nil)
+        try rejectRightDoubleClick(button: button, clickCount: clickCount)
 
         let snapshot = try currentSnapshot(for: query)
+        try performClick(
+            snapshot: snapshot,
+            button: button,
+            elementIndex: elementIndex,
+            x: x,
+            y: y,
+            clickCount: clickCount,
+            clickMethod: clickMethod,
+            coordinateScreenshotPixelSize: screenshotPixelSize(snapshot: snapshot)
+        )
+
+        return snapshotResult(
+            for: try refreshSnapshot(
+                for: query,
+                recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod)
+            ),
+            style: .actionResult
+        )
+    }
+
+    /// window2 click: the `window` argument (opaque CGWindowID from
+    /// list_windows/get_window_state) takes precedence over any legacy app
+    /// argument. x/y are screenshot pixels and require a prior
+    /// get_window_state observation with a screenshot (coordinate gate).
+    public func click(
+        window: WindowRef,
+        elementIndex: String?,
+        x: Double?,
+        y: Double?,
+        clickCount: Int,
+        mouseButton: String,
+        clickMethod: ClickMethod = .auto,
+        screenshotID: String? = nil
+    ) throws -> ToolCallResult {
+        try validateClickMethod(
+            clickMethod,
+            hasElementIndex: elementIndex != nil,
+            environment: ProcessInfo.processInfo.environment
+        )
+        try validateSkyClickArguments(
+            method: clickMethod,
+            mouseButton: mouseButton,
+            clickCount: clickCount
+        )
         let button = try mouseButtonKindForToolArgument(mouseButton)
+        try checkScreenshotID(screenshotID, windowID: window.id)
+        try rejectRightDoubleClick(button: button, clickCount: clickCount)
+
+        if elementIndex == nil, let x, let y {
+            try checkCoordinateGate(
+                windowID: window.id,
+                x: x,
+                y: y,
+                currentBounds: WindowDirectory.currentBounds(for: window.id)
+            )
+        }
+
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        let snapshot = try windowSnapshot(for: resolved.ref.id)
+        try performClick(
+            snapshot: snapshot,
+            button: button,
+            elementIndex: elementIndex,
+            x: x,
+            y: y,
+            clickCount: clickCount,
+            clickMethod: clickMethod,
+            coordinateScreenshotPixelSize: windowScreenshotMeta[resolved.ref.id]?.screenshotPixelSize
+        )
+        invalidateWindowScreenshot(for: resolved.ref.id)
+
+        return snapshotResult(
+            for: try refreshWindowSnapshot(for: resolved, recoveryPolicy: .readOnly),
+            style: .actionResult
+        )
+    }
+
+    func rejectRightDoubleClick(button: MouseButtonKind, clickCount: Int) throws {
+        guard button == .right && clickCount >= 2 else {
+            return
+        }
+
+        throw ComputerUseError.message("right double click is not supported")
+    }
+
+    /// Shared click execution core for the app- and window-targeted flows.
+    /// `coordinateScreenshotPixelSize` carries the pixel size of the
+    /// observed screenshot for x/y conversion: the window flow passes the
+    /// get_window_state observation's pixel size (pixel semantics), the
+    /// legacy app flow passes the snapshot's own (unchanged behavior).
+    private func performClick(
+        snapshot: AppSnapshot,
+        button: MouseButtonKind,
+        elementIndex: String?,
+        x: Double?,
+        y: Double?,
+        clickCount: Int,
+        clickMethod: ClickMethod,
+        coordinateScreenshotPixelSize: CGSize?
+    ) throws {
         if snapshot.mode == .fixture {
             guard clickMethod == .auto else {
                 throw ComputerUseError.message(
@@ -524,17 +932,24 @@ public final class ComputerUseService {
                 moveVisualCursor(to: cursorTarget)
                 try FixtureBridge.post(FixtureCommand(kind: "click", identifier: identifier))
             } else if let x, let y {
-                let identifier = try fixtureIdentifier(at: CGPoint(x: x, y: y), snapshot: snapshot)
+                // x/y are screenshot pixels for window-targeted flows (the
+                // legacy app flow passes scale 1, so the point is unchanged).
+                let point = screenshotPixelToWindowPoint(
+                    CGPoint(x: x, y: y),
+                    screenshotPixelSize: coordinateScreenshotPixelSize ?? screenshotPixelSize(snapshot: snapshot),
+                    windowBounds: snapshot.windowBounds
+                )
+                let identifier = try fixtureIdentifier(at: point, snapshot: snapshot)
                 cursorTarget = fixtureVisualCursorTarget(identifier: identifier, snapshot: snapshot)
                 moveVisualCursor(to: cursorTarget)
-                try FixtureBridge.post(FixtureCommand(kind: "click", identifier: identifier, x: x, y: y))
+                try FixtureBridge.post(FixtureCommand(kind: "click", identifier: identifier, x: point.x, y: point.y))
             } else {
                 throw ComputerUseError.invalidArguments("click requires either element_index or x/y")
             }
 
             Thread.sleep(forTimeInterval: 0.15)
             pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return
         }
 
         if let elementIndex {
@@ -602,7 +1017,11 @@ public final class ComputerUseService {
             pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
         } else if let x, let y {
             let screenshotPoint = CGPoint(x: x, y: y)
-            let point = screenshotPixelToWindowPointInSnapshot(snapshot: snapshot, point: screenshotPoint)
+            let point = screenshotPixelToWindowPoint(
+                screenshotPoint,
+                screenshotPixelSize: coordinateScreenshotPixelSize ?? screenshotPixelSize(snapshot: snapshot),
+                windowBounds: snapshot.windowBounds
+            )
             let targetPoint = try windowPointToGlobalPoint(snapshot: snapshot, point: point)
             let cursorTarget = makeVisualCursorTarget(
                 at: targetPoint,
@@ -662,26 +1081,31 @@ public final class ComputerUseService {
         } else {
             throw ComputerUseError.invalidArguments("click requires either element_index or x/y")
         }
-
-        return snapshotResult(
-            for: try refreshSnapshot(
-                for: query,
-                recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod)
-            ),
-            style: .actionResult
-        )
     }
 
     public func performSecondaryAction(app query: String, elementIndex: String, action: String) throws -> ToolCallResult {
         let snapshot = try currentSnapshot(for: query)
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        try performSecondaryActionCore(action: action, elementIndex: elementIndex, record: record, snapshot: snapshot)
+        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+    }
 
+    public func performSecondaryAction(window: WindowRef, elementIndex: String, action: String) throws -> ToolCallResult {
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        let snapshot = try windowSnapshot(for: resolved.ref.id)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        try performSecondaryActionCore(action: action, elementIndex: elementIndex, record: record, snapshot: snapshot)
+        return try windowActionResult(for: resolved)
+    }
+
+    private func performSecondaryActionCore(action: String, elementIndex: String, record: ElementRecord, snapshot: AppSnapshot) throws {
         if snapshot.mode == .fixture {
             guard action.caseInsensitiveCompare("Raise") == .orderedSame else {
                 throw ComputerUseError.message(invalidSecondaryActionMessage(action: action, record: record))
             }
 
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            Thread.sleep(forTimeInterval: 0.15)
+            return
         }
 
         guard let rawAction = matchingAction(requested: action, record: record) else {
@@ -698,19 +1122,78 @@ public final class ComputerUseService {
         }
 
         Thread.sleep(forTimeInterval: 0.15)
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
     }
 
     public func scroll(app query: String, direction: String, elementIndex: String, pages: Double) throws -> ToolCallResult {
-        let normalized = direction.lowercased()
-        guard ["up", "down", "left", "right"].contains(normalized) else {
+        try validateScrollPageArguments(direction: direction, pages: pages)
+        let snapshot = try currentSnapshot(for: query)
+        try scrollByPagesCore(direction: direction, elementIndex: elementIndex, pages: pages, snapshot: snapshot)
+        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+    }
+
+    /// window2 element-mode scroll: page deltas on an element of the
+    /// observed window (snapshot from the latest get_window_state).
+    public func scroll(window: WindowRef, direction: String, elementIndex: String, pages: Double) throws -> ToolCallResult {
+        try validateScrollPageArguments(direction: direction, pages: pages)
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        let snapshot = try windowSnapshot(for: resolved.ref.id)
+        try scrollByPagesCore(direction: direction, elementIndex: elementIndex, pages: pages, snapshot: snapshot)
+        return try windowActionResult(for: resolved)
+    }
+
+    // Argument validation happens before any snapshot lookup so bad
+    // arguments fail fast with the official message.
+    private func validateScrollPageArguments(direction: String, pages: Double) throws {
+        guard ["up", "down", "left", "right"].contains(direction.lowercased()) else {
             throw ComputerUseError.message("Invalid scroll direction: \(direction)")
         }
         guard pages.isFinite, pages > 0 else {
             throw ComputerUseError.message("pages must be > 0")
         }
+    }
 
+    /// window2 coordinate scroll (window targeting): x/y are screenshot
+    /// pixels and require a prior get_window_state observation with a
+    /// screenshot (coordinate gate).
+    public func scroll(window: WindowRef, x: Double, y: Double, scrollX: Double, scrollY: Double, screenshotID: String? = nil) throws -> ToolCallResult {
+        try checkScreenshotID(screenshotID, windowID: window.id)
+        try checkCoordinateGate(
+            windowID: window.id,
+            x: x,
+            y: y,
+            currentBounds: WindowDirectory.currentBounds(for: window.id)
+        )
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        let snapshot = try windowSnapshot(for: resolved.ref.id)
+        try performCoordinateScroll(
+            snapshot: snapshot,
+            x: x,
+            y: y,
+            scrollX: scrollX,
+            scrollY: scrollY,
+            coordinateScreenshotPixelSize: windowScreenshotMeta[resolved.ref.id]?.screenshotPixelSize
+        )
+        return try windowActionResult(for: resolved)
+    }
+
+    /// Coordinate scroll on the legacy app flow: x/y keep the legacy
+    /// window-point semantics (get_app_state never writes screenshot meta).
+    public func scroll(app query: String, x: Double, y: Double, scrollX: Double, scrollY: Double, screenshotID: String? = nil) throws -> ToolCallResult {
+        try checkScreenshotID(screenshotID, windowID: nil)
         let snapshot = try currentSnapshot(for: query)
+        try performCoordinateScroll(
+            snapshot: snapshot,
+            x: x,
+            y: y,
+            scrollX: scrollX,
+            scrollY: scrollY,
+            coordinateScreenshotPixelSize: screenshotPixelSize(snapshot: snapshot)
+        )
+        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+    }
+
+    private func scrollByPagesCore(direction: String, elementIndex: String, pages: Double, snapshot: AppSnapshot) throws {
+        let normalized = direction.lowercased()
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
 
         if snapshot.mode == .fixture {
@@ -719,7 +1202,7 @@ public final class ComputerUseService {
             }
             try FixtureBridge.post(FixtureCommand(kind: "scroll", identifier: identifier, direction: normalized, pages: pages))
             Thread.sleep(forTimeInterval: 0.15)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return
         }
 
         if let repeatCount = integralScrollPageCount(pages),
@@ -729,22 +1212,47 @@ public final class ComputerUseService {
                 _ = AXUIElementPerformAction(element, rawAction as CFString)
                 Thread.sleep(forTimeInterval: 0.05)
             }
-        } else if let point = try globalPoint(for: record, snapshot: snapshot) {
-            try performScrollEvent(
-                at: point,
-                direction: normalized,
-                pages: pages,
-                targetDescription: "element_index=\(elementIndex)",
-                snapshot: snapshot
-            )
-        } else {
+            return
+        }
+
+        guard let point = try globalPoint(for: record, snapshot: snapshot) else {
             throw ComputerUseError.stateUnavailable("element \(elementIndex) has no scrollable frame")
         }
 
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+        try performScrollEvent(
+            at: point,
+            direction: normalized,
+            pages: pages,
+            targetDescription: "element_index=\(elementIndex)",
+            snapshot: snapshot
+        )
     }
 
-    public func drag(app query: String, fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> ToolCallResult {
+    private func performCoordinateScroll(
+        snapshot: AppSnapshot,
+        x: Double,
+        y: Double,
+        scrollX: Double,
+        scrollY: Double,
+        coordinateScreenshotPixelSize: CGSize?
+    ) throws {
+        let point = screenshotPixelToWindowPoint(
+            CGPoint(x: x, y: y),
+            screenshotPixelSize: coordinateScreenshotPixelSize ?? screenshotPixelSize(snapshot: snapshot),
+            windowBounds: snapshot.windowBounds
+        )
+        let targetPoint = try windowPointToGlobalPoint(snapshot: snapshot, point: point)
+        try performPixelScroll(
+            at: targetPoint,
+            deltaX: scrollX,
+            deltaY: scrollY,
+            targetDescription: "x=\(Int(x)) y=\(Int(y)) scrollX=\(Int(scrollX)) scrollY=\(Int(scrollY))",
+            snapshot: snapshot
+        )
+    }
+
+    public func drag(app query: String, fromX: Double, fromY: Double, toX: Double, toY: Double, screenshotID: String? = nil) throws -> ToolCallResult {
+        try checkScreenshotID(screenshotID, windowID: nil)
         let snapshot = try currentSnapshot(for: query)
         if snapshot.mode == .fixture {
             try FixtureBridge.post(FixtureCommand(kind: "drag", identifier: "fixture-drag-pad", x: fromX, y: fromY, toX: toX, toY: toY))
@@ -763,41 +1271,116 @@ public final class ComputerUseService {
         return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
     }
 
+    /// window2 drag: both endpoints are screenshot pixels of the observed
+    /// window and must pass the coordinate gate.
+    public func drag(window: WindowRef, fromX: Double, fromY: Double, toX: Double, toY: Double, screenshotID: String? = nil) throws -> ToolCallResult {
+        try checkScreenshotID(screenshotID, windowID: window.id)
+        let currentBounds = WindowDirectory.currentBounds(for: window.id)
+        try checkCoordinateGate(windowID: window.id, x: fromX, y: fromY, currentBounds: currentBounds)
+        try checkCoordinateGate(windowID: window.id, x: toX, y: toY, currentBounds: currentBounds)
+
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        let snapshot = try windowSnapshot(for: resolved.ref.id)
+        let pixelSize = windowScreenshotMeta[resolved.ref.id]?.screenshotPixelSize
+        let start = screenshotPixelToWindowPoint(
+            CGPoint(x: fromX, y: fromY),
+            screenshotPixelSize: pixelSize ?? screenshotPixelSize(snapshot: snapshot),
+            windowBounds: snapshot.windowBounds
+        )
+        let end = screenshotPixelToWindowPoint(
+            CGPoint(x: toX, y: toY),
+            screenshotPixelSize: pixelSize ?? screenshotPixelSize(snapshot: snapshot),
+            windowBounds: snapshot.windowBounds
+        )
+
+        if snapshot.mode == .fixture {
+            try FixtureBridge.post(FixtureCommand(kind: "drag", identifier: "fixture-drag-pad", x: start.x, y: start.y, toX: end.x, toY: end.y))
+        } else {
+            try performDragEvent(
+                from: try windowPointToGlobalPoint(snapshot: snapshot, point: start),
+                to: try windowPointToGlobalPoint(snapshot: snapshot, point: end),
+                targetDescription: "from=(\(Int(fromX)), \(Int(fromY))) to=(\(Int(toX)), \(Int(toY)))",
+                snapshot: snapshot
+            )
+        }
+        return try windowActionResult(for: resolved)
+    }
+
     public func typeText(app query: String, text: String) throws -> ToolCallResult {
         let snapshot = try currentSnapshot(for: query)
+        try typeTextCore(text: text, snapshot: snapshot)
+        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+    }
+
+    /// window2 type_text: input goes to the observed window's owning app
+    /// (keyboard input is process-targeted, not window-targeted).
+    public func typeText(window: WindowRef, text: String) throws -> ToolCallResult {
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        let snapshot = try windowSnapshot(for: resolved.ref.id)
+        try typeTextCore(text: text, snapshot: snapshot)
+        return try windowActionResult(for: resolved)
+    }
+
+    private func typeTextCore(text: String, snapshot: AppSnapshot) throws {
         if snapshot.mode == .fixture {
             try FixtureBridge.post(FixtureCommand(kind: "type_text", identifier: "fixture-input", value: text))
             Thread.sleep(forTimeInterval: 0.15)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return
         }
 
         if try typeTextBySettingFocusedValueIfAvailable(text, in: snapshot) {
             Thread.sleep(forTimeInterval: 0.1)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return
         }
 
-        guard try canTypeTextUsingKeyboardFallback(in: snapshot) else {
+        guard canTypeTextUsingKeyboardFallback(in: snapshot) else {
             throw ComputerUseError.stateUnavailable("type_text requires a focused editable text element. Click a text entry area first, or use set_value on a settable text element.")
         }
 
         try InputSimulation.typeText(text, pid: snapshot.app.pid)
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
     }
 
     public func pressKey(app query: String, key: String) throws -> ToolCallResult {
         let snapshot = try currentSnapshot(for: query)
+        try pressKeyCore(key: key, snapshot: snapshot)
+        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+    }
+
+    /// window2 press_key: keys are posted to the observed window's owning
+    /// app (keyboard input is process-targeted, not window-targeted).
+    public func pressKey(window: WindowRef, key: String) throws -> ToolCallResult {
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        let snapshot = try windowSnapshot(for: resolved.ref.id)
+        try pressKeyCore(key: key, snapshot: snapshot)
+        return try windowActionResult(for: resolved)
+    }
+
+    private func pressKeyCore(key: String, snapshot: AppSnapshot) throws {
         if snapshot.mode == .fixture {
             try FixtureBridge.post(FixtureCommand(kind: "press_key", identifier: "fixture-key-capture", value: key))
             Thread.sleep(forTimeInterval: 0.15)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return
         }
 
         try InputSimulation.pressKey(key, pid: snapshot.app.pid)
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
     }
 
     public func setValue(app query: String, elementIndex: String, value: String) throws -> ToolCallResult {
         let snapshot = try currentSnapshot(for: query)
+        try setValueCore(elementIndex: elementIndex, value: value, snapshot: snapshot)
+        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+    }
+
+    /// window2 set_value: the element must come from the observed window's
+    /// latest get_window_state snapshot.
+    public func setValue(window: WindowRef, elementIndex: String, value: String) throws -> ToolCallResult {
+        let resolved = try WindowDirectory.resolve(id: window.id)
+        let snapshot = try windowSnapshot(for: resolved.ref.id)
+        try setValueCore(elementIndex: elementIndex, value: value, snapshot: snapshot)
+        return try windowActionResult(for: resolved)
+    }
+
+    private func setValueCore(elementIndex: String, value: String, snapshot: AppSnapshot) throws {
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
 
         if snapshot.mode == .fixture {
@@ -810,7 +1393,7 @@ public final class ComputerUseService {
             try FixtureBridge.post(FixtureCommand(kind: "set_value", identifier: identifier, value: value))
             Thread.sleep(forTimeInterval: 0.15)
             settleVisualCursor(at: cursorTarget)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return
         }
 
         guard let element = record.element else {
@@ -837,7 +1420,6 @@ public final class ComputerUseService {
         }
 
         settleVisualCursor(at: cursorTarget)
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
     }
 
     private func currentSnapshot(for query: String) throws -> AppSnapshot {
@@ -1192,6 +1774,15 @@ public final class ComputerUseService {
         )
     }
 
+    /// type_text-only settable check: AX query errors (such as -25205) are
+    /// treated as "not verified settable" so the keyboard fallback chain
+    /// still runs instead of surfacing a raw AX error.
+    private func isValueSettableForTypeText(_ element: AXUIElement) -> Bool {
+        var settable = DarwinBoolean(false)
+        let result = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
+        return typeTextValueIsSettable(result: result, settable: settable.boolValue)
+    }
+
     private func bestElement(containing point: CGPoint, in snapshot: AppSnapshot) -> ElementRecord? {
         snapshot.elements.values
             .filter { $0.localFrame?.contains(point) ?? false }
@@ -1454,7 +2045,7 @@ public final class ComputerUseService {
             return false
         }
 
-        guard try isSettableForSetValue(element: element, attribute: kAXValueAttribute) else {
+        guard isValueSettableForTypeText(element) else {
             return false
         }
 
@@ -1470,7 +2061,7 @@ public final class ComputerUseService {
         }
     }
 
-    private func canTypeTextUsingKeyboardFallback(in snapshot: AppSnapshot) throws -> Bool {
+    private func canTypeTextUsingKeyboardFallback(in snapshot: AppSnapshot) -> Bool {
         guard let element = snapshot.focusedElement else {
             return false
         }
@@ -1482,7 +2073,7 @@ public final class ComputerUseService {
         return canUseKeyboardTextFallback(
             role: role,
             roleDescription: roleDescription,
-            isValueSettable: try isSettableForSetValue(element: element, attribute: kAXValueAttribute)
+            isValueSettable: isValueSettableForTypeText(element)
         )
     }
 
@@ -1862,6 +2453,29 @@ public final class ComputerUseService {
         }
 
         try InputSimulation.scrollTargeted(at: eventPoint, direction: direction, pages: pages, pid: snapshot.app.pid)
+    }
+
+    private func performPixelScroll(
+        at point: CGPoint,
+        deltaX: Double,
+        deltaY: Double,
+        targetDescription: String,
+        snapshot: AppSnapshot
+    ) throws {
+        let eventPoint = inputEventPoint(fromScreenStatePoint: point)
+
+        if globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) {
+            debugInputFallback(
+                tool: "scroll",
+                targetDescription: targetDescription,
+                snapshot: snapshot
+            )
+            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try InputSimulation.scrollGloballyPixels(at: eventPoint, deltaX: deltaX, deltaY: deltaY)
+            return
+        }
+
+        try InputSimulation.scrollTargetedPixels(at: eventPoint, deltaX: deltaX, deltaY: deltaY, pid: snapshot.app.pid)
     }
 
     private func performDragEvent(

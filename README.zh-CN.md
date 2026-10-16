@@ -27,7 +27,7 @@
 | `press_key` | 按键或组合键（`ctrl+s`、`return`、`page_up`…）。 |
 | `set_value` | 直接设置可写控件的值。 |
 
-另有五个窗口级工具——`list_windows`、`get_window`、`get_window_state`、`launch_app`、`activate_window`——遵循新的 window2 API。`launch_app` 在 Windows 和 macOS 上可用；其余四个当前仅在 Windows 上可用（macOS / Linux 进行中）。
+另有五个窗口级工具——`list_windows`、`get_window`、`get_window_state`、`launch_app`、`activate_window`——遵循新的 window2 API，Windows 和 macOS 均可用（Linux 进行中）；macOS 上窗口 id 即 CGWindowID，动作工具同样接受可选 `window` 参数与 `screenshotId` 坐标参数。
 
 ## 快速开始
 
@@ -97,7 +97,7 @@ npx skills add opensymph/open-computer-use -g -a claude-code --skill open-comput
 
 | 平台 | 运行时 | 说明 |
 | --- | --- | --- |
-| macOS | Swift | 视觉光标、权限引导、`sky_click` 后台点击；含显示级桌面命令（见英文 README）。 |
+| macOS | Swift | 视觉光标、权限引导、`sky_click` 后台点击、完整 window2 API；含显示级桌面命令（见英文 README）。 |
 | Windows | Go 单 exe | UI Automation + Win32，操作进程隔离，完整 window2 API；含显示级桌面命令（见英文 README）。 |
 | Linux | Go 单二进制 | 原生 AT-SPI2 over D-Bus，零运行时依赖；含显示级 X11 命令（见英文 README）。 |
 

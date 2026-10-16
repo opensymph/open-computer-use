@@ -90,6 +90,8 @@ final class FixtureAppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDele
     private var counter = 0
     private var activationLossCount = 0
     private var keyWindowLossCount = 0
+    private var secondWindow: NSWindow?
+    private var dialogWindow: NSWindow?
     private weak var observedScrollView: NSScrollView?
     private var commandObserver: NSObjectProtocol?
     private let headless: Bool
@@ -212,6 +214,132 @@ final class FixtureAppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDele
     private func handleIncrement() {
         counter += 1
         counterLabel.stringValue = "Counter: \(counter)"
+        updateExportedState()
+    }
+
+    // Multi-window support for the window2 surface: an optional second
+    // top-level window (openable/closable, title configurable so identical
+    // titles can be exercised; `sameBounds` places it at exactly the main
+    // window's frame so same-bounds identity resolution can be exercised)
+    // and a fixture dialog window.
+    private func buildSecondWindow(title: String, sameBounds: Bool = false) {
+        if let existing = secondWindow {
+            existing.title = title
+            if sameBounds {
+                existing.setFrame(window.frame, display: true)
+            }
+            updateExportedState()
+            return
+        }
+
+        let frame = window.frame
+        let second = NSWindow(
+            contentRect: NSRect(x: frame.maxX + 40, y: frame.minY, width: 420, height: 320),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        // `setFrame` addresses the outer frame (title bar included), i.e.
+        // the exact CGWindow bounds — required for the same-bounds case.
+        if sameBounds {
+            second.setFrame(frame, display: true)
+        }
+        second.title = title
+        second.setAccessibilityIdentifier("fixture-second-window")
+        second.delegate = self
+        second.isReleasedWhenClosed = false
+
+        let contentView = NSView()
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        second.contentView = contentView
+
+        let descriptionLabel = NSTextField(wrappingLabelWithString: "Second fixture window.")
+        descriptionLabel.setAccessibilityIdentifier("fixture-second-label")
+
+        let closeButton = NSButton(title: "Close Window", target: self, action: #selector(handleSecondWindowClose))
+        closeButton.bezelStyle = .rounded
+        closeButton.setAccessibilityIdentifier("fixture-second-close")
+
+        let stack = NSStackView(views: [descriptionLabel, closeButton])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 20),
+        ])
+
+        secondWindow = second
+        if headless {
+            second.orderOut(nil)
+        } else {
+            second.makeKeyAndOrderFront(nil)
+        }
+        updateExportedState()
+    }
+
+    private func buildDialogWindow() {
+        guard dialogWindow == nil else {
+            return
+        }
+
+        let frame = window.frame
+        let dialog = NSWindow(
+            contentRect: NSRect(x: frame.minX + 120, y: frame.maxY - 60, width: 360, height: 180),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        dialog.title = "Fixture Dialog"
+        dialog.delegate = self
+        dialog.isReleasedWhenClosed = false
+
+        let contentView = NSView()
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        dialog.contentView = contentView
+
+        let messageLabel = NSTextField(wrappingLabelWithString: "This is a fixture dialog.")
+        messageLabel.setAccessibilityIdentifier("fixture-dialog-label")
+
+        let okButton = NSButton(title: "OK", target: self, action: #selector(handleDialogOK))
+        okButton.bezelStyle = .rounded
+        okButton.keyEquivalent = "\r"
+        okButton.setAccessibilityIdentifier("fixture-dialog-ok")
+
+        let stack = NSStackView(views: [messageLabel, okButton])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 16
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+        ])
+
+        dialogWindow = dialog
+        if headless {
+            dialog.orderOut(nil)
+        } else {
+            dialog.makeKeyAndOrderFront(nil)
+        }
+        updateExportedState()
+    }
+
+    @objc
+    private func handleSecondWindowClose() {
+        secondWindow?.close()
+        secondWindow = nil
+        updateExportedState()
+    }
+
+    @objc
+    private func handleDialogOK() {
+        dialogWindow?.close()
+        dialogWindow = nil
         updateExportedState()
     }
 
@@ -347,6 +475,28 @@ final class FixtureAppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDele
             window.makeFirstResponder(keyCaptureView)
             keyCaptureView.needsDisplay = true
             updateExportedState()
+        case ("open_window", "fixture-second"):
+            buildSecondWindow(title: command.value ?? "Fixture Second Window")
+        case ("open_window", "fixture-second-same-bounds"):
+            buildSecondWindow(title: command.value ?? "Fixture Second Window", sameBounds: true)
+        case ("close_window", "fixture-second"):
+            if secondWindow != nil {
+                handleSecondWindowClose()
+            }
+        case ("minimize_window", "fixture-second"):
+            if let secondWindow {
+                secondWindow.miniaturize(nil)
+            }
+        case ("restore_window", "fixture-second"):
+            if let secondWindow {
+                secondWindow.deminiaturize(nil)
+            }
+        case ("show_dialog", "fixture-dialog"):
+            buildDialogWindow()
+        case ("dismiss_dialog", "fixture-dialog"):
+            if dialogWindow != nil {
+                handleDialogOK()
+            }
         default:
             break
         }
@@ -377,7 +527,8 @@ final class FixtureAppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDele
             isActive: NSApp.isActive,
             isKeyWindow: window.isKeyWindow,
             activationLossCount: activationLossCount,
-            keyWindowLossCount: keyWindowLossCount
+            keyWindowLossCount: keyWindowLossCount,
+            keyWindowTitle: NSApp.keyWindow?.title
         )
 
         try? FixtureBridge.writeState(state)

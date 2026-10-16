@@ -208,6 +208,122 @@ enum SnapshotBuilder {
         )
     }
 
+    /// window2 variant of `build` (observation never restores minimized
+    /// windows or activates the app; that is `activate_window`'s job):
+    /// targets an exact CGWindowID instead of
+    /// the app's focused window, renders only that window (no menu bar),
+    /// and captures a screenshot only when `includeScreenshot` is true.
+    /// CGWindowIDs are never invented — they come from the live window
+    /// list via `WindowDirectory.resolve`.
+    static func buildWindow(
+        for resolved: ResolvedWindow,
+        includeScreenshot: Bool,
+        textLimit: SnapshotTextLimit = .defaults,
+        treeLimits: AccessibilityTreeLimits = .defaults,
+        recoveryPolicy: SnapshotRecoveryPolicy = .readOnly
+    ) throws -> AppSnapshot {
+        let app = RunningAppDescriptor(
+            name: resolved.ref.app,
+            bundleIdentifier: resolved.bundleIdentifier,
+            pid: resolved.pid,
+            runningApplication: resolved.runningApplication
+        )
+
+        if app.name == FixtureBridge.appName, let fixtureState = try FixtureBridge.readState() {
+            return buildFixtureSnapshot(
+                app: app,
+                state: fixtureState,
+                window: resolved.entry,
+                screenshotPNGData: includeScreenshot
+                    ? WindowCapture
+                        .capture(
+                            windowID: resolved.entry.windowID,
+                            bounds: resolved.entry.bounds,
+                            layer: resolved.entry.layer
+                        )
+                        .pngDataIfAvailable()
+                    : nil
+            )
+        }
+
+        let permissions = PermissionDiagnostics.current()
+        guard permissions.accessibilityTrusted else {
+            throw ComputerUseError.permissionDenied("Accessibility permission is required. Run `open-computer-use doctor` and grant access to Open Computer Use.")
+        }
+
+        let appElement = AXUIElementCreateApplication(app.pid)
+        enableBestEffortAccessibilityModes(appElement)
+        let systemWide = AXUIElementCreateSystemWide()
+        let focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
+
+        var targetEntry = resolved.entry
+
+        // The accessibility root must be the window backing the captured
+        // CGWindowID. Same-bounds ambiguity fails explicitly instead of
+        // guessing: serving window A's capture with window B's tree is a
+        // correctness violation.
+        func rootWindowElement(for entry: CGWindowEntry) throws -> AXUIElement? {
+            switch WindowDirectory.matchAXWindow(appElement: appElement, entry: entry) {
+            case .matched(let window):
+                return window
+            case .ambiguous(let count):
+                throw ComputerUseError.message(
+                    WindowDirectory.ambiguousWindowMessage(id: resolved.ref.id, app: app.name, count: count)
+                )
+            case .notFound:
+                return nil
+            }
+        }
+
+        var rootWindow = try rootWindowElement(for: targetEntry)
+        if rootWindow == nil, recoveryPolicy == .allowActivation {
+            if let refreshedEntry = WindowDirectory.currentEntry(for: resolved.ref.id) {
+                targetEntry = refreshedEntry
+                rootWindow = try rootWindowElement(for: targetEntry)
+            }
+            if rootWindow == nil, recoverVisibleWindow(for: app, appElement: appElement, preferredWindow: nil) {
+                targetEntry = WindowDirectory.currentEntry(for: resolved.ref.id) ?? targetEntry
+                rootWindow = try rootWindowElement(for: targetEntry)
+            }
+        }
+
+        guard let rootWindow else {
+            throw ComputerUseError.stateUnavailable(computerUseNoWindowFoundMessage)
+        }
+
+        // A minimized window has no usable on-screen capture; restore it
+        // before matching and capturing when recovery is allowed.
+        if recoveryPolicy == .allowActivation, boolValue(of: rootWindow, attribute: kAXMinimizedAttribute) == true {
+            if unminimize(rootWindow) {
+                Thread.sleep(forTimeInterval: windowVisibilityRecoveryDelay)
+                if let refreshedEntry = WindowDirectory.currentEntry(for: resolved.ref.id) {
+                    targetEntry = refreshedEntry
+                }
+            }
+        }
+
+        let windowCapture = includeScreenshot
+            ? WindowCapture.capture(windowID: targetEntry.windowID, bounds: targetEntry.bounds, layer: targetEntry.layer)
+            : WindowCapture(windowID: targetEntry.windowID, layer: targetEntry.layer, bounds: targetEntry.bounds, image: nil)
+
+        let windowTitle = stringValue(of: rootWindow, attribute: kAXTitleAttribute)
+            ?? (targetEntry.title?.isEmpty == false ? targetEntry.title : nil)
+
+        return buildAccessibilitySnapshot(
+            app: app,
+            appElement: appElement,
+            rootElement: rootWindow,
+            windowTitle: windowTitle,
+            windowCapture: windowCapture,
+            focusedApplication: focusedApplication,
+            systemWide: systemWide,
+            textLimit: textLimit,
+            treeLimits: treeLimits,
+            renderMenuBar: false,
+            restrictFocusToRoot: true
+        )
+    }
+
     private static func buildAccessibilitySnapshot(
         app: RunningAppDescriptor,
         appElement: AXUIElement,
@@ -217,11 +333,22 @@ enum SnapshotBuilder {
         focusedApplication: AXUIElement?,
         systemWide: AXUIElement,
         textLimit: SnapshotTextLimit,
-        treeLimits: AccessibilityTreeLimits
+        treeLimits: AccessibilityTreeLimits,
+        renderMenuBar: Bool = true,
+        restrictFocusToRoot: Bool = false
     ) -> AppSnapshot {
         let windowBounds = windowCapture.bounds
         let screenshotPNGData = windowCapture.pngDataIfAvailable()
-        let focusedElement = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
+        var focusedElement = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
+        // The app-level focused element can live in a sibling window of the
+        // same app; a window snapshot must never expose (or let type_text
+        // write into) another window's element.
+        if restrictFocusToRoot, let focused = focusedElement, !CFEqual(focused, rootElement) {
+            let owningWindow = copyElement(focused, attribute: kAXWindowAttribute)
+            if !(owningWindow.map { CFEqual($0, rootElement) } ?? false) {
+                focusedElement = nil
+            }
+        }
         let selectedText = focusedElement.flatMap { copySelectedText($0, textLimit: textLimit) }
         let context = RenderContext(
             windowBounds: windowBounds,
@@ -232,7 +359,8 @@ enum SnapshotBuilder {
 
         var renderer = TreeRenderer(context: context)
         renderer.render(rootElement)
-        if let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute),
+        if renderMenuBar,
+           let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute),
            !CFEqual(menuBar, rootElement)
         {
             renderer.render(menuBar)
@@ -364,7 +492,12 @@ enum SnapshotBuilder {
         return copyElement(appElement, attribute: kAXFocusedUIElementAttribute)
     }
 
-    private static func buildFixtureSnapshot(app: RunningAppDescriptor, state: FixtureAppState) -> AppSnapshot {
+    private static func buildFixtureSnapshot(
+        app: RunningAppDescriptor,
+        state: FixtureAppState,
+        window: CGWindowEntry? = nil,
+        screenshotPNGData: Data? = nil
+    ) -> AppSnapshot {
         var lines: [String] = []
 
         var records: [Int: ElementRecord] = [:]
@@ -393,13 +526,19 @@ enum SnapshotBuilder {
             }
         }
 
+        // When a specific CG window is the target (window2 flow), its live
+        // bounds and title win over the state file so the coordinate pipeline
+        // and screenshot metadata stay bound to the observed window.
+        let windowBounds = window?.bounds ?? state.windowBounds.cgRect
+        let windowTitle = (window?.title?.isEmpty == false ? window!.title : nil) ?? state.windowTitle
+
         return AppSnapshot(
             app: app,
-            windowTitle: state.windowTitle,
-            windowBounds: state.windowBounds.cgRect,
-            targetWindowID: nil,
-            targetWindowLayer: nil,
-            screenshotPNGData: nil,
+            windowTitle: windowTitle,
+            windowBounds: windowBounds,
+            targetWindowID: window?.windowID,
+            targetWindowLayer: window?.layer,
+            screenshotPNGData: screenshotPNGData,
             mode: .fixture,
             treeLines: lines,
             focusedSummary: focusedSummary,
@@ -418,11 +557,17 @@ private func enableBestEffortAccessibilityModes(_ appElement: AXUIElement) {
     _ = AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
 }
 
-private struct WindowCapture {
+struct WindowCapture {
     let windowID: CGWindowID
     let layer: Int
     let bounds: CGRect
     let image: CGImage?
+
+    /// Captures one specific window by CGWindowID through the shared
+    /// ScreenCaptureKit path (no second screenshot implementation).
+    static func capture(windowID: CGWindowID, bounds: CGRect, layer: Int) -> WindowCapture {
+        WindowCapture(windowID: windowID, layer: layer, bounds: bounds, image: captureImage(windowID: windowID, bounds: bounds))
+    }
 
     static func resolve(for pid: pid_t, titleHint: String?) -> WindowCapture? {
         guard let infoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
@@ -574,6 +719,21 @@ func boundedScreenshotPNGData(
     }
 
     return best
+}
+
+func pngPixelSize(of data: Data) -> CGSize? {
+    guard
+        let imageSource = CGImageSourceCreateWithData(data as CFData, nil),
+        let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any],
+        let pixelWidth = properties[kCGImagePropertyPixelWidth] as? CGFloat,
+        let pixelHeight = properties[kCGImagePropertyPixelHeight] as? CGFloat,
+        pixelWidth > 0,
+        pixelHeight > 0
+    else {
+        return nil
+    }
+
+    return CGSize(width: pixelWidth, height: pixelHeight)
 }
 
 private func pngData(for image: CGImage) -> Data? {

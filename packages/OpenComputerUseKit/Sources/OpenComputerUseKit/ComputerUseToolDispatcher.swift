@@ -57,21 +57,93 @@ public final class ComputerUseToolDispatcher {
         self.service = service
     }
 
-    private func hasWindow2Arguments(_ arguments: [String: Any]) -> Bool {
-        arguments.keys.contains { key in
-            key == "window" || key == "window_id" || key == "screenshotId" || key == "scrollX" || key == "scrollY"
-        }
+    // Official window2 action targeting: the `window` object (or the flat
+    // `window_id` alias) takes precedence over the legacy `app` argument;
+    // with neither present the unified missing-argument error applies.
+    private enum ActionTarget {
+        case window(WindowRef)
+        case app(String)
     }
 
-    private func window2NotSupportedError() -> ComputerUseError {
-        .message("Window-targeted actions are not supported yet on macOS; use the legacy app-targeted arguments.")
+    private func actionTarget(_ arguments: [String: Any]) throws -> ActionTarget {
+        if let window = try WindowArgumentParsing.optional(arguments) {
+            return .window(window)
+        }
+
+        if let app = optionalString("app", in: arguments), !app.isEmpty {
+            return .app(app)
+        }
+
+        throw ComputerUseError.message("Missing required argument: provide either window (from list_windows/get_window_state) or app")
+    }
+
+    private func optionalBool(_ key: String, in arguments: [String: Any]) throws -> Bool? {
+        guard let value = arguments[key] else {
+            return nil
+        }
+
+        if let bool = value as? Bool {
+            return bool
+        }
+
+        if let number = value as? NSNumber, CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
+            return number.boolValue
+        }
+
+        throw ComputerUseError.message("\(key) must be a boolean")
+    }
+
+    private func isCoordinateScroll(_ arguments: [String: Any]) -> Bool {
+        optionalDouble("scrollX", in: arguments) != nil || optionalDouble("scrollY", in: arguments) != nil
+    }
+
+    private func coordinateScrollArguments(_ arguments: [String: Any]) throws -> (x: Double, y: Double, scrollX: Double, scrollY: Double) {
+        guard let x = optionalDouble("x", in: arguments), let y = optionalDouble("y", in: arguments) else {
+            throw ComputerUseError.message("coordinate scroll requires both x and y (window-relative)")
+        }
+
+        let scrollX = optionalDouble("scrollX", in: arguments) ?? 0
+        let scrollY = optionalDouble("scrollY", in: arguments) ?? 0
+        guard scrollX != 0 || scrollY != 0 else {
+            throw ComputerUseError.message("coordinate scroll requires a non-zero scrollX or scrollY pixel delta")
+        }
+
+        return (x, y, scrollX, scrollY)
     }
 
     public func callTool(name: String, arguments: [String: Any]) throws -> ToolCallResult {
         switch name {
-        case "list_windows", "get_window", "get_window_state", "activate_window":
-            // Official window2 surface: implemented on the Windows runtime first.
-            throw ComputerUseError.message("\(name) is not supported yet on macOS; use the legacy app-targeted tools.")
+        case "list_windows":
+            return try service.listWindows()
+        case "get_window":
+            guard let window = try WindowArgumentParsing.required(arguments) else {
+                throw ComputerUseError.message("Missing required argument: window.id")
+            }
+            return try service.getWindow(window: window)
+        case "get_window_state":
+            guard let window = try WindowArgumentParsing.required(arguments) else {
+                throw ComputerUseError.message("Missing required argument: window")
+            }
+            let includeScreenshot = try optionalBool("include_screenshot", in: arguments) ?? true
+            let includeText = try optionalBool("include_text", in: arguments) ?? false
+            guard includeScreenshot || includeText else {
+                throw ComputerUseError.message("get_window_state must request include_text, include_screenshot, or both")
+            }
+            return try service.getWindowState(
+                window: window,
+                includeScreenshot: includeScreenshot,
+                includeText: includeText,
+                textLimit: try optionalTextLimit("text_limit", in: arguments) ?? .defaults,
+                treeLimits: AccessibilityTreeLimits.defaults.replacing(
+                    maxNodeCount: try optionalPositiveInt("max_tree_nodes", in: arguments),
+                    maxDepth: try optionalPositiveInt("max_tree_depth", in: arguments)
+                )
+            )
+        case "activate_window":
+            guard let window = try WindowArgumentParsing.required(arguments) else {
+                throw ComputerUseError.message("Missing required argument: window.id")
+            }
+            return try service.activateWindow(window: window)
         case "launch_app":
             return try service.launchApp(app: requireString("app", in: arguments))
         case "list_apps":
@@ -86,73 +158,149 @@ public final class ComputerUseToolDispatcher {
                 )
             )
         case "click":
-            if hasWindow2Arguments(arguments) {
-                throw window2NotSupportedError()
+            let clickMethod = try parseClickMethod(optionalString("click_method", in: arguments))
+            let mouseButton = optionalString("mouse_button", in: arguments) ?? "left"
+            _ = try mouseButtonKindForToolArgument(mouseButton)
+            let screenshotID = optionalString("screenshotId", in: arguments)
+
+            switch try actionTarget(arguments) {
+            case let .window(window):
+                return try service.click(
+                    window: window,
+                    elementIndex: optionalElementIndex(in: arguments),
+                    x: optionalDouble("x", in: arguments),
+                    y: optionalDouble("y", in: arguments),
+                    clickCount: clampedClickCount(optionalDouble("click_count", in: arguments)),
+                    mouseButton: mouseButton,
+                    clickMethod: clickMethod,
+                    screenshotID: screenshotID
+                )
+            case let .app(app):
+                return try service.click(
+                    app: app,
+                    elementIndex: optionalElementIndex(in: arguments),
+                    x: optionalDouble("x", in: arguments),
+                    y: optionalDouble("y", in: arguments),
+                    clickCount: clampedClickCount(optionalDouble("click_count", in: arguments)),
+                    mouseButton: mouseButton,
+                    clickMethod: clickMethod,
+                    screenshotID: screenshotID
+                )
             }
-            return try service.click(
-                app: requireString("app", in: arguments),
-                elementIndex: optionalElementIndex(in: arguments),
-                x: optionalDouble("x", in: arguments),
-                y: optionalDouble("y", in: arguments),
-                clickCount: clampedClickCount(optionalDouble("click_count", in: arguments)),
-                mouseButton: optionalString("mouse_button", in: arguments) ?? "left",
-                clickMethod: try parseClickMethod(optionalString("click_method", in: arguments))
-            )
         case "perform_secondary_action":
-            if hasWindow2Arguments(arguments) {
-                throw window2NotSupportedError()
+            switch try actionTarget(arguments) {
+            case let .window(window):
+                return try service.performSecondaryAction(
+                    window: window,
+                    elementIndex: requireElementIndex(in: arguments),
+                    action: requireString("action", in: arguments)
+                )
+            case let .app(app):
+                return try service.performSecondaryAction(
+                    app: app,
+                    elementIndex: requireElementIndex(in: arguments),
+                    action: requireString("action", in: arguments)
+                )
             }
-            return try service.performSecondaryAction(
-                app: requireString("app", in: arguments),
-                elementIndex: requireElementIndex(in: arguments),
-                action: requireString("action", in: arguments)
-            )
         case "scroll":
-            if hasWindow2Arguments(arguments) {
-                throw window2NotSupportedError()
+            switch try actionTarget(arguments) {
+            case let .window(window):
+                if isCoordinateScroll(arguments) {
+                    let (x, y, scrollX, scrollY) = try coordinateScrollArguments(arguments)
+                    return try service.scroll(
+                        window: window,
+                        x: x,
+                        y: y,
+                        scrollX: scrollX,
+                        scrollY: scrollY,
+                        screenshotID: optionalString("screenshotId", in: arguments)
+                    )
+                }
+
+                guard let direction = optionalString("direction", in: arguments), !direction.isEmpty else {
+                    throw ComputerUseError.message("Missing required argument: direction")
+                }
+                guard let elementIndex = optionalElementIndex(in: arguments) else {
+                    throw ComputerUseError.message("scroll requires either element_index + direction (page mode) or x/y + scrollX/scrollY (coordinate mode)")
+                }
+                return try service.scroll(
+                    window: window,
+                    direction: direction,
+                    elementIndex: elementIndex,
+                    pages: clampedScrollPages(optionalDouble("pages", in: arguments) ?? 1)
+                )
+            case let .app(app):
+                if isCoordinateScroll(arguments) {
+                    let (x, y, scrollX, scrollY) = try coordinateScrollArguments(arguments)
+                    return try service.scroll(
+                        app: app,
+                        x: x,
+                        y: y,
+                        scrollX: scrollX,
+                        scrollY: scrollY,
+                        screenshotID: optionalString("screenshotId", in: arguments)
+                    )
+                }
+
+                return try service.scroll(
+                    app: app,
+                    direction: requireString("direction", in: arguments),
+                    elementIndex: requireElementIndex(in: arguments),
+                    pages: clampedScrollPages(optionalDouble("pages", in: arguments) ?? 1)
+                )
             }
-            return try service.scroll(
-                app: requireString("app", in: arguments),
-                direction: requireString("direction", in: arguments),
-                elementIndex: requireElementIndex(in: arguments),
-                pages: clampedScrollPages(optionalDouble("pages", in: arguments) ?? 1)
-            )
         case "drag":
-            if hasWindow2Arguments(arguments) {
-                throw window2NotSupportedError()
+            let screenshotID = optionalString("screenshotId", in: arguments)
+
+            switch try actionTarget(arguments) {
+            case let .window(window):
+                return try service.drag(
+                    window: window,
+                    fromX: requireDouble("from_x", in: arguments),
+                    fromY: requireDouble("from_y", in: arguments),
+                    toX: requireDouble("to_x", in: arguments),
+                    toY: requireDouble("to_y", in: arguments),
+                    screenshotID: screenshotID
+                )
+            case let .app(app):
+                return try service.drag(
+                    app: app,
+                    fromX: requireDouble("from_x", in: arguments),
+                    fromY: requireDouble("from_y", in: arguments),
+                    toX: requireDouble("to_x", in: arguments),
+                    toY: requireDouble("to_y", in: arguments),
+                    screenshotID: screenshotID
+                )
             }
-            return try service.drag(
-                app: requireString("app", in: arguments),
-                fromX: requireDouble("from_x", in: arguments),
-                fromY: requireDouble("from_y", in: arguments),
-                toX: requireDouble("to_x", in: arguments),
-                toY: requireDouble("to_y", in: arguments)
-            )
         case "type_text":
-            if hasWindow2Arguments(arguments) {
-                throw window2NotSupportedError()
+            switch try actionTarget(arguments) {
+            case let .window(window):
+                return try service.typeText(window: window, text: requireString("text", in: arguments))
+            case let .app(app):
+                return try service.typeText(app: app, text: requireString("text", in: arguments))
             }
-            return try service.typeText(
-                app: requireString("app", in: arguments),
-                text: requireString("text", in: arguments)
-            )
         case "press_key":
-            if hasWindow2Arguments(arguments) {
-                throw window2NotSupportedError()
+            switch try actionTarget(arguments) {
+            case let .window(window):
+                return try service.pressKey(window: window, key: requireString("key", in: arguments))
+            case let .app(app):
+                return try service.pressKey(app: app, key: requireString("key", in: arguments))
             }
-            return try service.pressKey(
-                app: requireString("app", in: arguments),
-                key: requireString("key", in: arguments)
-            )
         case "set_value":
-            if hasWindow2Arguments(arguments) {
-                throw window2NotSupportedError()
+            switch try actionTarget(arguments) {
+            case let .window(window):
+                return try service.setValue(
+                    window: window,
+                    elementIndex: requireElementIndex(in: arguments),
+                    value: requireString("value", in: arguments)
+                )
+            case let .app(app):
+                return try service.setValue(
+                    app: app,
+                    elementIndex: requireElementIndex(in: arguments),
+                    value: requireString("value", in: arguments)
+                )
             }
-            return try service.setValue(
-                app: requireString("app", in: arguments),
-                elementIndex: requireElementIndex(in: arguments),
-                value: requireString("value", in: arguments)
-            )
         default:
             throw ComputerUseError.unsupportedTool(name)
         }

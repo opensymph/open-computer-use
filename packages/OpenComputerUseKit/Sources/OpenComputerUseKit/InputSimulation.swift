@@ -109,6 +109,38 @@ enum InputSimulation {
         Thread.sleep(forTimeInterval: 0.1)
     }
 
+    // window2 coordinate scroll: pixel deltas with the official sign
+    // convention (positive scrollY scrolls down, positive scrollX scrolls
+    // right), matching the line-based wheel1/wheel2 sign convention above.
+    static func scrollTargetedPixels(at point: CGPoint, deltaX: Double, deltaY: Double, pid: pid_t) throws {
+        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: clampedPixelWheelDelta(-deltaY), wheel2: clampedPixelWheelDelta(-deltaX), wheel3: 0) else {
+            throw ComputerUseError.message("Failed to create scroll event.")
+        }
+
+        event.location = point
+        event.postToPid(pid)
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+
+    static func scrollGloballyPixels(at point: CGPoint, deltaX: Double, deltaY: Double) throws {
+        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: clampedPixelWheelDelta(-deltaY), wheel2: clampedPixelWheelDelta(-deltaX), wheel3: 0) else {
+            throw ComputerUseError.message("Failed to create scroll event.")
+        }
+
+        event.location = point
+        event.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+
+    private static func clampedPixelWheelDelta(_ value: Double) -> Int32 {
+        guard value.isFinite else {
+            return 0
+        }
+
+        let clamped = min(Double(Int32.max), max(Double(Int32.min), value.rounded(.toNearestOrAwayFromZero)))
+        return Int32(clamped)
+    }
+
     static func scrollGlobally(at point: CGPoint, direction: String, pages: Double) throws {
         guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: wheel1(direction: direction, pages: pages), wheel2: wheel2(direction: direction, pages: pages), wheel3: 0) else {
             throw ComputerUseError.message("Failed to create scroll event.")

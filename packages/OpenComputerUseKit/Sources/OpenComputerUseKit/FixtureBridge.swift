@@ -49,6 +49,9 @@ public struct FixtureAppState: Codable, Sendable {
     public let isKeyWindow: Bool?
     public let activationLossCount: Int?
     public let keyWindowLossCount: Int?
+    /// Title of the app's current key window. Optional so state files written
+    /// by older fixture builds (single window only) still decode.
+    public let keyWindowTitle: String?
 
     public init(
         processIdentifier: pid_t? = nil,
@@ -59,7 +62,8 @@ public struct FixtureAppState: Codable, Sendable {
         isActive: Bool? = nil,
         isKeyWindow: Bool? = nil,
         activationLossCount: Int? = nil,
-        keyWindowLossCount: Int? = nil
+        keyWindowLossCount: Int? = nil,
+        keyWindowTitle: String? = nil
     ) {
         self.processIdentifier = processIdentifier
         self.windowTitle = windowTitle
@@ -70,6 +74,34 @@ public struct FixtureAppState: Codable, Sendable {
         self.isKeyWindow = isKeyWindow
         self.activationLossCount = activationLossCount
         self.keyWindowLossCount = keyWindowLossCount
+        self.keyWindowTitle = keyWindowTitle
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case processIdentifier
+        case windowTitle
+        case windowBounds
+        case focusedIdentifier
+        case elements
+        case isActive
+        case isKeyWindow
+        case activationLossCount
+        case keyWindowLossCount
+        case keyWindowTitle
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        processIdentifier = try container.decodeIfPresent(pid_t.self, forKey: .processIdentifier)
+        windowTitle = try container.decode(String.self, forKey: .windowTitle)
+        windowBounds = try container.decode(FixtureRect.self, forKey: .windowBounds)
+        focusedIdentifier = try container.decodeIfPresent(String.self, forKey: .focusedIdentifier)
+        elements = try container.decode([FixtureElementState].self, forKey: .elements)
+        isActive = try container.decodeIfPresent(Bool.self, forKey: .isActive)
+        isKeyWindow = try container.decodeIfPresent(Bool.self, forKey: .isKeyWindow)
+        activationLossCount = try container.decodeIfPresent(Int.self, forKey: .activationLossCount)
+        keyWindowLossCount = try container.decodeIfPresent(Int.self, forKey: .keyWindowLossCount)
+        keyWindowTitle = try container.decodeIfPresent(String.self, forKey: .keyWindowTitle)
     }
 }
 

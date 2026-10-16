@@ -27,7 +27,7 @@ Nine core tools, identical across all three platforms:
 | `press_key` | Press a key or chord (`ctrl+s`, `return`, `page_up`…). |
 | `set_value` | Set the value of a settable control directly. |
 
-Five additional window-level tools — `list_windows`, `get_window`, `get_window_state`, `launch_app`, `activate_window` — follow the newer window2 API. `launch_app` is available on Windows and macOS; the other four are currently available on Windows only (macOS and Linux in progress).
+Five additional window-level tools — `list_windows`, `get_window`, `get_window_state`, `launch_app`, `activate_window` — follow the newer window2 API and are available on Windows and macOS (Linux in progress). On macOS the window id is a CGWindowID, and the action tools accept the same optional `window` argument plus `screenshotId` for coordinate actions as on Windows.
 
 ## Quick start
 
@@ -97,7 +97,7 @@ npx skills add opensymph/open-computer-use -g -a claude-code --skill open-comput
 
 | Platform | Runtime | Notes |
 | --- | --- | --- |
-| macOS | Swift | Visual cursor, permission onboarding, `sky_click` background clicks; display-level desktop commands (see below). |
+| macOS | Swift | Visual cursor, permission onboarding, `sky_click` background clicks, full window2 API; display-level desktop commands (see below). |
 | Windows | Go, single exe | UI Automation + Win32, process-isolated operations, full window2 API; display-level desktop commands (see below). |
 | Linux | Go, single binary | Native AT-SPI2 over D-Bus; display-level X11 commands (see below). |
 

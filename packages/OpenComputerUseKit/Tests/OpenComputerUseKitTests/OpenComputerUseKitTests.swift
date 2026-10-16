@@ -1610,6 +1610,18 @@ final class OpenComputerUseKitTests: XCTestCase {
         }
     }
 
+    func testTypeTextValueGateTreatsAXQueryErrorsAsNotSettable() {
+        XCTAssertTrue(typeTextValueIsSettable(result: .success, settable: true))
+        XCTAssertFalse(typeTextValueIsSettable(result: .success, settable: false))
+
+        // AX query errors (the observed -25205 included) mean "not verified
+        // settable": type_text must fall through to the keyboard fallback
+        // instead of surfacing a raw AX error.
+        XCTAssertFalse(typeTextValueIsSettable(result: .attributeUnsupported, settable: false))
+        XCTAssertFalse(typeTextValueIsSettable(result: .cannotComplete, settable: true))
+        XCTAssertFalse(typeTextValueIsSettable(result: .failure, settable: true))
+    }
+
     func testMakeVisualCursorTargetUsesWindowRelativeElementCenter() {
         let screenMappings = [
             VisualCursorScreenMapping(
