@@ -69,9 +69,11 @@ public final class ComputerUseToolDispatcher {
 
     public func callTool(name: String, arguments: [String: Any]) throws -> ToolCallResult {
         switch name {
-        case "list_windows", "get_window", "launch_app", "get_window_state", "activate_window":
+        case "list_windows", "get_window", "get_window_state", "activate_window":
             // Official window2 surface: implemented on the Windows runtime first.
             throw ComputerUseError.message("\(name) is not supported yet on macOS; use the legacy app-targeted tools.")
+        case "launch_app":
+            return try service.launchApp(app: requireString("app", in: arguments))
         case "list_apps":
             return service.listApps()
         case "get_app_state":

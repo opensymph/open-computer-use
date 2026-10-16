@@ -39,7 +39,14 @@ drag
 type_text
 press_key
 set_value
+list_windows
+get_window
+launch_app
+get_window_state
+activate_window
 ```
+
+The first nine are the core tool surface and work on macOS, Windows, and Linux. The last five follow the window2 API: `launch_app` is implemented on macOS and Windows (gated on Windows), and `list_windows`, `get_window`, `get_window_state`, and `activate_window` are implemented on Windows only; on macOS and Linux they return an explicit `not supported yet` error when called.
 
 ## Direct CLI Tool Calls
 
@@ -138,6 +145,60 @@ OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 open-computer-use call click 
 Keep the environment override scoped as narrowly as possible. While it remains enabled, the existing `auto` route may also choose the global pointer path after accessibility cannot handle a click.
 
 Windows returns an unsupported error for `sky_click` and `global`; Linux returns an unsupported error for `app_post` and `sky_click`. An unsupported or failed explicit method does not fall back to `auto`.
+
+## Launching Apps (`launch_app`)
+
+`launch_app` starts an application so its windows can be targeted by the other tools. It is supported on macOS (native NSWorkspace/LaunchServices path, no permission or feature gate) and on Windows (requires `OPEN_COMPUTER_USE_WINDOWS_ALLOW_APP_LAUNCH=1`). It replaces shell workarounds such as `open -a Safari`.
+
+The tool accepts one argument, `app`:
+
+```json
+{"app": "Safari"}
+```
+
+On macOS, `app` accepts an app name (`"Safari"`), a bundle identifier (`"com.apple.Safari"`), or an explicit application path (`"/Applications/Safari.app"` — paths containing spaces work). Resolution order:
+
+1. A running instance whose name or bundle identifier matches (case-insensitive) is reused; a second instance is never started.
+2. An explicit path containing `/` that exists on disk.
+3. A bundle identifier (a query containing `.`) resolved through LaunchServices.
+4. An app name resolved through LaunchServices against the standard application locations.
+
+The launch runs in the background: the app is opened without activation, so the user's foreground app, keyboard focus, and window order are preserved. Deny-listed apps (password managers on macOS; terminal hosts, password managers, and security apps on Windows) are never launched.
+
+macOS returns this JSON on success:
+
+```json
+{
+  "pid": 870,
+  "bundleIdentifier": "com.apple.Safari",
+  "name": "Safari",
+  "windows": [
+    { "app": "Safari", "title": "", "id": 51234 }
+  ]
+}
+```
+
+`windows` lists the app's normal-level windows (`id` is a CGWindowID); titles are empty until the Open Computer Use app has been granted Screen Recording, while window ids are returned either way. Windowless apps are still a success with an empty `windows` list. Windows returns a single `window` reference (`{"app", "id", "title"}` with the main HWND) instead.
+
+Errors:
+
+- `appNotFound("query")` — no installed app matches the name, bundle identifier, or path.
+- `Computer Use is not allowed to use the app '<bundle id>' for safety reasons.` — the app is on the built-in deny list.
+- `launchFailed("query"): <reason>` — the app resolved but could not be started.
+
+MCP (any stdio client, e.g. OpenCode):
+
+```json
+{"name": "launch_app", "arguments": {"app": "Safari"}}
+{"name": "launch_app", "arguments": {"app": "com.apple.TextEdit"}}
+```
+
+CLI:
+
+```sh
+open-computer-use call launch_app --args '{"app":"Safari"}'
+open-computer-use call launch_app --args '{"app":"TextEdit"}'
+```
 
 ## Platform Notes
 

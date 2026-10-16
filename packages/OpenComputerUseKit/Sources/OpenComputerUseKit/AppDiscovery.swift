@@ -1,4 +1,5 @@
 import AppKit
+import CoreGraphics
 import CoreServices
 import Foundation
 
@@ -7,6 +8,18 @@ public struct RunningAppDescriptor {
     public let bundleIdentifier: String?
     public let pid: pid_t
     public let runningApplication: NSRunningApplication
+}
+
+public struct AppLaunchWindow {
+    public let id: CGWindowID
+    public let title: String?
+}
+
+public struct AppLaunchResult {
+    public let pid: pid_t
+    public let name: String
+    public let bundleIdentifier: String?
+    public let windows: [AppLaunchWindow]
 }
 
 struct ListedAppDescriptor {
@@ -166,11 +179,149 @@ enum AppDiscovery {
         throw ComputerUseError.appNotFound(normalizedQuery)
     }
 
+    // launch_app: launch through NSWorkspace/LaunchServices (never AppleScript),
+    // reuse a running instance instead of spawning duplicates, and keep the
+    // launch in the background so the user's foreground focus is preserved.
+    static func launch(_ query: String) throws -> AppLaunchResult {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else {
+            throw ComputerUseError.invalidArguments("app must be a non-empty app name or bundle identifier")
+        }
+
+        if isBundleIdentifierQuery(normalizedQuery), AppSafetyPolicy.isBlocked(bundleIdentifier: normalizedQuery) {
+            throw AppSafetyPolicy.permissionDenied(bundleIdentifier: normalizedQuery)
+        }
+
+        if let running = resolvedRunningApp(in: runningApps(), matching: normalizedQuery) {
+            // Defense in depth: re-check the resolved instance's real bundle id.
+            if AppSafetyPolicy.isBlocked(bundleIdentifier: running.bundleIdentifier) {
+                throw AppSafetyPolicy.permissionDenied(bundleIdentifier: running.bundleIdentifier ?? normalizedQuery)
+            }
+            // Re-open through LaunchServices so a running app with no windows
+            // receives a reopen event (like `open -a`), still without activating it.
+            if let bundleURL = running.runningApplication.bundleURL {
+                try openApplication(at: bundleURL, activates: false, name: normalizedQuery)
+                waitForFirstWindow(pid: running.pid)
+            }
+            return launchResult(for: running)
+        }
+
+        let appURL: URL
+        if normalizedQuery.contains("/") {
+            appURL = try validatedApplicationURL(forPath: normalizedQuery)
+        } else if isBundleIdentifierQuery(normalizedQuery),
+                  let resolvedURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: normalizedQuery) {
+            appURL = resolvedURL
+        } else if let resolvedURL = applicationURL(named: normalizedQuery) {
+            appURL = resolvedURL
+        } else {
+            throw ComputerUseError.appNotFound(normalizedQuery)
+        }
+
+        if AppSafetyPolicy.isBlocked(bundleIdentifier: Bundle(url: appURL)?.bundleIdentifier) {
+            throw AppSafetyPolicy.permissionDenied(
+                bundleIdentifier: Bundle(url: appURL)?.bundleIdentifier ?? normalizedQuery
+            )
+        }
+
+        let launchedApplication = try openApplication(at: appURL, activates: false, name: normalizedQuery)
+
+        guard let application = launchedApplication else {
+            throw ComputerUseError.message(
+                "launchFailed(\"\(normalizedQuery)\"): LaunchServices returned no application"
+            )
+        }
+
+        let descriptor = RunningAppDescriptor(
+            name: appName(application),
+            bundleIdentifier: application.bundleIdentifier,
+            pid: application.processIdentifier,
+            runningApplication: application
+        )
+
+        waitForFirstWindow(pid: descriptor.pid)
+
+        return launchResult(for: descriptor)
+    }
+
+    // Explicit paths must be an absolute, existing `.app` application bundle.
+    // `~` is expanded and symlinks are resolved so the deny-list check that
+    // follows sees the real bundle.
+    private static func validatedApplicationURL(forPath path: String) throws -> URL {
+        let expandedPath = (path as NSString).expandingTildeInPath
+        guard expandedPath.hasPrefix("/") else {
+            throw ComputerUseError.invalidArguments("app path must be an absolute path to an .app bundle")
+        }
+
+        let url = URL(fileURLWithPath: expandedPath).standardizedFileURL.resolvingSymlinksInPath()
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw ComputerUseError.appNotFound(path)
+        }
+
+        let isApplication = (try? url.resourceValues(forKeys: [.isApplicationKey]))?.isApplication ?? false
+        guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame, isApplication else {
+            throw ComputerUseError.invalidArguments("app path must point to an .app application bundle")
+        }
+
+        return url
+    }
+
+    // Give the app a brief moment to create its first window so the response
+    // can report available windows; windowless apps are still a successful
+    // launch (the windows list simply stays empty).
+    private static func waitForFirstWindow(pid: pid_t) {
+        let windowDeadline = Date(timeIntervalSinceNow: 2.5)
+        while windows(for: pid).isEmpty, Date() < windowDeadline {
+            pause(0.1)
+        }
+    }
+
+    private static func launchResult(for descriptor: RunningAppDescriptor) -> AppLaunchResult {
+        AppLaunchResult(
+            pid: descriptor.pid,
+            name: descriptor.name,
+            bundleIdentifier: descriptor.bundleIdentifier,
+            windows: windows(for: descriptor.pid)
+        )
+    }
+
+    static func windows(for pid: pid_t) -> [AppLaunchWindow] {
+        guard let infoList = CGWindowListCopyWindowInfo([], kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+
+        return infoList.compactMap { info in
+            guard
+                let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
+                ownerPID == pid,
+                let layer = info[kCGWindowLayer as String] as? Int,
+                layer == 0,
+                let number = info[kCGWindowNumber as String] as? NSNumber,
+                let bounds = info[kCGWindowBounds as String] as? [String: Any],
+                (bounds["Width"] as? CGFloat ?? 0) > 0,
+                (bounds["Height"] as? CGFloat ?? 0) > 0
+            else {
+                return nil
+            }
+
+            return AppLaunchWindow(
+                id: CGWindowID(number.uint32Value),
+                title: info[kCGWindowName as String] as? String
+            )
+        }
+    }
+
+    private final class LaunchedApplicationBox: @unchecked Sendable {
+        var application: NSRunningApplication?
+        var error: Error?
+    }
+
     private static func resolvedRunningApp(in descriptors: [RunningAppDescriptor], matching query: String) -> RunningAppDescriptor? {
-        if isBundleIdentifierQuery(query) {
-            return descriptors.first(where: { descriptor in
-                descriptor.bundleIdentifier?.caseInsensitiveCompare(query) == .orderedSame
-            })
+        if isBundleIdentifierQuery(query),
+           let match = descriptors.first(where: { descriptor in
+               descriptor.bundleIdentifier?.caseInsensitiveCompare(query) == .orderedSame
+           }) {
+            return match
         }
 
         return descriptors.first(where: { descriptor in
@@ -257,7 +408,7 @@ enum AppDiscovery {
             }
 
             if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: query) {
-                try openApplication(at: appURL)
+                try openApplication(at: appURL, activates: true, name: query)
             }
             return
         }
@@ -270,7 +421,7 @@ enum AppDiscovery {
             return
         }
 
-        try openApplication(at: appURL)
+        try openApplication(at: appURL, activates: true, name: query)
     }
 
     private static func applicationURL(named query: String) -> URL? {
@@ -312,36 +463,60 @@ enum AppDiscovery {
         return nil
     }
 
-    private static func openApplication(at appURL: URL) throws {
+    // Single LaunchServices entry point shared by `resolve` and `launch`.
+    // LaunchServices reuses a running instance (and delivers a reopen event
+    // when it has no windows) instead of spawning a duplicate.
+    @discardableResult
+    private static func openApplication(at appURL: URL, activates: Bool, name: String) throws -> NSRunningApplication? {
         let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = activates
+        let launchedBox = LaunchedApplicationBox()
         let semaphore = DispatchSemaphore(value: 0)
-        let errorBox = LaunchErrorBox()
 
-        NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { _, error in
-            errorBox.error = error
+        NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { application, error in
+            launchedBox.application = application
+            launchedBox.error = error
             semaphore.signal()
         }
 
-        waitForSignal(semaphore)
-
-        if let launchError = errorBox.error {
-            throw launchError
+        guard waitForSignal(semaphore) else {
+            throw ComputerUseError.message("launchFailed(\"\(name)\"): timed out waiting for LaunchServices")
         }
+
+        if let launchError = launchedBox.error {
+            throw ComputerUseError.message("launchFailed(\"\(name)\"): \(launchError.localizedDescription)")
+        }
+
+        return launchedBox.application
     }
 
-    private static func waitForSignal(_ semaphore: DispatchSemaphore) {
+    private static let launchServicesTimeout: TimeInterval = 20
+
+    /// Returns false when LaunchServices did not call back before the timeout,
+    /// so a stuck launch cannot block the serial MCP server forever.
+    @discardableResult
+    private static func waitForSignal(_ semaphore: DispatchSemaphore, timeout: TimeInterval = launchServicesTimeout) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+
         if Thread.isMainThread {
             while semaphore.wait(timeout: .now()) == .timedOut {
+                if Date() >= deadline {
+                    return false
+                }
                 RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
             }
-            return
+            return true
         }
 
-        semaphore.wait()
+        return semaphore.wait(timeout: .now() + timeout) == .success
     }
 
-    private final class LaunchErrorBox: @unchecked Sendable {
-        var error: Error?
+    private static func pause(_ interval: TimeInterval) {
+        if Thread.isMainThread {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: interval))
+        } else {
+            Thread.sleep(forTimeInterval: interval)
+        }
     }
 
     private static func recentUsageCutoff(referenceDate: Date = Date()) -> Date {
@@ -359,7 +534,19 @@ enum AppDiscovery {
     }
 
     private static func isBundleIdentifierQuery(_ query: String) -> Bool {
-        query.contains(".")
+        guard query.contains(".") else {
+            return false
+        }
+
+        // "TextEdit.app" and names with spaces are application names, not bundle ids.
+        if query.lowercased().hasSuffix(".app") {
+            return false
+        }
+
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.")
+        return query.unicodeScalars.allSatisfy { allowed.contains($0) }
+            && !query.hasPrefix(".")
+            && !query.hasSuffix(".")
     }
 
     private static func isUserFacingListApp(_ app: NSRunningApplication) -> Bool {
@@ -509,7 +696,7 @@ enum AppSafetyPolicy {
         "com.1password.safari",
         "com.bitwarden.desktop",
         "com.dashlane.dashlanephonefinal",
-        "com.lastpass.LastPass",
+        "com.lastpass.lastpass",
         "com.nordsec.nordpass",
         "me.proton.pass.electron",
         "me.proton.pass.catalyst",
@@ -520,7 +707,7 @@ enum AppSafetyPolicy {
             return false
         }
 
-        return blockedBundleIdentifiers.contains(bundleIdentifier)
+        return blockedBundleIdentifiers.contains(bundleIdentifier.lowercased())
     }
 
     static func permissionDenied(bundleIdentifier: String) -> ComputerUseError {

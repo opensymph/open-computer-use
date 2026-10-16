@@ -27,7 +27,7 @@ Nine core tools, identical across all three platforms:
 | `press_key` | Press a key or chord (`ctrl+s`, `return`, `page_up`…). |
 | `set_value` | Set the value of a settable control directly. |
 
-Five additional window-level tools — `list_windows`, `get_window`, `get_window_state`, `launch_app`, `activate_window` — follow the newer window2 API and are currently available on Windows (macOS and Linux in progress).
+Five additional window-level tools — `list_windows`, `get_window`, `get_window_state`, `launch_app`, `activate_window` — follow the newer window2 API. `launch_app` is available on Windows and macOS; the other four are currently available on Windows only (macOS and Linux in progress).
 
 ## Quick start
 

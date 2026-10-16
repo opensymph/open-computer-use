@@ -1,5 +1,11 @@
 # 功能发布记录
 
+## 2026-09
+
+| 日期 | 功能域 | 用户价值 | 变更摘要 |
+| --- | --- | --- | --- |
+| 2026-09-20 | macOS `launch_app` 原生实现 | AI agent 可以直接通过 `launch_app` MCP 工具启动 macOS 应用，不再需要 `open -a Safari` 之类的 shell 命令变通方案。支持按应用名、Bundle ID 或完整路径（含空格路径）解析；运行中实例直接复用而不重复启动；后台启动不抢用户前台焦点；密码管理器继续被内置 deny 名单拒绝；返回 `pid`/`bundleIdentifier`/`name`/`windows[]`（`CGWindowID`，title 依赖 Screen Recording 授权，窗口 id 无授权也返回）。 | macOS `AppDiscovery.launch`（NSWorkspace/LaunchServices，`NSWorkspace.OpenConfiguration.activates=false`，不引入 AppleScript、不新增 feature gate）、`ComputerUseService.launchApp` JSON 契约、dispatcher 将 `launch_app` 从 "not supported yet" 路由到原生路径；新增 7 个单测（dispatch/参数校验/不存在/空查询/deny 名单/真实启动+复用），smoke suite 对齐 14-tool 面；README（含 zh-CN）、SKILL、ARCHITECTURE、usage 参考文档同步更新。 |
+
 ## 2026-08
 
 | 日期 | 功能域 | 用户价值 | 变更摘要 |

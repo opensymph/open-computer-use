@@ -409,6 +409,7 @@ final class DesktopCommandTests: XCTestCase {
         XCTAssertEqual(plan.video.inputVideoPath, "/tmp/a.mp4")
         XCTAssertEqual(plan.playback.segments.count, 1)
         XCTAssertEqual(plan.tracks.clickEffects.count, 1)
+    }
 
     func testKeyDisplayLabelMapsReturn() {
         let label = keyDisplayLabel("ctrl+Return")

@@ -448,6 +448,35 @@ public final class ComputerUseService {
         )
     }
 
+    public func launchApp(app query: String) throws -> ToolCallResult {
+        let launched = try AppDiscovery.launch(query)
+
+        let windows: [[String: Any]] = launched.windows.map { window in
+            [
+                "app": launched.name,
+                "id": Int(window.id),
+                "title": window.title ?? "",
+            ]
+        }
+
+        let payload: [String: Any] = [
+            "pid": Int(launched.pid),
+            "bundleIdentifier": launched.bundleIdentifier ?? "",
+            "name": launched.name,
+            "windows": windows,
+        ]
+
+        let data = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .withoutEscapingSlashes]
+        )
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ComputerUseError.message("Failed to encode launch_app result as JSON.")
+        }
+
+        return ToolCallResult.text(text)
+    }
+
     public func getAppState(
         app query: String,
         textLimit: SnapshotTextLimit = .defaults,

@@ -27,7 +27,7 @@
 | `press_key` | 按键或组合键（`ctrl+s`、`return`、`page_up`…）。 |
 | `set_value` | 直接设置可写控件的值。 |
 
-另有五个窗口级工具——`list_windows`、`get_window`、`get_window_state`、`launch_app`、`activate_window`——遵循新的 window2 API，当前在 Windows 上可用（macOS / Linux 进行中）。
+另有五个窗口级工具——`list_windows`、`get_window`、`get_window_state`、`launch_app`、`activate_window`——遵循新的 window2 API。`launch_app` 在 Windows 和 macOS 上可用；其余四个当前仅在 Windows 上可用（macOS / Linux 进行中）。
 
 ## 快速开始
 

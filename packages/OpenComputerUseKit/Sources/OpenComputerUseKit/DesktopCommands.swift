@@ -240,7 +240,9 @@ public enum DesktopInputGate {
     public static let environmentKey = "OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT"
 
     public static func isEnabled(environment: [String: String]) -> Bool {
-        let value = environment[environmentKey]?.lowercased()
+        let value = environment[environmentKey]?
+            .trimmingCharacters(in: .whitespaces)
+            .lowercased()
         return value == "1" || value == "true" || value == "yes" || value == "on"
     }
 

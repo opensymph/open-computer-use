@@ -18,7 +18,11 @@ additionally implements the official Codex `window2` tools: `list_windows`,
 `get_window`, `launch_app`, `get_window_state`, and `activate_window`, and the
 action tools accept an optional `window` argument (`{app, id, title}` with an
 opaque id from `list_windows`/`get_window_state`) plus `screenshotId` for
-coordinate actions. On macOS and Linux these window2 tools return an explicit
+coordinate actions. The macOS runtime natively implements `launch_app`
+(NSWorkspace/LaunchServices: launch by app name or bundle id, reuse a running
+instance, background launch without stealing focus, returns `pid`,
+`bundleIdentifier`, `name`, and `windows[]`); on macOS the remaining window2
+tools, and on Linux all five window2 tools, return an explicit
 "not supported yet" error.
 
 ## Core Workflow
@@ -47,6 +51,7 @@ coordinate actions. On macOS and Linux these window2 tools return an explicit
 - Window2 coordinates, screenshot ids, and element indexes are valid only for the observation that produced them; re-observe (`get_window_state`) after any action or error before retrying. In coordinate scroll mode pass `x`/`y` plus `scrollX`/`scrollY` pixel deltas and never `element_index`. On Windows, coordinate clicks/scrolls/drags additionally require a prior `get_window_state` with `include_screenshot: true` for that window, and are rejected if the window has moved or resized since the observation (re-observe and retry) or the point falls outside the screenshot bounds.
 - `mouse_button: "right"` with `click_count >= 2` is rejected on Windows (official policy: right double click is not supported); `type_text` payloads above 8192 UTF-16 code units are rejected — split long text into chunks.
 - `launch_app` and `activate_window` on Windows are gated by `OPEN_COMPUTER_USE_WINDOWS_ALLOW_APP_LAUNCH=1` and `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOCUS_ACTIONS=1` respectively.
+- `launch_app` on macOS is not feature-gated, but deny-listed apps (password managers) are never launched, a running instance is reused instead of starting a second one, and the app launches in the background without stealing focus.
 - On Windows, `click_method: "global"` (and `input_method: "global"` on `press_key`/`type_text`/`scroll`/`drag`) activates the target window and injects real SendInput events — it moves the mouse pointer and steals keyboard focus. Only use it when the user explicitly opted in via `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1`; without the flag the runtime returns an explicit gated error.
 - On Windows, screenshots prefer Windows.Graphics.Capture (captures the window itself even when occluded, without the OS cursor), falling back to `PrintWindow` and GDI screen copy. Force one backend with `OPEN_COMPUTER_USE_WINDOWS_CAPTURE=wgc|print|gdi` (default `auto`); a forced backend that fails raises an error instead of silently degrading.
 - The Windows runtime is a single self-contained Go executable: all 14 tools (UI Automation tree reads, Win32 window-message and SendInput actions, and the WGC/PrintWindow/GDI screenshot chain) run in-process with no PowerShell/.NET dependency. `OPEN_COMPUTER_USE_WINDOWS_BACKEND` no longer selects anything (setting it only prints a one-line deprecation warning). For crash isolation, each tool operation executes in a short-lived child of the same executable and the screenshot chain runs in a grandchild worker; this is internal and invisible to tool callers.
