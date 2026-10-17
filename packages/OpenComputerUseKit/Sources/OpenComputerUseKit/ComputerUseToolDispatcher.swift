@@ -301,6 +301,8 @@ public final class ComputerUseToolDispatcher {
                     value: requireString("value", in: arguments)
                 )
             }
+        case "capture_display":
+            return try service.captureDisplay(displayID: optionalDisplayID(in: arguments))
         default:
             throw ComputerUseError.unsupportedTool(name)
         }
@@ -390,6 +392,52 @@ public final class ComputerUseToolDispatcher {
         }
 
         return try positiveInt(from: value, key: key, expectedDescription: "a positive integer")
+    }
+
+    // capture_display takes at most one optional unsigned-integer display_id;
+    // anything else (Boolean, fractional, negative, overflow, unexpected
+    // fields) is rejected rather than silently retargeting the capture.
+    private func optionalDisplayID(in arguments: [String: Any]) throws -> CGDirectDisplayID? {
+        for key in arguments.keys where key != "display_id" {
+            throw ComputerUseError.invalidArguments("capture_display does not accept argument '\(key)'")
+        }
+
+        guard let value = arguments["display_id"] else {
+            return nil
+        }
+
+        if value is Bool {
+            throw ComputerUseError.invalidArguments("display_id must be a non-negative integer")
+        }
+
+        if let number = value as? NSNumber, CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
+            throw ComputerUseError.invalidArguments("display_id must be a non-negative integer")
+        }
+
+        let numeric: Double
+        if let integer = value as? Int {
+            numeric = Double(integer)
+        } else if let double = value as? Double {
+            numeric = double
+        } else if let number = value as? NSNumber {
+            numeric = number.doubleValue
+        } else {
+            throw ComputerUseError.invalidArguments("display_id must be a non-negative integer")
+        }
+
+        guard numeric.isFinite, numeric.rounded(.towardZero) == numeric else {
+            throw ComputerUseError.invalidArguments("display_id must be a non-negative integer")
+        }
+
+        guard numeric >= 0 else {
+            throw ComputerUseError.invalidArguments("display_id must be a non-negative integer")
+        }
+
+        guard numeric <= Double(UInt32.max) else {
+            throw ComputerUseError.invalidArguments("display_id is outside the supported range (0...\(UInt32.max))")
+        }
+
+        return CGDirectDisplayID(numeric)
     }
 
     private func positiveInt(from value: Any, key: String, expectedDescription: String) throws -> Int {

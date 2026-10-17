@@ -736,7 +736,7 @@ func pngPixelSize(of data: Data) -> CGSize? {
     return CGSize(width: pixelWidth, height: pixelHeight)
 }
 
-private func pngData(for image: CGImage) -> Data? {
+func pngData(for image: CGImage) -> Data? {
     let bitmap = NSBitmapImageRep(cgImage: image)
     return bitmap.representation(using: .png, properties: [:])
 }
