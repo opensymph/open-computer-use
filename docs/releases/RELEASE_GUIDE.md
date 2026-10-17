@@ -165,7 +165,7 @@ gh run view -R opensymph/open-computer-use <run-id> --log-failed
 
 ## 当前已知边界
 
-- `Open Computer Use` 的 npm release 产物在没有配置组织级 `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` secrets 时，仍会退回 ad-hoc signing；配置后会先导入 `Developer ID Application` 证书，再按该 identity 统一签名；secrets 缺失时不会阻塞整条 release。
+- macOS App 的 stable 发版路径（`release.yml` → `build-macos-app.yml`）是 fail-closed 的路线 A：没有配置 `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` 或 `APPLE_NOTARY_*` secrets 时，App 构建直接失败，不会退回 ad-hoc signing、也不会跳过公证；打包前还会校验 Developer ID 签名来自批准的 team `DSA846ZFPA` 且 identifier 为 `com.ifuryst.opencomputeruse`，并要求 staple 校验通过。`release-app.yml` 预发布 App 同样要求签名+公证。ad-hoc 签名只用于本地开发构建（`OPEN_COMPUTER_USE_CODESIGN_MODE=adhoc`），不属于任何发布路径。npm 制品本身不含签名逻辑，直接内置该 App 构建产物。
 - `open-computer-use` npm root 包会内置六个 `os-arch` native artifacts，包体积会比 macOS-only 版本更大；release 前要确认 staging 包里包含 `dist/Open Computer Use.app`、`dist/linux/` 和 `dist/windows/`，并确认 launcher 没有声明 `optionalDependencies`。
 
 ## 如果 tag 已经打错了
