@@ -111,15 +111,15 @@ codesign --verify --deep --strict "${app_path}" \
 signature_details="$(codesign -dvvv "${app_path}" 2>&1)"
 
 if [[ "${notarized}" == "true" ]]; then
-  # The caller's assertion alone never ends up in the manifest: validate the
-  # staple before claiming notarization.
-  if command -v xcrun >/dev/null 2>&1; then
-    xcrun stapler validate "${app_path}" >/dev/null 2>&1 \
-      || fail "notarized=true was requested but stapler validate failed for ${app_path}"
-  else
-    spctl -a -t exec -vv "${app_path}" >/dev/null 2>&1 \
-      || fail "notarized=true was requested but spctl gatekeeper assessment failed for ${app_path} (no xcrun available)"
-  fi
+  # The caller's assertion alone never ends up in the manifest: the
+  # notarization staple must validate. Generic spctl gatekeeper assessment
+  # is not notarization evidence (it follows local policy and approvals, and
+  # trivially passes where Gatekeeper is disabled), so without stapler there
+  # is no way to prove notarization and the build fails closed.
+  command -v xcrun >/dev/null 2>&1 \
+    || fail "notarized=true was requested but xcrun/stapler is unavailable; cannot validate the notarization staple of ${app_path}"
+  xcrun stapler validate "${app_path}" >/dev/null 2>&1 \
+    || fail "notarized=true was requested but stapler validate failed for ${app_path}"
 fi
 
 info="${app_path}/Contents/Info.plist"
