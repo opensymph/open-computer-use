@@ -730,7 +730,7 @@ final class OpenComputerUseKitTests: XCTestCase {
 
         let image = try XCTUnwrap(object["image"] as? [String: Any])
         XCTAssertGreaterThan(image["width"] as? Int ?? 0, 0)
-        XCTAssertGreaterThan(image["height"] as? Int ?? 0)
+        XCTAssertGreaterThan(image["height"] as? Int ?? 0, 0)
 
         let native = try XCTUnwrap(object["native"] as? [String: Any])
         XCTAssertEqual(native["unit"] as? String, "point")
