@@ -135,6 +135,69 @@ json_string() {
   printf '"%s"' "${out}"
 }
 
+json_unescape() {
+  # Reverse json_string: decode the escapes in $1 (a JSON string literal
+  # body, without the surrounding quotes) back to the raw value. State
+  # fields must be decoded before they are compared against filesystem
+  # paths or passed to mv/test.
+  local value="$1" out="" char esc hex octal
+  local -i i=0
+  while ((i < ${#value})); do
+    char="${value:i:1}"
+    if [[ "${char}" != "\\" ]]; then
+      out+="${char}"
+      i=$((i + 1))
+      continue
+    fi
+    i=$((i + 1))
+    if ((i >= ${#value})); then
+      fail "truncated escape in JSON string: ${value}"
+    fi
+    esc="${value:i:1}"
+    case "${esc}" in
+      '"') out+='"' ;;
+      '\') out+='\' ;;
+      '/') out+='/' ;;
+      'b') out+=$'\b' ;;
+      't') out+=$'\t' ;;
+      'n') out+=$'\n' ;;
+      'f') out+=$'\f' ;;
+      'r') out+=$'\r' ;;
+      'u')
+        hex="${value:i+1:4}"
+        if [[ ! "${hex}" =~ ^[0-9a-fA-F]{4}$ ]]; then
+          fail "invalid \\u escape in JSON string: \\u${hex}"
+        fi
+        if ((16#${hex} < 128)); then
+          printf -v octal '%03o' "$((16#${hex}))"
+          printf -v char '%b' "\\${octal}"
+          out+="${char}"
+        else
+          # json_string only ever emits \u00XX control escapes; a literal
+          # with non-ASCII \u escapes was written by something else. Hand
+          # the whole literal to a real JSON decoder instead of guessing.
+          local decoded
+          if decoded="$(printf '"%s"' "${value}" | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin))' 2>/dev/null)"; then
+            printf '%s' "${decoded}"
+            return 0
+          fi
+          if decoded="$(printf '"%s"' "${value}" | perl -MJSON::PP -0777 -ne 'print JSON::PP->new->utf8->decode($_)' 2>/dev/null)"; then
+            printf '%s' "${decoded}"
+            return 0
+          fi
+          fail "non-ASCII \\u escape in JSON string and no JSON decoder available: \\u${hex}"
+        fi
+        i=$((i + 4))
+        ;;
+      *)
+        fail "invalid escape in JSON string: \\${esc}"
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s' "${out}"
+}
+
 require_path_arg() {
   local flag="$1"
   local value="${2:-}"
@@ -190,7 +253,7 @@ while [[ $# -gt 0 ]]; do
     --backup)
       require_path_arg "$1" "${2:-}"
       rollback_backup="$2"
-      shift
+      shift 2
       ;;
     --json)
       json=1
@@ -442,11 +505,25 @@ list_contains() {
   return 1
 }
 
+backup_timestamp_key() {
+  # $1 = backup directory name. Prints the 14-digit creation timestamp
+  # embedded in the name, or 00000000000000 when there is none. The
+  # version/build prefix must never participate in ordering: "9-1-..." is
+  # an older release even when its name sorts after "1-1-...".
+  local name="$1"
+  if [[ "${name}" =~ ([0-9]{14}) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    printf '%s' "00000000000000"
+  fi
+}
+
 # Keep only the newest ${keep} recorded entries per backup class. Ordering
 # comes from backups/index.txt (recorded creation order), never from the
 # bundled app's preserved mtime: a restored older build must not sort behind
-# a newer backup. Backups that predate the index are appended in lexical
-# (name-timestamp) order so retention keeps working across the upgrade.
+# a newer backup. Backups that predate the index are appended oldest first,
+# sorted by the timestamp key embedded in their names while keeping the
+# original names intact, so retention keeps working across the upgrade.
 prune_backups() {
   local keep="${1:-2}" name idx
   [[ -f "${backup_index}" ]] || return 0
@@ -464,15 +541,27 @@ prune_backups() {
     fi
   done < <(ls -1 "${backup_dir}" 2>/dev/null | grep -e '\.prev$' -e '\.rolled-back$' || true)
   if [[ ${#legacy[@]} -gt 0 ]]; then
-    local -a sorted_legacy=()
-    while IFS= read -r name; do
-      sorted_legacy+=("${name}")
-    done < <(printf '%s\n' "${legacy[@]}" \
-      | sed 's/^\(.*-\)\([0-9]\{14\}\)\(\.[a-z-]*\)$/\2|\1\3/' \
-      | sort \
-      | sed 's/^[0-9]\{14\}|//')
-    for ((idx = 0; idx < ${#sorted_legacy[@]}; idx++)); do
-      on_disk+=("${sorted_legacy[${idx}]}")
+    # Insertion-sort legacy names by timestamp key (lists here are tiny),
+    # preserving the original names for the directory checks below.
+    local -a keys=()
+    local legacy_name legacy_key i j
+    for ((i = 0; i < ${#legacy[@]}; i++)); do
+      keys+=("$(backup_timestamp_key "${legacy[i]}")")
+    done
+    for ((i = 1; i < ${#legacy[@]}; i++)); do
+      legacy_name="${legacy[i]}"
+      legacy_key="${keys[i]}"
+      j=$((i - 1))
+      while ((j >= 0)) && [[ "${keys[j]}" > "${legacy_key}" ]]; do
+        legacy[j+1]="${legacy[j]}"
+        keys[j+1]="${keys[j]}"
+        j=$((j - 1))
+      done
+      legacy[j+1]="${legacy_name}"
+      keys[j+1]="${legacy_key}"
+    done
+    for ((i = 0; i < ${#legacy[@]}; i++)); do
+      on_disk+=("${legacy[i]}")
     done
   fi
 
@@ -528,6 +617,38 @@ write_install_state() {
     "${backup_field}" \
     "$(json_string "$(date +%Y%m%d%H%M%S)")" > "${state_file}.tmp"
   mv "${state_file}.tmp" "${state_file}"
+}
+
+read_install_state() {
+  # Populate recorded_dest / recorded_had_previous / recorded_backup from
+  # install-state.json, decoding the JSON string fields for real (the file
+  # is written through json_string). A path containing quotes, tabs or other
+  # escaped characters only matches the filesystem after unescaping.
+  recorded_dest=""
+  recorded_had_previous=""
+  recorded_backup=""
+  [[ -f "${state_file}" ]] || return 0
+
+  local raw state_re dest_raw had_prev_raw backup_field_raw backup_str_raw
+  raw="$(cat "${state_file}")"
+  state_re='^\{"dest":"(([^"\\]|\\.)*)","had_previous":(true|false),"backup":(null|"(([^"\\]|\\.)*)"),"ts":"(([^"\\]|\\.)*)"\}$'
+  if [[ ! "${raw}" =~ ${state_re} ]]; then
+    log "warning: ${state_file} is not a valid install state file; ignoring it"
+    return 0
+  fi
+  # Copy BASH_REMATCH out before json_unescape runs its own regexps.
+  dest_raw="${BASH_REMATCH[1]}"
+  had_prev_raw="${BASH_REMATCH[3]}"
+  backup_field_raw="${BASH_REMATCH[4]}"
+  backup_str_raw="${BASH_REMATCH[5]}"
+
+  recorded_dest="$(json_unescape "${dest_raw}")"
+  recorded_had_previous="${had_prev_raw}"
+  if [[ "${backup_field_raw}" == "null" ]]; then
+    recorded_backup=""
+  else
+    recorded_backup="$(json_unescape "${backup_str_raw}")"
+  fi
 }
 
 terminate_agents() {
@@ -701,7 +822,8 @@ else
   #      A missing recorded backup is an error, not a licence to pick some
   #      unrelated historical backup.
   #   3. Installs that predate install-state.json: the newest recorded
-  #      .prev backup.
+  #      .prev backup; without a usable index, the .prev with the newest
+  #      embedded timestamp key (never the lexically greatest name).
   restore_to_absent=0
   restore_source=""
 
@@ -710,25 +832,17 @@ else
   if [[ -n "${rollback_backup}" ]]; then
     require_app_bundle "${rollback_backup}" "backup"
     check_dir_on_dest_volume "$(dirname "${rollback_backup}")" "backup directory"
+    # The current destination is displaced into the default backup
+    # directory below; create and volume-check it on this route too, before
+    # any mutation.
+    mkdir -p "${backup_dir}"
+    check_dir_on_dest_volume "${backup_dir}" "backup directory"
     restore_source="${rollback_backup}"
   else
     mkdir -p "${backup_dir}"
     check_dir_on_dest_volume "${backup_dir}" "backup directory"
 
-    recorded_dest=""
-    recorded_had_previous=""
-    recorded_backup=""
-    if [[ -f "${state_file}" ]]; then
-      # BSD sed has no BRE alternation (\|): capture loosely, validate in bash.
-      recorded_dest="$(sed -n 's/^{"dest":"\(.*\)","had_previous".*/\1/p' "${state_file}")"
-      recorded_had_previous="$(sed -n 's/.*"had_previous":\([a-z]*\),.*/\1/p' "${state_file}")"
-      [[ "${recorded_had_previous}" == "true" || "${recorded_had_previous}" == "false" ]] || recorded_had_previous=""
-      if grep -q '"backup":null' "${state_file}"; then
-        recorded_backup=""
-      else
-        recorded_backup="$(sed -n 's/.*"backup":"\(.*\)","ts".*/\1/p' "${state_file}")"
-      fi
-    fi
+    read_install_state
 
     if [[ "${recorded_dest}" == "${dest}" && -n "${recorded_had_previous}" ]]; then
       if [[ "${recorded_had_previous}" == "false" ]]; then
@@ -751,7 +865,19 @@ else
         done < "${backup_index}"
       fi
       if [[ -z "${latest_name}" ]]; then
-        latest_name="$(ls -1 "${backup_dir}" 2>/dev/null | grep -- '\.prev$' | sort | tail -n 1 || true)"
+        # No index (or nothing valid in it): pick the on-disk .prev whose
+        # embedded timestamp key is newest. Sorting the version-prefixed
+        # name lexically would pick "9-1-<older-ts>" over "1-1-<newer-ts>".
+        latest_key=""
+        while IFS= read -r name; do
+          if [[ -d "${backup_dir}/${name}" && "${name}" == *.prev ]]; then
+            key="$(backup_timestamp_key "${name}")"
+            if [[ -z "${latest_key}" || "${key}" > "${latest_key}" ]]; then
+              latest_key="${key}"
+              latest_name="${name}"
+            fi
+          fi
+        done < <(ls -1 "${backup_dir}" 2>/dev/null || true)
       fi
       [[ -n "${latest_name}" ]] || fail "no .prev backup found in ${backup_dir} and no install state recorded; nothing to roll back to"
       restore_source="${backup_dir}/${latest_name}"
