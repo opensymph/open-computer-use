@@ -28,14 +28,13 @@ private struct AppAgentExecutableIdentity: Sendable {
     }
 
     private static func identity(atPath path: String) -> AppAgentExecutableIdentity? {
-        var status = stat()
-        guard Darwin.stat(path, &status) == 0 else {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let device = (attributes[.deviceIdentifier] as? NSNumber)?.uint64Value,
+              let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
+        else {
             return nil
         }
-        return AppAgentExecutableIdentity(
-            device: UInt64(clamping: status.st_dev),
-            inode: UInt64(clamping: status.st_ino)
-        )
+        return AppAgentExecutableIdentity(device: device, inode: inode)
     }
 }
 
