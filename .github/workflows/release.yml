@@ -116,12 +116,15 @@ jobs:
         run: ./scripts/build-open-computer-use-app.sh --configuration release --arch universal
 
       - name: Notarize macOS app
+        id: macos_app_notarize
         env:
           APPLE_NOTARY_API_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_BASE64 }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
           APPLE_DEVELOPER_TEAM_ID: ${{ secrets.APPLE_DEVELOPER_TEAM_ID }}
         run: |
+          echo "stapled=false" >> "${GITHUB_OUTPUT}"
+
           if [ -z "${APPLE_NOTARY_API_KEY_P8_BASE64}" ] || [ -z "${APPLE_NOTARY_KEY_ID}" ] || [ -z "${APPLE_NOTARY_ISSUER_ID}" ] || [ -z "${APPLE_DEVELOPER_TEAM_ID}" ]; then
             echo "APPLE_NOTARY_* secrets not configured; skipping notarization. Browser-downloaded builds will need manual quarantine removal on launch."
             exit 0
@@ -142,6 +145,25 @@ jobs:
 
           xcrun stapler staple "dist/Open Computer Use.app"
           xcrun stapler validate "dist/Open Computer Use.app"
+          echo "stapled=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Package macOS app distribution
+        run: |
+          ./scripts/package-macos-app.sh \
+            --app "dist/Open Computer Use.app" \
+            --out-dir dist/app \
+            --channel stable \
+            --notarized "${{ steps.macos_app_notarize.outputs.stapled }}"
+
+      - name: Upload macOS app artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: macos-app
+          path: |
+            dist/app/Open-Computer-Use-macOS.zip
+            dist/app/SHA256SUMS.txt
+            dist/app/app-manifest.json
+          if-no-files-found: error
 
       - name: Build npm release artifacts
         env:
@@ -207,20 +229,27 @@ jobs:
           name: npm-release-artifacts
           path: dist/release/out
 
+      - name: Download macOS app artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: macos-app
+          path: dist/app
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           notes_path="docs/releases/github/${RELEASE_TAG}.md"
+          app_assets=(dist/app/Open-Computer-Use-macOS.zip dist/app/SHA256SUMS.txt dist/app/app-manifest.json)
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" dist/release/out/npm/*.tgz dist/release/out/release-manifest.json --clobber
+            gh release upload "${RELEASE_TAG}" dist/release/out/npm/*.tgz dist/release/out/release-manifest.json "${app_assets[@]}" --clobber
             gh release edit "${RELEASE_TAG}" \
               --title "${RELEASE_TAG}" \
               --notes-file "${notes_path}"
           else
-            gh release create "${RELEASE_TAG}" dist/release/out/npm/*.tgz dist/release/out/release-manifest.json \
+            gh release create "${RELEASE_TAG}" dist/release/out/npm/*.tgz dist/release/out/release-manifest.json "${app_assets[@]}" \
               --title "${RELEASE_TAG}" \
               --notes-file "${notes_path}"
           fi
