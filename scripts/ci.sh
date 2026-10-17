@@ -12,6 +12,8 @@ while IFS= read -r file; do
   bash -n "$file"
 done < <(find "${repo_root}/scripts" -type f -name '*.sh' | sort)
 
+"${repo_root}/scripts/test-ocu-app-install.sh"
+
 while IFS= read -r file; do
   node --check "$file"
 done < <(find "${repo_root}/scripts" -type f -name '*.mjs' | sort)

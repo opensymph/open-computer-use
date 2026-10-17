@@ -244,7 +244,8 @@ while [[ $# -gt 0 ]]; do
     --relaunch-after-pid)
       require_path_arg "$1" "${2:-}"
       relaunch_pid="$2"
-      shift
+      [[ "${relaunch_pid}" =~ ^[0-9]+$ ]] || fail "--relaunch-after-pid requires a numeric PID" 2
+      shift 2
       ;;
     --rollback)
       mode="rollback"
@@ -521,7 +522,8 @@ backup_timestamp_key() {
 # Keep only the newest ${keep} recorded entries per backup class. Ordering
 # comes from backups/index.txt (recorded creation order), never from the
 # bundled app's preserved mtime: a restored older build must not sort behind
-# a newer backup. Backups that predate the index are appended oldest first,
+# a newer backup. Backups that predate the index are placed before recorded
+# entries, oldest first,
 # sorted by the timestamp key embedded in their names while keeping the
 # original names intact, so retention keeps working across the upgrade.
 prune_backups() {
@@ -560,9 +562,10 @@ prune_backups() {
       legacy[j+1]="${legacy_name}"
       keys[j+1]="${legacy_key}"
     done
-    for ((i = 0; i < ${#legacy[@]}; i++)); do
-      on_disk+=("${legacy[i]}")
-    done
+    # Every legacy backup predates the index. Retention removes from the
+    # beginning of each class, so legacy entries must precede recorded ones;
+    # appending them would make a newly recorded backup look oldest.
+    on_disk=("${legacy[@]}" "${on_disk[@]}")
   fi
 
   # Everything on disk but not in the index (external tampering aside, this
