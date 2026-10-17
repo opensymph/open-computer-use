@@ -6,7 +6,15 @@
 # copy of this script bundled in Contents/Resources/.
 #
 # Every step before the swap is validated first; any failure leaves the
-# destination untouched.
+# destination untouched. Once the current destination has been moved aside,
+# the EXIT trap restores it if anything still fails (or the script is
+# signalled) before the replacement move commits.
+#
+# Backup bookkeeping: backups get unique names and are recorded, in creation
+# order, in backups/index.txt. Rollback restores the backup recorded by the
+# last install (support dir install-state.json); a fresh install (no
+# previous app) rolls back to the pre-install absent state instead of
+# picking an arbitrary historical backup.
 #
 # Usage:
 #   ocu-app-install.sh --staged-app PATH [options]
@@ -24,7 +32,8 @@
 #   --no-hooks               Skip pre-install / post-install hooks
 #   --relaunch-after-pid PID Wait for PID to exit before swapping, then
 #                            'open -n' the installed app (in-app upgrade)
-#   --rollback               Restore the newest backup instead of installing
+#   --rollback               Restore the newest backup instead of installing;
+#                            a fresh install rolls back to the absent state
 #   --backup PATH            With --rollback: restore this backup explicitly
 #   --json                   Print a machine-readable result on stdout
 #                            (progress messages go to stderr)
@@ -39,6 +48,8 @@ default_dest="/Applications/Open Computer Use.app"
 support_dir="${HOME}/Library/Application Support/OpenComputerUse"
 hooks_dir="${support_dir}/hooks"
 backup_dir="${support_dir}/backups"
+backup_index="${backup_dir}/index.txt"
+state_file="${support_dir}/install-state.json"
 agent_pattern='__open-computer-use-app-agent'
 
 mode=""
@@ -71,7 +82,8 @@ Options:
   --no-hooks               Skip pre-install / post-install hooks
   --relaunch-after-pid PID Wait for PID to exit before swapping, then
                            'open -n' the installed app (in-app upgrade)
-  --rollback               Restore the newest backup instead of installing
+  --rollback               Restore the newest backup instead of installing;
+                           a fresh install rolls back to the absent state
   --backup PATH            With --rollback: restore this backup explicitly
   --json                   Print a machine-readable result on stdout
                            (progress messages go to stderr)
@@ -95,12 +107,32 @@ fail() {
 }
 
 json_string() {
-  local value="$*"
+  local value="$*" char out="" code
+  local -i i
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
-  value="${value//$'\n'/\\n}"
-  value="${value//$'\r'/}"
-  printf '"%s"' "${value}"
+  for ((i = 0; i < ${#value}; i++)); do
+    char="${value:i:1}"
+    case "${char}" in
+      $'\b') out+="\\b" ;;
+      $'\t') out+="\\t" ;;
+      $'\n') out+="\\n" ;;
+      $'\v') out+="\\u000b" ;;
+      $'\f') out+="\\f" ;;
+      $'\r') out+="\\r" ;;
+      *)
+        # Escape the remaining JSON-forbidden control characters
+        # (U+0000-U+001F). UTF-8 lead/continuation bytes are all >= 0x80,
+        # so anything below 0x20 here is exactly such a control character.
+        printf -v code '%d' "'${char}"
+        if ((code < 32)); then
+          printf -v char '\\u%04x' "${code}"
+        fi
+        out+="${char}"
+        ;;
+    esac
+  done
+  printf '"%s"' "${out}"
 }
 
 require_path_arg() {
@@ -149,7 +181,7 @@ while [[ $# -gt 0 ]]; do
     --relaunch-after-pid)
       require_path_arg "$1" "${2:-}"
       relaunch_pid="$2"
-      shift 2
+      shift
       ;;
     --rollback)
       mode="rollback"
@@ -158,7 +190,7 @@ while [[ $# -gt 0 ]]; do
     --backup)
       require_path_arg "$1" "${2:-}"
       rollback_backup="$2"
-      shift 2
+      shift
       ;;
     --json)
       json=1
@@ -319,6 +351,13 @@ validate_staged_app() {
   fi
 }
 
+device_of() {
+  stat -f %d "$1"
+}
+
+# The staged app, the destination parent, and the backup directory must all
+# live on one volume: the design relies on rename(2) being atomic, and an
+# interruption mid copy-and-delete is not recoverable.
 check_same_volume() {
   local staged_parent dest_parent staged_dev dest_dev
   staged_parent="$(cd "$(dirname "$1")" && pwd)"
@@ -326,10 +365,19 @@ check_same_volume() {
   if [[ ! -d "${dest_parent}" ]]; then
     fail "destination parent directory does not exist: ${dest_parent}"
   fi
-  staged_dev="$(stat -f %d "${staged_parent}")"
-  dest_dev="$(stat -f %d "${dest_parent}")"
+  staged_dev="$(device_of "${staged_parent}")"
+  dest_dev="$(device_of "${dest_parent}")"
   if [[ "${staged_dev}" != "${dest_dev}" ]]; then
     fail "staged app and destination live on different volumes; atomic rename impossible"
+  fi
+}
+
+check_dir_on_dest_volume() {
+  local dir="$1" label="$2" dir_dev dest_dev
+  dest_dev="$(device_of "$(dirname "${dest}")")"
+  dir_dev="$(device_of "${dir}")"
+  if [[ "${dir_dev}" != "${dest_dev}" ]]; then
+    fail "${label} and destination live on different volumes; refusing non-atomic ${label} moves"
   fi
 }
 
@@ -366,18 +414,120 @@ run_hook() {
   return 0
 }
 
-# Keep only the newest ${keep} entries matching a suffix in the backup dir.
-prune_backups() {
-  local suffix="$1" keep="${2:-2}" entries=()
-  [[ -d "${backup_dir}" ]] || return 0
-  while IFS= read -r entry; do
-    entries+=("${entry}")
-  done < <(ls -1t "${backup_dir}" 2>/dev/null | grep -- "${suffix}$" || true)
-  local index
-  for ((index = keep; index < ${#entries[@]}; index++)); do
-    log "pruning old backup: ${entries[${index}]}"
-    rm -rf "${backup_dir:?}/${entries[${index}]}" 2>/dev/null || log "warning: failed to prune ${entries[${index}]}"
+# --- Backup bookkeeping (M3: unique names, recorded creation order). ---
+
+unique_child_name() {
+  # $1 = name base without suffix, $2 = suffix ("prev"/"rolled-back").
+  # Second-resolution timestamps can repeat; never reuse a name and never
+  # mv into an existing directory (which would nest instead of rename).
+  local base="$1" suffix="$2"
+  local candidate="${base}.${suffix}"
+  local n=0
+  while [[ -e "${candidate}" ]]; do
+    n=$((n + 1))
+    candidate="${base}.${n}.${suffix}"
   done
+  printf '%s\n' "${candidate}"
+}
+
+record_backup() {
+  printf '%s\n' "$(basename "$1")" >> "${backup_index}"
+}
+
+list_contains() {
+  local needle="$1" item
+  for item in "${@:2}"; do
+    [[ "${item}" == "${needle}" ]] && return 0
+  done
+  return 1
+}
+
+# Keep only the newest ${keep} recorded entries per backup class. Ordering
+# comes from backups/index.txt (recorded creation order), never from the
+# bundled app's preserved mtime: a restored older build must not sort behind
+# a newer backup. Backups that predate the index are appended in lexical
+# (name-timestamp) order so retention keeps working across the upgrade.
+prune_backups() {
+  local keep="${1:-2}" name idx
+  [[ -f "${backup_index}" ]] || return 0
+
+  local -a on_disk=()
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] && on_disk+=("${name}")
+  done < "${backup_index}"
+
+  # Fold legacy on-disk backups into the index once.
+  local -a legacy=()
+  while IFS= read -r name; do
+    if ! list_contains "${name}" ${on_disk[@]+"${on_disk[@]}"}; then
+      legacy+=("${name}")
+    fi
+  done < <(ls -1 "${backup_dir}" 2>/dev/null | grep -e '\.prev$' -e '\.rolled-back$' || true)
+  if [[ ${#legacy[@]} -gt 0 ]]; then
+    local -a sorted_legacy=()
+    while IFS= read -r name; do
+      sorted_legacy+=("${name}")
+    done < <(printf '%s\n' "${legacy[@]}" \
+      | sed 's/^.*-\([0-9]\{14\}\)\.\(prev\|rolled-back\)$/\1 &/' \
+      | sort \
+      | sed 's/^[0-9]\{14\} //')
+    for ((idx = 0; idx < ${#sorted_legacy[@]}; idx++)); do
+      on_disk+=("${sorted_legacy[${idx}]}")
+    done
+  fi
+
+  # Everything on disk but not in the index (external tampering aside, this
+  # cannot happen): drop it from rotation.
+  local -a pruned=()
+  local -a classes=(".prev" ".rolled-back")
+  local suffix entry total
+  for suffix in "${classes[@]}"; do
+    local -a matching=()
+    for ((idx = 0; idx < ${#on_disk[@]}; idx++)); do
+      entry="${on_disk[${idx}]}"
+      if [[ -d "${backup_dir}/${entry}" && "${entry}" == *"${suffix}" ]]; then
+        matching+=("${entry}")
+      fi
+    done
+    total=${#matching[@]}
+    for ((idx = 0; idx < total - keep; idx++)); do
+      pruned+=("${matching[${idx}]}")
+    done
+  done
+
+  local -a kept=()
+  for ((idx = 0; idx < ${#on_disk[@]}; idx++)); do
+    entry="${on_disk[${idx}]}"
+    if [[ -d "${backup_dir}/${entry}" ]] && ! list_contains "${entry}" ${pruned[@]+"${pruned[@]}"}; then
+      kept+=("${entry}")
+    fi
+  done
+
+  for ((idx = 0; idx < ${#pruned[@]}; idx++)); do
+    entry="${pruned[${idx}]}"
+    log "pruning old backup: ${entry}"
+    rm -rf "${backup_dir:?}/${entry}" 2>/dev/null || log "warning: failed to prune ${entry}"
+  done
+
+  if [[ ${#kept[@]} -eq 0 ]]; then
+    : > "${backup_index}"
+  else
+    printf '%s\n' "${kept[@]}" > "${backup_index}"
+  fi
+}
+
+# --- Install state (M2: the pre-install absent state is explicit). ---
+
+write_install_state() {
+  # $1 = had previous app (0/1), $2 = backup path or "".
+  local had_previous="$1" prev_backup="$2" backup_field="null"
+  [[ -n "${prev_backup}" ]] && backup_field="$(json_string "${prev_backup}")"
+  printf '{"dest":%s,"had_previous":%s,"backup":%s,"ts":%s}\n' \
+    "$(json_string "${dest}")" \
+    "$([[ "${had_previous}" -eq 1 ]] && printf 'true' || printf 'false')" \
+    "${backup_field}" \
+    "$(json_string "$(date +%Y%m%d%H%M%S)")" > "${state_file}.tmp"
+  mv "${state_file}.tmp" "${state_file}"
 }
 
 terminate_agents() {
@@ -433,6 +583,37 @@ register_app() {
   fi
 }
 
+# --- Interruption recovery (M4). ---
+#
+# Once the destination has been moved aside, any failure or signal before
+# the replacement move commits must put it back; the brief two-rename gap is
+# by design, an indefinitely missing destination is not.
+displaced_path=""
+swap_in_progress=0
+swap_committed=0
+
+recover_interrupted_swap() {
+  if [[ "${swap_in_progress}" -eq 1 \
+    && "${swap_committed}" -eq 0 \
+    && -n "${displaced_path}" \
+    && ! -e "${dest}" ]]; then
+    log "recovering from interrupted swap: restoring ${displaced_path} -> ${dest}"
+    if mv "${displaced_path}" "${dest}" 2>/dev/null; then
+      log "recovery complete: destination restored"
+    else
+      log "warning: failed to restore ${displaced_path}; destination is left missing"
+    fi
+  fi
+}
+
+handle_signal() {
+  log "interrupted by signal; aborting"
+  exit 130
+}
+
+trap 'recover_interrupted_swap' EXIT
+trap 'handle_signal' INT TERM
+
 hooks_json=""
 terminated_agents=0
 old_json="null"
@@ -452,7 +633,12 @@ if [[ "${mode}" == "install" ]]; then
   validate_staged_app "${staged_app}"
   collect_app_metadata "${staged_app}"
   new_json="$(metadata_json)"
+
+  # Create and volume-check every participating directory before the first
+  # destructive operation.
+  mkdir -p "${backup_dir}"
   check_same_volume "${staged_app}" "${dest}"
+  check_dir_on_dest_volume "${backup_dir}" "backup directory"
   strip_quarantine "${staged_app}"
 
   # --- In-app upgrade: the caller (the running app) exits first. ---
@@ -465,14 +651,18 @@ if [[ "${mode}" == "install" ]]; then
     fail "pre-install hook failed; destination left untouched"
   fi
 
-  mkdir -p "${backup_dir}"
+  had_previous=0
   if [[ -e "${dest}" ]]; then
     require_app_bundle "${dest}" "existing destination"
     collect_app_metadata "${dest}"
     old_metadata_known=1
-    backup_path="${backup_dir}/Open Computer Use.app.${m_version}-${m_build}-$(date +%Y%m%d%H%M%S).prev"
+    had_previous=1
+    displaced_path="$(unique_child_name "${backup_dir}/Open Computer Use.app.${m_version}-${m_build}-$(date +%Y%m%d%H%M%S)" "prev")"
+    backup_path="${displaced_path}"
     log "backing up current app to ${backup_path}"
+    swap_in_progress=1
     mv "${dest}" "${backup_path}"
+    record_backup "${backup_path}"
   else
     log "no existing app at ${dest} (fresh install)"
   fi
@@ -482,12 +672,11 @@ if [[ "${mode}" == "install" ]]; then
   fi
 
   if ! mv "${staged_app}" "${dest}"; then
-    # Best effort: put the backup back so the destination is not left missing.
-    if [[ -n "${backup_path}" ]]; then
-      mv "${backup_path}" "${dest}" || true
-    fi
     fail "failed to move staged app into place"
   fi
+  swap_committed=1
+
+  write_install_state "${had_previous}" "${backup_path}"
 
   register_app "${dest}"
   terminate_agents
@@ -495,7 +684,7 @@ if [[ "${mode}" == "install" ]]; then
   if ! run_hook "post-install"; then
     log "post-install hook failed (recorded, not rolled back)"
   fi
-  prune_backups '\.prev' 2
+  prune_backups 2
 
   if [[ -n "${relaunch_pid}" ]]; then
     log "relaunching ${dest}"
@@ -503,40 +692,111 @@ if [[ "${mode}" == "install" ]]; then
   fi
 else
   # --- Rollback mode. ---
+  #
+  # The restore source is chosen explicitly, never by bundle mtime:
+  #   1. --backup PATH: restore exactly that bundle.
+  #   2. The backup recorded by the last install (install-state.json). A
+  #      fresh install recorded had_previous=false: rollback moves the
+  #      installed app aside and returns to the pre-install absent state.
+  #      A missing recorded backup is an error, not a licence to pick some
+  #      unrelated historical backup.
+  #   3. Installs that predate install-state.json: the newest recorded
+  #      .prev backup.
+  restore_to_absent=0
+  restore_source=""
+
+  [[ -d "$(dirname "${dest}")" ]] || fail "destination parent directory does not exist: $(dirname "${dest}")"
+
   if [[ -n "${rollback_backup}" ]]; then
     require_app_bundle "${rollback_backup}" "backup"
-    backup_path="${rollback_backup}"
+    check_dir_on_dest_volume "$(dirname "${rollback_backup}")" "backup directory"
+    restore_source="${rollback_backup}"
   else
-    [[ -d "${backup_dir}" ]] || fail "no backups directory at ${backup_dir}; nothing to roll back to"
-    latest_backup="$(ls -1t "${backup_dir}" 2>/dev/null | grep -- '\.prev$' | head -n 1 || true)"
-    [[ -n "${latest_backup}" ]] || fail "no .prev backup found in ${backup_dir}"
-    backup_path="${backup_dir}/${latest_backup}"
-    require_app_bundle "${backup_path}" "backup"
+    mkdir -p "${backup_dir}"
+    check_dir_on_dest_volume "${backup_dir}" "backup directory"
+
+    recorded_dest=""
+    recorded_had_previous=""
+    recorded_backup=""
+    if [[ -f "${state_file}" ]]; then
+      recorded_dest="$(sed -n 's/^{"dest":"\(.*\)","had_previous".*/\1/p' "${state_file}")"
+      recorded_had_previous="$(sed -n 's/.*"had_previous":\(true\|false\),.*/\1/p' "${state_file}")"
+      if grep -q '"backup":null' "${state_file}"; then
+        recorded_backup=""
+      else
+        recorded_backup="$(sed -n 's/.*"backup":"\(.*\)","ts".*/\1/p' "${state_file}")"
+      fi
+    fi
+
+    if [[ "${recorded_dest}" == "${dest}" && -n "${recorded_had_previous}" ]]; then
+      if [[ "${recorded_had_previous}" == "false" ]]; then
+        log "last install was a fresh install; rolling back to the pre-install absent state"
+        restore_to_absent=1
+      elif [[ -n "${recorded_backup}" && -d "${recorded_backup}" ]]; then
+        require_app_bundle "${recorded_backup}" "recorded backup"
+        restore_source="${recorded_backup}"
+      else
+        fail "the backup recorded for the last install (${recorded_backup:-none}) no longer exists; refusing to restore an arbitrary historical backup"
+      fi
+    else
+      # Legacy installs predate install-state.json: newest recorded .prev.
+      latest_name=""
+      while IFS= read -r name; do
+        if [[ -d "${backup_dir}/${name}" && "${name}" == *.prev ]]; then
+          latest_name="${name}"
+        fi
+      done < "${backup_index}" 2>/dev/null || true
+      if [[ -z "${latest_name}" ]]; then
+        latest_name="$(ls -1 "${backup_dir}" 2>/dev/null | grep -- '\.prev$' | sort | tail -n 1 || true)"
+      fi
+      [[ -n "${latest_name}" ]] || fail "no .prev backup found in ${backup_dir} and no install state recorded; nothing to roll back to"
+      restore_source="${backup_dir}/${latest_name}"
+      require_app_bundle "${restore_source}" "backup"
+    fi
   fi
 
-  collect_app_metadata "${backup_path}"
-  new_json="$(metadata_json)"
+  if [[ "${restore_to_absent}" -eq 1 ]]; then
+    if [[ -e "${dest}" ]]; then
+      require_app_bundle "${dest}" "current destination"
+      collect_app_metadata "${dest}"
+      old_json="$(metadata_json)"
+      displaced_path="$(unique_child_name "${backup_dir}/Open Computer Use.app.${m_version}-${m_build}-$(date +%Y%m%d%H%M%S)" "rolled-back")"
+      backup_path="${displaced_path}"
+      log "moving installed app aside to ${backup_path}"
+      swap_in_progress=1
+      mv "${dest}" "${backup_path}"
+      record_backup "${backup_path}"
+      swap_committed=1
+    else
+      log "destination already absent; nothing to roll back"
+    fi
+  else
+    collect_app_metadata "${restore_source}"
+    new_json="$(metadata_json)"
+
+    if [[ -e "${dest}" ]]; then
+      require_app_bundle "${dest}" "current destination"
+      collect_app_metadata "${dest}"
+      old_json="$(metadata_json)"
+      displaced_path="$(unique_child_name "${backup_dir}/Open Computer Use.app.${m_version}-${m_build}-$(date +%Y%m%d%H%M%S)" "rolled-back")"
+      backup_path="${displaced_path}"
+      log "moving current app aside to ${backup_path}"
+      swap_in_progress=1
+      mv "${dest}" "${backup_path}"
+      record_backup "${backup_path}"
+    fi
+
+    if ! mv "${restore_source}" "${dest}"; then
+      fail "failed to restore backup"
+    fi
+    swap_committed=1
+  fi
 
   if [[ -e "${dest}" ]]; then
-    require_app_bundle "${dest}" "current destination"
-    collect_app_metadata "${dest}"
-    old_json="$(metadata_json)"
-    mkdir -p "${backup_dir}"
-    rolled_path="${backup_dir}/Open Computer Use.app.${m_version}-${m_build}-$(date +%Y%m%d%H%M%S).rolled-back"
-    log "moving current app aside to ${rolled_path}"
-    mv "${dest}" "${rolled_path}"
+    register_app "${dest}"
   fi
-
-  if ! mv "${backup_path}" "${dest}"; then
-    if [[ -n "${rolled_path:-}" ]]; then
-      mv "${rolled_path}" "${dest}" || true
-    fi
-    fail "failed to restore backup"
-  fi
-
-  register_app "${dest}"
   terminate_agents
-  prune_backups '\.prev' 2
+  prune_backups 2
 fi
 
 if [[ -n "${backup_path}" ]]; then
