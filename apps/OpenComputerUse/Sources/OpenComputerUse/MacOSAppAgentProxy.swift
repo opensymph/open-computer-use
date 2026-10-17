@@ -6,6 +6,38 @@ import OpenComputerUseKit
 private let appAgentCommand = "__open-computer-use-app-agent"
 private let appAgentDisableEnvironmentKey = "OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY"
 private let appAgentProcessStartDate = Date()
+private let appAgentExecutableIdentity = AppAgentExecutableIdentity.current()
+
+// Identity of the file a process image was launched from. The agent captures
+// it once at startup: after an in-place upgrade the path resolves to the
+// replacement file, so a path stat alone can no longer describe what is
+// actually running.
+private struct AppAgentExecutableIdentity: Sendable {
+    let device: UInt64
+    let inode: UInt64
+
+    static func current() -> AppAgentExecutableIdentity? {
+        guard let path = Bundle.main.executableURL?.standardizedFileURL.path else {
+            return nil
+        }
+        return identity(atPath: path)
+    }
+
+    static func identity(at url: URL) -> AppAgentExecutableIdentity? {
+        identity(atPath: url.standardizedFileURL.path)
+    }
+
+    private static func identity(atPath path: String) -> AppAgentExecutableIdentity? {
+        var status = stat()
+        guard Darwin.stat(path, &status) == 0 else {
+            return nil
+        }
+        return AppAgentExecutableIdentity(
+            device: UInt64(clamping: status.st_dev),
+            inode: UInt64(clamping: status.st_ino)
+        )
+    }
+}
 
 enum MacOSAppAgentProxy {
     static func isAgentInvocation(arguments: [String]) -> Bool {
@@ -347,12 +379,18 @@ private final class AppAgentConnection: @unchecked Sendable {
 
             switch kind {
             case "agentInfo":
-                return [
+                var response: [String: Any] = [
                     "bundleIdentifier": Bundle.main.bundleIdentifier ?? "",
                     "bundleURL": Bundle.main.bundleURL.standardizedFileURL.path,
                     "executableURL": Bundle.main.executableURL?.standardizedFileURL.path ?? "",
                     "processStartTime": appAgentProcessStartDate.timeIntervalSince1970,
                 ]
+                if let identity = appAgentExecutableIdentity {
+                    // String form keeps 64-bit values exact for JSON consumers.
+                    response["executableDevice"] = String(identity.device)
+                    response["executableInode"] = String(identity.inode)
+                }
+                return response
             case "terminate":
                 Task { @MainActor in
                     NSApp.terminate(nil)
@@ -586,17 +624,21 @@ private final class AppAgentSocketClient: @unchecked Sendable {
             return false
         }
 
-        guard let processStartTime = response["processStartTime"] as? TimeInterval else {
+        // Compare the agent's launch-time (st_dev, st_ino) against the file
+        // now at the executable path. Zip-based upgrades preserve mtimes, so
+        // the previous "process started after mtime" heuristic kept stale
+        // agents alive; inode identity changes on every real replacement. An
+        // agent that cannot prove its identity is treated as stale and gets
+        // relaunched.
+        guard let device = response["executableDevice"] as? String,
+              let inode = response["executableInode"] as? String,
+              let executableURL = executableURL(for: expectedBundleURL),
+              let diskIdentity = AppAgentExecutableIdentity.identity(at: executableURL)
+        else {
             return false
         }
 
-        guard let executableURL = executableURL(for: expectedBundleURL),
-              let modifiedAt = try? executableURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-        else {
-            return true
-        }
-
-        return processStartTime + 0.5 >= modifiedAt.timeIntervalSince1970
+        return String(diskIdentity.device) == device && String(diskIdentity.inode) == inode
     }
 
     private func executableURL(for appURL: URL) -> URL? {
