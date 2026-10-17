@@ -1,0 +1,59 @@
+name: release-cli
+
+# Builds the bare `OpenComputerUse` CLI binary (what mac-agent's daemon
+# invokes) in release configuration and publishes it as a download artifact.
+# Trigger manually from the Actions tab or via:
+#   gh workflow run release-cli --ref <branch> [-f attach_to_release=<tag>]
+
+"on":
+  workflow_dispatch:
+    inputs:
+      attach_to_release:
+        description: "Attach the built binary to a GitHub Release tag (empty = workflow artifact only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-cli:
+    runs-on: macos-26
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Build release CLI binary
+        run: swift build -c release
+
+      - name: Smoke test (silent permission probe, no UI)
+        run: |
+          OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY=1 ./.build/release/OpenComputerUse doctor --no-ui
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist/cli
+          cp .build/release/OpenComputerUse dist/cli/OpenComputerUse-macos-arm64
+          (cd dist/cli && shasum -a 256 OpenComputerUse-macos-arm64 > SHA256SUMS.txt)
+          cat dist/cli/SHA256SUMS.txt
+
+      - name: Upload CLI artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ocu-cli-macos-arm64
+          path: dist/cli/
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: ${{ inputs.attach_to_release != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ inputs.attach_to_release }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" \
+              --notes "OpenComputerUse CLI binary (macOS arm64, release configuration, ad-hoc signed)."
+          fi
+          gh release upload "$tag" \
+            dist/cli/OpenComputerUse-macos-arm64 dist/cli/SHA256SUMS.txt --clobber
