@@ -1,6 +1,6 @@
 import Foundation
 
-public let openComputerUseVersion = "1.2.0"
+public let openComputerUseVersion = "1.3.0"
 
 public struct OpenComputerUseBuildMetadata: Sendable {
     public let version: String
