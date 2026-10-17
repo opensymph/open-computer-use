@@ -162,8 +162,9 @@ public enum DisplayCapture {
 
         let filter = SCContentFilter(display: selected, excludingWindows: [])
         let contentRect = filter.contentRect
-        let pixelWidth = Int((contentRect.width * filter.pointPixelScale).rounded())
-        let pixelHeight = Int((contentRect.height * filter.pointPixelScale).rounded())
+        let pixelScale = CGFloat(filter.pointPixelScale)
+        let pixelWidth = Int((contentRect.width * pixelScale).rounded())
+        let pixelHeight = Int((contentRect.height * pixelScale).rounded())
 
         guard pixelWidth > 0, pixelHeight > 0 else {
             throw DisplayCaptureError(

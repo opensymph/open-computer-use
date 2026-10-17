@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 func normalizedElementIndexArgument(_ value: Any?) -> String? {
