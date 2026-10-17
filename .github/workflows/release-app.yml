@@ -1,0 +1,60 @@
+name: release-app
+
+# Publishes a prerelease Open Computer Use.app for any ref without going
+# through npm. Replaces the retired release-cli.yml bare-binary flow.
+#
+# The tag (app-build-YYYYMMDD-<sha7>) contains no dots, does not start with
+# "v", and is created with GITHUB_TOKEN, so it never triggers release.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or SHA to build"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-macos-app.yml
+    with:
+      channel: prerelease
+      require_identity: false
+      ref: ${{ inputs.ref }}
+    secrets: inherit
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Download macOS app artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: macos-app
+          path: dist/app
+
+      - name: Create prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          sha7="${sha:0:7}"
+          tag="app-build-$(date -u +%Y%m%d)-${sha7}"
+
+          gh release create "${tag}" \
+            --prerelease \
+            --target "${sha}" \
+            --title "${tag}" \
+            dist/app/Open-Computer-Use-macOS.zip \
+            dist/app/SHA256SUMS.txt \
+            dist/app/app-manifest.json
