@@ -227,6 +227,7 @@ cd "${repo_root}"
 
 package_version="$(read_package_version)"
 bundle_version="${OPEN_COMPUTER_USE_BUNDLE_VERSION:-$(git -C "${repo_root}" rev-list --count HEAD 2>/dev/null || echo 1)}"
+git_commit="${OPEN_COMPUTER_USE_GIT_COMMIT:-$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)}"
 release_app_bundle_name="Open Computer Use.app"
 development_app_bundle_name="Open Computer Use (Dev).app"
 legacy_app_bundle_name="OpenComputerUse.app"
@@ -239,6 +240,11 @@ bundle_display_name="Open Computer Use"
 bundle_identifier="com.ifuryst.opencomputeruse"
 app_variant="release"
 app_bundle_name="${release_app_bundle_name}"
+
+git_commit_entry=""
+if [[ -n "${git_commit}" ]]; then
+  git_commit_entry="$(printf '  <key>OpenComputerUseGitCommit</key>\n  <string>%s</string>\n' "${git_commit}")"
+fi
 
 if [[ "${configuration}" != "release" ]]; then
   bundle_display_name="Open Computer Use (Dev)"
@@ -337,7 +343,7 @@ cat > "${contents_dir}/Info.plist" <<PLIST
   <string>${package_version}</string>
   <key>CFBundleVersion</key>
   <string>${bundle_version}</string>
-  <key>LSMinimumSystemVersion</key>
+${git_commit_entry}  <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>LSUIElement</key>
   <true/>

@@ -213,6 +213,17 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(resolvedOpenComputerUseVersion(bundle: Bundle(for: Self.self)), openComputerUseVersion)
     }
 
+    func testBuildMetadataDescriptionListsBuildAndCommit() {
+        let full = OpenComputerUseBuildMetadata(version: "1.2.0", build: "329", commit: "fb7599c0ffee")
+        XCTAssertEqual(full.descriptionText, "1.2.0 (build 329, commit fb7599c)")
+
+        let buildOnly = OpenComputerUseBuildMetadata(version: "1.2.0", build: "7", commit: nil)
+        XCTAssertEqual(buildOnly.descriptionText, "1.2.0 (build 7)")
+
+        let bare = OpenComputerUseBuildMetadata(version: "1.2.0", build: nil, commit: nil)
+        XCTAssertEqual(bare.descriptionText, "1.2.0")
+    }
+
     func testBoundedScreenshotPNGDataShrinksLargeScreenshots() throws {
         let image = try makeNoisyTestImage(width: 800, height: 600)
         let data = try XCTUnwrap(boundedScreenshotPNGData(

@@ -87,7 +87,7 @@ enum OpenComputerUseMain {
         case let .help(command):
             print(openComputerUseHelpText(command: command))
         case .version:
-            print(resolvedOpenComputerUseVersion())
+            print(resolvedOpenComputerUseBuildMetadata().descriptionText)
         case .launchOnboarding:
             if !PermissionDiagnostics.current().allGranted {
                 PermissionOnboardingApp.launch()

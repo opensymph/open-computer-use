@@ -390,6 +390,14 @@ private final class AppAgentConnection: @unchecked Sendable {
                     response["executableDevice"] = String(identity.device)
                     response["executableInode"] = String(identity.inode)
                 }
+                let metadata = resolvedOpenComputerUseBuildMetadata()
+                response["version"] = metadata.version
+                if let build = metadata.build {
+                    response["build"] = build
+                }
+                if let commit = metadata.commit {
+                    response["commit"] = commit
+                }
                 return response
             case "terminate":
                 Task { @MainActor in
