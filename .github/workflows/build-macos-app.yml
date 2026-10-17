@@ -28,6 +28,13 @@ on:
         required: false
         type: string
         default: ""
+    outputs:
+      sha:
+        description: "Full SHA of the commit that was actually built"
+        value: ${{ jobs.build.outputs.sha }}
+      sha7:
+        description: "Short (7-character) SHA of the commit that was actually built"
+        value: ${{ jobs.build.outputs.sha7 }}
 
 permissions:
   contents: read
@@ -96,9 +103,9 @@ jobs:
 
           resolved_identity="${APPLE_SIGNING_IDENTITY:-}"
           if [ -z "${resolved_identity}" ]; then
-            # Only auto-select a Developer ID Application identity; never the
-            # first arbitrary codesigning identity.
-            resolved_identity="$(security find-identity -v -p codesigning "${keychain_path}" | sed -n 's/^.*"\(Developer ID Application:[^"]*\)"/\1/p' | head -n 1)"
+            # Only auto-select the approved team's Developer ID Application
+            # identity; never the first arbitrary codesigning identity.
+            resolved_identity="$(security find-identity -v -p codesigning "${keychain_path}" | sed -n 's/^.*"\(Developer ID Application:[^"]*\)"/\1/p' | grep -F '(DSA846ZFPA)' | head -n 1)"
           fi
           if [ -z "${resolved_identity}" ]; then
             echo "Imported signing certificate, but no usable codesigning identity was found in ${keychain_path}." >&2
