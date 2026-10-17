@@ -468,9 +468,9 @@ prune_backups() {
     while IFS= read -r name; do
       sorted_legacy+=("${name}")
     done < <(printf '%s\n' "${legacy[@]}" \
-      | sed 's/^.*-\([0-9]\{14\}\)\.\(prev\|rolled-back\)$/\1 &/' \
+      | sed 's/^\(.*-\)\([0-9]\{14\}\)\(\.[a-z-]*\)$/\2|\1\3/' \
       | sort \
-      | sed 's/^[0-9]\{14\} //')
+      | sed 's/^[0-9]\{14\}|//')
     for ((idx = 0; idx < ${#sorted_legacy[@]}; idx++)); do
       on_disk+=("${sorted_legacy[${idx}]}")
     done
@@ -719,8 +719,10 @@ else
     recorded_had_previous=""
     recorded_backup=""
     if [[ -f "${state_file}" ]]; then
+      # BSD sed has no BRE alternation (\|): capture loosely, validate in bash.
       recorded_dest="$(sed -n 's/^{"dest":"\(.*\)","had_previous".*/\1/p' "${state_file}")"
-      recorded_had_previous="$(sed -n 's/.*"had_previous":\(true\|false\),.*/\1/p' "${state_file}")"
+      recorded_had_previous="$(sed -n 's/.*"had_previous":\([a-z]*\),.*/\1/p' "${state_file}")"
+      [[ "${recorded_had_previous}" == "true" || "${recorded_had_previous}" == "false" ]] || recorded_had_previous=""
       if grep -q '"backup":null' "${state_file}"; then
         recorded_backup=""
       else
@@ -741,11 +743,13 @@ else
     else
       # Legacy installs predate install-state.json: newest recorded .prev.
       latest_name=""
-      while IFS= read -r name; do
-        if [[ -d "${backup_dir}/${name}" && "${name}" == *.prev ]]; then
-          latest_name="${name}"
-        fi
-      done < "${backup_index}" 2>/dev/null || true
+      if [[ -f "${backup_index}" ]]; then
+        while IFS= read -r name; do
+          if [[ -d "${backup_dir}/${name}" && "${name}" == *.prev ]]; then
+            latest_name="${name}"
+          fi
+        done < "${backup_index}"
+      fi
       if [[ -z "${latest_name}" ]]; then
         latest_name="$(ls -1 "${backup_dir}" 2>/dev/null | grep -- '\.prev$' | sort | tail -n 1 || true)"
       fi
