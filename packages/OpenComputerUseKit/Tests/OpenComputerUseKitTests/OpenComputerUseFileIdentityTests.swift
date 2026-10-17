@@ -51,9 +51,11 @@ final class OpenComputerUseFileIdentityTests: XCTestCase {
         try fileManager.removeItem(atPath: path)
         try fileManager.moveItem(atPath: staged, toPath: path)
 
-        // The mtime really is unchanged...
+        // The mtime really is unchanged (sub-second precision is not
+        // preserved through setAttributes, hence the 1s tolerance)...
         let newAttributes = try fileManager.attributesOfItem(atPath: path)
-        XCTAssertEqual(newAttributes[.modificationDate] as? Date, originalMtime)
+        let newMtime = try XCTUnwrap(newAttributes[.modificationDate] as? Date)
+        XCTAssertEqual(newMtime.timeIntervalSince1970, originalMtime.timeIntervalSince1970, accuracy: 1.0)
 
         // ...but the running agent's captured identity must differ from the
         // file now at the path, so the client freshness check rejects it.
