@@ -189,11 +189,9 @@ public enum DisplayCapture {
         configuration.showsCursor = false
         configuration.capturesAudio = false
         configuration.scalesToFit = false
-        if #available(macOS 15, *) {
-            // Keep the menu bar in the frame where the OS supports saying so
-            // explicitly; on macOS 14 display captures already include it.
-            configuration.includeMenuBar = true
-        }
+        // Menu bar: macOS SDK headers (SCStream.h, macOS 14.2+) document that
+        // display-excluding content filters default includeMenuBar to YES, so
+        // the menu bar is captured without touching a macOS 15-only property.
 
         let image: CGImage
         do {
