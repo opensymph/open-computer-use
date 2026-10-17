@@ -8,6 +8,12 @@ failed=0
 while IFS= read -r line; do
   file="${line%%:*}"
   content="${line#*:}"
+  # Local reusable workflows (uses: ./path/to/workflow.yml) live in this
+  # repository and cannot be SHA-pinned; only external action references
+  # are checked.
+  if [[ "${content}" =~ uses:[[:space:]]*\./ ]]; then
+    continue
+  fi
   if [[ ! "${content}" =~ @[0-9a-f]{40}([[:space:]]|$) ]]; then
     echo "发现未固定 SHA 的 GitHub Action 引用: ${line}"
     failed=1
