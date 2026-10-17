@@ -292,14 +292,14 @@ validate_staged_app() {
     fail "staged app variant is '${variant}', expected 'release' (refusing to install a dev build)" 2
   fi
 
-  if ! codesign --verify --deep --strict "${app_path}" 2>&1; then
+  if ! codesign --verify --deep --strict "${app_path}"; then
     fail "codesign --verify --deep --strict failed for staged app" 2
   fi
 
   if [[ -n "${expect_team}" ]]; then
     local requirement
     requirement="anchor apple generic and identifier \"${app_bundle_id}\" and certificate leaf[subject.OU] = \"${expect_team}\""
-    if ! codesign --verify -R="${requirement}" "${app_path}" 2>&1; then
+    if ! codesign --verify -R="${requirement}" "${app_path}"; then
       fail "staged app does not satisfy signing requirement for team ${expect_team}" 2
     fi
     if command -v xcrun >/dev/null 2>&1; then
@@ -354,13 +354,9 @@ run_hook() {
   fi
   log "running hook: ${hook}"
   if [[ "${json}" -eq 1 ]]; then
-    if ! "${hook}" >&2; then
-      status=$?
-    fi
+    "${hook}" >&2 || status=$?
   else
-    if ! "${hook}"; then
-      status=$?
-    fi
+    "${hook}" || status=$?
   fi
   if [[ "${status}" -ne 0 ]]; then
     hooks_json="${hooks_json},\"${name}\":\"failed\""
@@ -380,7 +376,7 @@ prune_backups() {
   local index
   for ((index = keep; index < ${#entries[@]}; index++)); do
     log "pruning old backup: ${entries[${index}]}"
-    rm -rf "${backup_dir:?}/${entries[${index}]}"
+    rm -rf "${backup_dir:?}/${entries[${index}]}" 2>/dev/null || log "warning: failed to prune ${entries[${index}]}"
   done
 }
 
@@ -389,7 +385,7 @@ terminate_agents() {
   [[ "${terminate_agent}" -eq 1 ]] || return 0
 
   local pids
-  pids="$(pgrep -f -- "${agent_pattern}" || true)"
+  pids="$(pgrep -f "${agent_pattern}" || true)"
   if [[ -z "${pids}" ]]; then
     log "no running app agent to terminate"
     return 0
@@ -397,19 +393,19 @@ terminate_agents() {
 
   terminated_agents="$(printf '%s\n' "${pids}" | sed '/^$/d' | wc -l | tr -d ' ')"
   log "terminating ${terminated_agents} app agent process(es)"
-  pkill -TERM -f -- "${agent_pattern}" 2>/dev/null || true
+  pkill -TERM -f "${agent_pattern}" 2>/dev/null || true
 
   local waited=0
   while (( waited < 50 )); do
-    pgrep -f -- "${agent_pattern}" >/dev/null 2>&1 || return 0
+    pgrep -f "${agent_pattern}" >/dev/null 2>&1 || return 0
     sleep 0.1
     waited=$((waited + 1))
   done
 
   log "agent still alive after 5s, sending KILL"
-  pkill -KILL -f -- "${agent_pattern}" 2>/dev/null || true
+  pkill -KILL -f "${agent_pattern}" 2>/dev/null || true
   sleep 0.5
-  if pgrep -f -- "${agent_pattern}" >/dev/null 2>&1; then
+  if pgrep -f "${agent_pattern}" >/dev/null 2>&1; then
     log "warning: app agent survived SIGKILL; install itself succeeded but a stale agent may still be running"
   fi
 }
