@@ -23,7 +23,7 @@ jobs:
     uses: ./.github/workflows/build-macos-app.yml
     with:
       channel: prerelease
-      require_identity: false
+      require_identity: true
       ref: ${{ inputs.ref }}
     secrets: inherit
 
@@ -35,7 +35,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
-          ref: ${{ inputs.ref }}
+          # Check out the exact commit the app was built from; the tag and
+          # release target must never re-resolve the input branch.
+          ref: ${{ needs.build.outputs.sha }}
 
       - name: Download macOS app artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -47,9 +49,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sha="$(git rev-parse HEAD)"
-          sha7="${sha:0:7}"
-          tag="app-build-$(date -u +%Y%m%d)-${sha7}"
+          sha="${{ needs.build.outputs.sha }}"
+          tag="app-build-$(date -u +%Y%m%d)-${{ needs.build.outputs.sha7 }}"
 
           gh release create "${tag}" \
             --prerelease \

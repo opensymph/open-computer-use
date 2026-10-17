@@ -5,8 +5,10 @@ name: build-macos-app
 #
 #   Open-Computer-Use-macOS.zip + SHA256SUMS.txt + app-manifest.json
 #
-# as the artifact "macos-app". Called by release-app.yml (prerelease) and by
-# release.yml's package-npm job (stable).
+# as the artifact "macos-app". Called by release.yml (stable) and
+# release-app.yml (prerelease), both with require_identity=true so approved
+# publication never falls back to ad-hoc signing. require_identity=false is
+# reserved for explicitly non-published development builds.
 
 on:
   workflow_call:
@@ -36,6 +38,8 @@ jobs:
 
     outputs:
       stapled: ${{ steps.notarize.outputs.stapled }}
+      sha: ${{ steps.resolved.outputs.sha }}
+      sha7: ${{ steps.resolved.outputs.sha7 }}
 
     steps:
       - name: Check out repository
@@ -44,6 +48,16 @@ jobs:
           # Full history keeps the CFBundleVersion commit counter monotonic.
           fetch-depth: 0
           ref: ${{ inputs.ref }}
+
+      - name: Record resolved commit
+        id: resolved
+        run: |
+          # Resolve the (possibly symbolic) input ref exactly once, here, and
+          # expose the immutable SHA so callers tag and target the same commit
+          # that was actually built.
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "sha7=${sha:0:7}" >> "${GITHUB_OUTPUT}"
 
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
@@ -82,7 +96,9 @@ jobs:
 
           resolved_identity="${APPLE_SIGNING_IDENTITY:-}"
           if [ -z "${resolved_identity}" ]; then
-            resolved_identity="$(security find-identity -v -p codesigning "${keychain_path}" | sed -n 's/.*\"\\(.*\\)\"/\\1/p' | head -n 1)"
+            # Only auto-select a Developer ID Application identity; never the
+            # first arbitrary codesigning identity.
+            resolved_identity="$(security find-identity -v -p codesigning "${keychain_path}" | sed -n 's/^.*"\(Developer ID Application:[^"]*\)"/\1/p' | head -n 1)"
           fi
           if [ -z "${resolved_identity}" ]; then
             echo "Imported signing certificate, but no usable codesigning identity was found in ${keychain_path}." >&2
@@ -99,6 +115,15 @@ jobs:
 
       - name: Build macOS app
         run: ./scripts/build-open-computer-use-app.sh --configuration release --arch universal
+
+      - name: Verify Developer ID signature against approved team
+        if: ${{ inputs.require_identity }}
+        run: |
+          # Approved Route A trust anchor: an Apple-anchored Developer ID
+          # signature on the expected bundle identifier from the approved
+          # team. A populated secret alone is not this check.
+          requirement='anchor apple generic and identifier "com.ifuryst.opencomputeruse" and certificate leaf[subject.OU] = "DSA846ZFPA"'
+          codesign --verify --deep --strict -R="${requirement}" "dist/Open Computer Use.app"
 
       - name: Notarize macOS app
         id: notarize
