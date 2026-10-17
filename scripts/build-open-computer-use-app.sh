@@ -235,6 +235,7 @@ bundle_icon_name="OpenComputerUse.icns"
 icon_master_png="${repo_root}/assets/app-icons/open-computer-use-1024.png"
 iconset_build_script="${repo_root}/scripts/build-apple-iconset.sh"
 cursor_reference_source="${repo_root}/assets/cursor/official-software-cursor-window-252.png"
+app_install_script_source="${repo_root}/scripts/ocu-app-install.sh"
 
 bundle_display_name="Open Computer Use"
 bundle_identifier="com.ifuryst.opencomputeruse"
@@ -303,6 +304,11 @@ if [[ ! -f "${cursor_reference_source}" ]]; then
   exit 1
 fi
 
+if [[ ! -f "${app_install_script_source}" ]]; then
+  echo "Missing app install script: ${app_install_script_source}" >&2
+  exit 1
+fi
+
 icon_work_dir="$(mktemp -d "${TMPDIR:-/tmp}/open-computer-use-icon.XXXXXX")"
 cleanup() {
   if [[ -n "${icon_work_dir:-}" ]]; then
@@ -315,6 +321,10 @@ mkdir -p "${iconset_dir}"
 "${iconset_build_script}" "${icon_master_png}" "${iconset_dir}"
 iconutil -c icns "${iconset_dir}" -o "${resources_dir}/${bundle_icon_name}"
 cp "${cursor_reference_source}" "${resources_dir}/official-software-cursor-window-252.png"
+
+# Bundled before codesign so the install engine ships inside the signature.
+cp "${app_install_script_source}" "${resources_dir}/ocu-app-install.sh"
+chmod 755 "${resources_dir}/ocu-app-install.sh"
 
 cat > "${contents_dir}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
