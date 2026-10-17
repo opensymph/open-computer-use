@@ -11,6 +11,12 @@
 # Asset names are fixed (no version in the file name) so
 # releases/latest/download/Open-Computer-Use-macOS.zip keeps working.
 #
+# The manifest only asserts what was actually verified: signature validity
+# (deep/strict), signing mode derived from the certificate chain (never a
+# bare TeamIdentifier heuristic), a validated notarization staple when
+# --notarized true, and nonempty version/build/commit/cdhash metadata.
+# Any check failure aborts before the three artifacts are written.
+#
 # Usage: package-macos-app.sh --app PATH --out-dir DIR
 #          [--channel stable|prerelease] [--notarized true|false]
 
@@ -22,7 +28,7 @@ channel="stable"
 notarized="false"
 
 usage() {
-  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -92,22 +98,60 @@ arch_cdhash() {
     | head -n 1
 }
 
+fail() {
+  echo "package-macos-app: error: $*" >&2
+  exit 1
+}
+
+# --- Trust and metadata checks (all before any artifact is written). ---
+
+codesign --verify --deep --strict "${app_path}" \
+  || fail "codesign --verify --deep --strict failed for ${app_path}"
+
+signature_details="$(codesign -dvvv "${app_path}" 2>&1)"
+
+if [[ "${notarized}" == "true" ]]; then
+  # The caller's assertion alone never ends up in the manifest: validate the
+  # staple before claiming notarization.
+  if command -v xcrun >/dev/null 2>&1; then
+    xcrun stapler validate "${app_path}" >/dev/null 2>&1 \
+      || fail "notarized=true was requested but stapler validate failed for ${app_path}"
+  else
+    spctl -a -t exec -vv "${app_path}" >/dev/null 2>&1 \
+      || fail "notarized=true was requested but spctl gatekeeper assessment failed for ${app_path} (no xcrun available)"
+  fi
+fi
+
 info="${app_path}/Contents/Info.plist"
+bundle_id="$(plist_value "${info}" CFBundleIdentifier)"
+[[ "${bundle_id}" == "com.ifuryst.opencomputeruse" ]] \
+  || fail "unexpected CFBundleIdentifier '${bundle_id}' (expected com.ifuryst.opencomputeruse)"
+
 version="$(plist_value "${info}" CFBundleShortVersionString)"
 bundle_version="$(plist_value "${info}" CFBundleVersion)"
 commit="$(plist_value "${info}" OpenComputerUseGitCommit)"
-team_id="$(codesign -dvvv "${app_path}" 2>&1 | sed -n 's/^.*TeamIdentifier=\([^ ]*\).*$/\1/p' | head -n 1)"
+[[ -n "${version}" && -n "${bundle_version}" && -n "${commit}" ]] \
+  || fail "missing required Info.plist metadata (version='${version}' bundle_version='${bundle_version}' commit='${commit}')"
+
+team_id="$(printf '%s\n' "${signature_details}" | sed -n 's/^.*TeamIdentifier=\([^ ]*\).*$/\1/p' | head -n 1)"
 if [[ "${team_id}" == "not" ]]; then
   team_id=""
 fi
 
-signing_mode="adhoc"
-if [[ -n "${team_id}" && "${OPEN_COMPUTER_USE_CODESIGN_MODE:-}" != "adhoc" ]]; then
+signing_mode=""
+if printf '%s\n' "${signature_details}" | grep -q '^Signature=adhoc'; then
+  signing_mode="adhoc"
+elif printf '%s\n' "${signature_details}" | grep -q '^Authority=Developer ID Application:'; then
   signing_mode="developer-id"
+elif printf '%s\n' "${signature_details}" | grep -q '^Authority=Apple Development:'; then
+  signing_mode="apple-development"
 fi
+[[ -n "${signing_mode}" ]] || fail "cannot classify the signing certificate chain of ${app_path} (expected ad-hoc, Developer ID Application, or Apple Development)"
 
 cdhash_arm64="$(arch_cdhash "${app_path}" arm64)"
 cdhash_x86_64="$(arch_cdhash "${app_path}" x86_64)"
+[[ "${cdhash_arm64}" =~ ^[0-9a-fA-F]{40}$ ]] || fail "missing or invalid arm64 CDHash '${cdhash_arm64}'"
+[[ "${cdhash_x86_64}" =~ ^[0-9a-fA-F]{40}$ ]] || fail "missing or invalid x86_64 CDHash '${cdhash_x86_64}'"
 
 mkdir -p "${out_dir}"
 zip_name="Open-Computer-Use-macOS.zip"
