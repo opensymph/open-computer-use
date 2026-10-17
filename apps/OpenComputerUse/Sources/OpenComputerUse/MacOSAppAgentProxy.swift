@@ -402,7 +402,17 @@ private final class AppAgentConnection: @unchecked Sendable {
                 }
                 return CLIProxyResponse(stdout: "", stderr: "", exitCode: EXIT_SUCCESS)
 
-            case .doctor:
+            case let .doctor(noUI):
+                if noUI {
+                    // Silent probe: never request access, never show UI, even
+                    // when proxied through the app agent.
+                    return CLIProxyResponse(
+                        stdout: try SilentPermissionReport.current().jsonText() + "\n",
+                        stderr: "",
+                        exitCode: EXIT_SUCCESS
+                    )
+                }
+
                 let permissions = PermissionDiagnostics.current()
                 if !permissions.missingPermissions.isEmpty {
                     Task { @MainActor in

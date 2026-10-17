@@ -48,11 +48,15 @@ enum OpenComputerUseMain {
             } else {
                 try server.run()
             }
-        case .doctor:
-            let permissions = PermissionDiagnostics.current()
-            print(permissions.summary)
-            if !permissions.missingPermissions.isEmpty {
-                PermissionOnboardingApp.launch()
+        case let .doctor(noUI):
+            if noUI {
+                print(try SilentPermissionReport.current().jsonText())
+            } else {
+                let permissions = PermissionDiagnostics.current()
+                print(permissions.summary)
+                if !permissions.missingPermissions.isEmpty {
+                    PermissionOnboardingApp.launch()
+                }
             }
         case .listApps:
             let service = ComputerUseService()

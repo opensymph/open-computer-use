@@ -3,7 +3,7 @@ import Foundation
 public enum OpenComputerUseCLICommand: Equatable {
     case launchOnboarding
     case mcp
-    case doctor
+    case doctor(noUI: Bool)
     case listApps
     case snapshot(app: String, textLimit: SnapshotTextLimit = .defaults, treeLimits: AccessibilityTreeLimits = .defaults)
     case call(OpenComputerUseCallInvocation)
@@ -85,7 +85,7 @@ public func parseOpenComputerUseCLI(arguments: [String]) throws -> OpenComputerU
     case "mcp":
         return try parseSimpleCommand(name: "mcp", arguments: Array(arguments.dropFirst()), result: .mcp)
     case "doctor":
-        return try parseSimpleCommand(name: "doctor", arguments: Array(arguments.dropFirst()), result: .doctor)
+        return try parseDoctor(arguments: Array(arguments.dropFirst()))
     case "list-apps":
         return try parseSimpleCommand(name: "list-apps", arguments: Array(arguments.dropFirst()), result: .listApps)
     case "call":
@@ -156,10 +156,16 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
     case "doctor":
         return """
         Usage:
-          open-computer-use doctor
+          open-computer-use doctor [--no-ui]
 
         Print the current Accessibility and Screen Recording permission state.
         If permissions are missing, this also launches the onboarding app.
+
+        Options:
+          --no-ui    Silent machine-readable probe: print a versioned JSON
+                     permission report, never request access, and never show
+                     onboarding or any other UI. Exit status reflects probe
+                     execution, not the grant booleans.
         """
     case "list-apps":
         return """
@@ -316,6 +322,27 @@ private func parseSimpleCommand(
     }
 
     throw OpenComputerUseCLIError(message: "\(name) does not accept any arguments", helpCommand: name)
+}
+
+private func parseDoctor(arguments: [String]) throws -> OpenComputerUseCLICommand {
+    var noUI = false
+
+    for argument in arguments {
+        switch argument {
+        case "--no-ui":
+            noUI = true
+        case "-h", "--help":
+            return .help(command: "doctor")
+        default:
+            if argument.hasPrefix("-") {
+                throw OpenComputerUseCLIError(message: "Unknown doctor option: \(argument)", helpCommand: "doctor")
+            }
+
+            throw OpenComputerUseCLIError(message: "doctor does not accept positional arguments", helpCommand: "doctor")
+        }
+    }
+
+    return .doctor(noUI: noUI)
 }
 
 private func parseTurnEnded(arguments: [String]) throws -> OpenComputerUseCLICommand {
