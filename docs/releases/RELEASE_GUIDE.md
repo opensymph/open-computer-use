@@ -23,6 +23,7 @@
 - 本地 stage npm 包目录：`node ./scripts/npm/build-packages.mjs`
 - 本地 publish：`node ./scripts/npm/publish-packages.mjs`
 - CI workflow：`.github/workflows/release.yml`
+- 预发布 App（不发 npm）：`.github/workflows/release-app.yml`，workflow_dispatch 输入 `ref`，产出 `app-build-YYYYMMDD-<sha7>` prerelease，挂 macOS App 三件套
 - 用户可见发布记录：`docs/releases/feature-release-notes.md`
 - GitHub Release 正文：`docs/releases/github/vX.Y.Z.md`
 - GitHub Release 页面：workflow 使用审核过的英文 notes 文件创建或更新，不直接引用 PR 标题自动生成正文。
@@ -132,6 +133,7 @@ workflow 会使用 `docs/releases/github/<tag>.md` 创建新 Release；如果 Re
 - release body 必须与仓库里的目标 notes 文件一致。
 - `What's Changed` 必须列出本次用户可感知的 1-3 个英文变化。
 - 保留 `Full Changelog` 链接。
+- macOS App 三个资产都在：`Open-Computer-Use-macOS.zip`、`SHA256SUMS.txt`、`app-manifest.json`（asset 名固定不带版本号）。
 
 ## Release 失败时怎么查
 
