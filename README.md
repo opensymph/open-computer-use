@@ -29,6 +29,8 @@ Nine core tools, identical across all three platforms:
 
 Five additional window-level tools — `list_windows`, `get_window`, `get_window_state`, `launch_app`, `activate_window` — follow the newer window2 API and are available on Windows and macOS (Linux in progress). On macOS the window id is a CGWindowID, and the action tools accept the same optional `window` argument plus `screenshotId` for coordinate actions as on Windows.
 
+macOS adds one display-level tool, `capture_display`: it captures one complete display — desktop, visible windows, menu bar, Dock, visible popovers — as a full-resolution PNG, without activating, unhiding, or focusing anything. With no `display_id` it captures the main display; the result's `available_displays` lists the other selectable IDs. It needs the Screen Recording permission, returns typed JSON errors (`permission_missing`, `display_not_found`, `display_changed`, `capture_timeout`, `capture_failed`, `image_too_large`), and its metadata maps PNG pixels to Quartz global display points — the image pixel size can be larger than the display point size on Retina displays. Unlike `get_app_state`/window screenshots it never restores hidden or minimized windows to obtain pixels.
+
 ## Quick start
 
 ```bash
@@ -135,7 +137,7 @@ OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1 open-computer-use.exe input t
 OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1 open-computer-use input key ctrl+s                # macOS
 ```
 
-These commands are CLI-only and never touch the official 14-tool MCP surface.
+These commands are CLI-only: they stay outside the shared cross-platform MCP tool surface (macOS separately exposes the full-display capture as the `capture_display` MCP tool described above).
 
 ## Documentation
 
