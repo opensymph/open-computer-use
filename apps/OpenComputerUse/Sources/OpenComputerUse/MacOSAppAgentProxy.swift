@@ -5,7 +5,19 @@ import OpenComputerUseKit
 
 private let appAgentCommand = "__open-computer-use-app-agent"
 private let appAgentDisableEnvironmentKey = "OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY"
-private let appAgentProcessStartDate = Date()
+
+// Immutable description of the running agent process image, captured once
+// before the agent listener opens. agentInfo must describe what is actually
+// running: after an in-place upgrade the executable path resolves to the
+// replacement file, so a lookup performed at request time — or a lazy
+// file-scope let, which Swift initializes on first access — can no longer
+// describe this process and would let a stale agent pass the client's
+// freshness check.
+private struct AppAgentLaunchState: Sendable {
+    let processStart: Date
+    let executableIdentity: OpenComputerUseFileIdentity?
+    let buildMetadata: OpenComputerUseBuildMetadata
+}
 
 enum MacOSAppAgentProxy {
     static func isAgentInvocation(arguments: [String]) -> Bool {
@@ -155,18 +167,30 @@ private struct CLIProxyResponse {
 @MainActor
 private final class MacOSAppAgentRuntime: NSObject, NSApplicationDelegate {
     private let socketPath: String
+    private let launchState: AppAgentLaunchState
     private var listener: AppAgentSocketListener?
     private var turnEndedObserver: NSObjectProtocol?
 
-    private init(socketPath: String) {
+    private init(socketPath: String, launchState: AppAgentLaunchState) {
         self.socketPath = socketPath
+        self.launchState = launchState
     }
 
     static func run(socketPath: String) throws {
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
 
-        let delegate = MacOSAppAgentRuntime(socketPath: socketPath)
+        // Eagerly capture the running image's identity and metadata before
+        // the listener opens: whatever later appears at the executable path
+        // must not redefine what this process reports about itself.
+        let executablePath = Bundle.main.executableURL?.standardizedFileURL.path
+        let launchState = AppAgentLaunchState(
+            processStart: Date(),
+            executableIdentity: executablePath.flatMap { OpenComputerUseFileIdentity.identity(atPath: $0) },
+            buildMetadata: resolvedOpenComputerUseBuildMetadata()
+        )
+
+        let delegate = MacOSAppAgentRuntime(socketPath: socketPath, launchState: launchState)
         application.delegate = delegate
         application.run()
     }
@@ -183,7 +207,7 @@ private final class MacOSAppAgentRuntime: NSObject, NSApplicationDelegate {
         }
 
         do {
-            let listener = try AppAgentSocketListener(path: socketPath)
+            let listener = try AppAgentSocketListener(path: socketPath, launchState: launchState)
             self.listener = listener
             listener.start()
         } catch {
@@ -211,11 +235,13 @@ private final class MacOSAppAgentRuntime: NSObject, NSApplicationDelegate {
 
 private final class AppAgentSocketListener: @unchecked Sendable {
     private let path: String
+    private let launchState: AppAgentLaunchState
     private let socketFD: Int32
     private var running = true
 
-    init(path: String) throws {
+    init(path: String, launchState: AppAgentLaunchState) throws {
         self.path = path
+        self.launchState = launchState
         unlink(path)
 
         socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -299,7 +325,7 @@ private final class AppAgentSocketListener: @unchecked Sendable {
 
             applyConnectionSocketOptions(clientFD)
             Thread.detachNewThread {
-                AppAgentConnection(fileDescriptor: clientFD).run()
+                AppAgentConnection(fileDescriptor: clientFD, launchState: self.launchState).run()
             }
         }
     }
@@ -318,10 +344,12 @@ private func applyConnectionSocketOptions(_ fd: Int32) {
 
 private final class AppAgentConnection: @unchecked Sendable {
     private let fileDescriptor: Int32
+    private let launchState: AppAgentLaunchState
     private let server = StdioMCPServer()
 
-    init(fileDescriptor: Int32) {
+    init(fileDescriptor: Int32, launchState: AppAgentLaunchState) {
         self.fileDescriptor = fileDescriptor
+        self.launchState = launchState
     }
 
     func run() {
@@ -347,12 +375,28 @@ private final class AppAgentConnection: @unchecked Sendable {
 
             switch kind {
             case "agentInfo":
-                return [
+                // Everything below was captured when this agent started, not
+                // read from whatever bundle now occupies the path.
+                var response: [String: Any] = [
                     "bundleIdentifier": Bundle.main.bundleIdentifier ?? "",
                     "bundleURL": Bundle.main.bundleURL.standardizedFileURL.path,
                     "executableURL": Bundle.main.executableURL?.standardizedFileURL.path ?? "",
-                    "processStartTime": appAgentProcessStartDate.timeIntervalSince1970,
+                    "processStartTime": launchState.processStart.timeIntervalSince1970,
                 ]
+                if let identity = launchState.executableIdentity {
+                    // String form keeps 64-bit values exact for JSON consumers.
+                    response["executableDevice"] = String(identity.device)
+                    response["executableInode"] = String(identity.inode)
+                }
+                let metadata = launchState.buildMetadata
+                response["version"] = metadata.version
+                if let build = metadata.build {
+                    response["build"] = build
+                }
+                if let commit = metadata.commit {
+                    response["commit"] = commit
+                }
+                return response
             case "terminate":
                 Task { @MainActor in
                     NSApp.terminate(nil)
@@ -402,7 +446,17 @@ private final class AppAgentConnection: @unchecked Sendable {
                 }
                 return CLIProxyResponse(stdout: "", stderr: "", exitCode: EXIT_SUCCESS)
 
-            case .doctor:
+            case let .doctor(noUI):
+                if noUI {
+                    // Silent probe: never request access, never show UI, even
+                    // when proxied through the app agent.
+                    return CLIProxyResponse(
+                        stdout: try SilentPermissionReport.current().jsonText() + "\n",
+                        stderr: "",
+                        exitCode: EXIT_SUCCESS
+                    )
+                }
+
                 let permissions = PermissionDiagnostics.current()
                 if !permissions.missingPermissions.isEmpty {
                     Task { @MainActor in
@@ -576,17 +630,21 @@ private final class AppAgentSocketClient: @unchecked Sendable {
             return false
         }
 
-        guard let processStartTime = response["processStartTime"] as? TimeInterval else {
+        // Compare the agent's launch-time (st_dev, st_ino) against the file
+        // now at the executable path. Zip-based upgrades preserve mtimes, so
+        // the previous "process started after mtime" heuristic kept stale
+        // agents alive; inode identity changes on every real replacement. An
+        // agent that cannot prove its identity is treated as stale and gets
+        // relaunched.
+        guard let device = response["executableDevice"] as? String,
+              let inode = response["executableInode"] as? String,
+              let executableURL = executableURL(for: expectedBundleURL),
+              let diskIdentity = OpenComputerUseFileIdentity.identity(atPath: executableURL.path)
+        else {
             return false
         }
 
-        guard let executableURL = executableURL(for: expectedBundleURL),
-              let modifiedAt = try? executableURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-        else {
-            return true
-        }
-
-        return processStartTime + 0.5 >= modifiedAt.timeIntervalSince1970
+        return String(diskIdentity.device) == device && String(diskIdentity.inode) == inode
     }
 
     private func executableURL(for appURL: URL) -> URL? {

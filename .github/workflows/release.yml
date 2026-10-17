@@ -41,13 +41,30 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: node ./scripts/validate-github-release-notes.mjs --tag "${RELEASE_TAG}"
 
-  package-npm:
+  # Stable macOS app publication is fail-closed (approved Route A): the
+  # reusable workflow refuses ad-hoc signing or a missing notarization
+  # staple when require_identity=true, and verifies the Developer ID
+  # signature against the approved team before packaging. Ad-hoc builds
+  # exist only as local development builds (scripts/build-open-computer-use-app.sh
+  # with OPEN_COMPUTER_USE_CODESIGN_MODE=adhoc), never on this path.
+  build-macos-app:
     needs: release-metadata
+    uses: ./.github/workflows/build-macos-app.yml
+    with:
+      channel: stable
+      require_identity: true
+    secrets: inherit
+
+  package-npm:
+    needs: [release-metadata, build-macos-app]
     runs-on: macos-26
 
     steps:
       - name: Check out repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          # Full history keeps the CFBundleVersion commit counter monotonic.
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
@@ -67,78 +84,16 @@ jobs:
           echo "npm ${npm_version}"
           node -e 'const [major, minor] = process.argv[1].split(".").map(Number); if (major < 11 || (major === 11 && minor < 5)) { console.error(`npm ${process.argv[1]} is too old for trusted publishing; need 11.5.1+`); process.exit(1); }' "${npm_version}"
 
-      - name: Prepare Open Computer Use signing config
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      - name: Download macOS app artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: macos-app
+          path: dist/app
+
+      - name: Unpack macOS app for npm packaging
         run: |
-          echo "OPEN_COMPUTER_USE_CODESIGN_MODE=adhoc" >> "${GITHUB_ENV}"
-
-          if [ -z "${APPLE_CERTIFICATE}" ] || [ -z "${APPLE_CERTIFICATE_PASSWORD}" ]; then
-            echo "No signing certificate configured (APPLE_CERTIFICATE secrets missing); release artifacts will fall back to ad-hoc signing and may create install-specific macOS permission identities."
-            exit 0
-          fi
-
-          keychain_password="open-computer-use-ci-${RUNNER_TEMP}"
-          cert_path="${RUNNER_TEMP}/open-computer-use-signing.p12"
-          keychain_path="${RUNNER_TEMP}/open-computer-use-signing.keychain-db"
-
-          printf '%s' "${APPLE_CERTIFICATE}" | base64 -d > "${cert_path}"
-
-          security create-keychain -p "${keychain_password}" "${keychain_path}"
-          security set-keychain-settings -lut 21600 "${keychain_path}"
-          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
-          security import "${cert_path}" -k "${keychain_path}" -P "${APPLE_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${keychain_password}" "${keychain_path}"
-
-          resolved_identity="${APPLE_SIGNING_IDENTITY:-}"
-          if [ -z "${resolved_identity}" ]; then
-            resolved_identity="$(security find-identity -v -p codesigning "${keychain_path}" | sed -n 's/.*\"\\(.*\\)\"/\\1/p' | head -n 1)"
-          fi
-          if [ -z "${resolved_identity}" ]; then
-            echo "Imported signing certificate, but no usable codesigning identity was found in ${keychain_path}." >&2
-            exit 1
-          fi
-
-          echo "Resolved Open Computer Use signing identity: ${resolved_identity}"
-
-          {
-            echo "OPEN_COMPUTER_USE_CODESIGN_MODE=identity"
-            echo "OPEN_COMPUTER_USE_CODESIGN_IDENTITY=${resolved_identity}"
-            echo "OPEN_COMPUTER_USE_CODESIGN_KEYCHAIN=${keychain_path}"
-          } >> "${GITHUB_ENV}"
-
-      - name: Build macOS app
-        run: ./scripts/build-open-computer-use-app.sh --configuration release --arch universal
-
-      - name: Notarize macOS app
-        env:
-          APPLE_NOTARY_API_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_BASE64 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-          APPLE_DEVELOPER_TEAM_ID: ${{ secrets.APPLE_DEVELOPER_TEAM_ID }}
-        run: |
-          if [ -z "${APPLE_NOTARY_API_KEY_P8_BASE64}" ] || [ -z "${APPLE_NOTARY_KEY_ID}" ] || [ -z "${APPLE_NOTARY_ISSUER_ID}" ] || [ -z "${APPLE_DEVELOPER_TEAM_ID}" ]; then
-            echo "APPLE_NOTARY_* secrets not configured; skipping notarization. Browser-downloaded builds will need manual quarantine removal on launch."
-            exit 0
-          fi
-
-          key_path="${RUNNER_TEMP}/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
-          zip_path="${RUNNER_TEMP}/open-computer-use-app.zip"
-          printf '%s' "${APPLE_NOTARY_API_KEY_P8_BASE64}" | base64 -d > "${key_path}"
-
-          ditto -c -k --keepParent "dist/Open Computer Use.app" "${zip_path}"
-
-          xcrun notarytool submit "${zip_path}" \
-            --key "${key_path}" \
-            --key-id "${APPLE_NOTARY_KEY_ID}" \
-            --issuer "${APPLE_NOTARY_ISSUER_ID}" \
-            --team-id "${APPLE_DEVELOPER_TEAM_ID}" \
-            --wait
-
-          xcrun stapler staple "dist/Open Computer Use.app"
-          xcrun stapler validate "dist/Open Computer Use.app"
+          ditto -x -k "dist/app/Open-Computer-Use-macOS.zip" dist/
+          [[ -d "dist/Open Computer Use.app" ]]
 
       - name: Build npm release artifacts
         env:
@@ -204,20 +159,27 @@ jobs:
           name: npm-release-artifacts
           path: dist/release/out
 
+      - name: Download macOS app artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: macos-app
+          path: dist/app
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           notes_path="docs/releases/github/${RELEASE_TAG}.md"
+          app_assets=(dist/app/Open-Computer-Use-macOS.zip dist/app/SHA256SUMS.txt dist/app/app-manifest.json)
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" dist/release/out/npm/*.tgz dist/release/out/release-manifest.json --clobber
+            gh release upload "${RELEASE_TAG}" dist/release/out/npm/*.tgz dist/release/out/release-manifest.json "${app_assets[@]}" --clobber
             gh release edit "${RELEASE_TAG}" \
               --title "${RELEASE_TAG}" \
               --notes-file "${notes_path}"
           else
-            gh release create "${RELEASE_TAG}" dist/release/out/npm/*.tgz dist/release/out/release-manifest.json \
+            gh release create "${RELEASE_TAG}" dist/release/out/npm/*.tgz dist/release/out/release-manifest.json "${app_assets[@]}" \
               --title "${RELEASE_TAG}" \
               --notes-file "${notes_path}"
           fi

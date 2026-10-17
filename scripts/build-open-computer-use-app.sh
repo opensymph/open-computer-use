@@ -227,6 +227,7 @@ cd "${repo_root}"
 
 package_version="$(read_package_version)"
 bundle_version="${OPEN_COMPUTER_USE_BUNDLE_VERSION:-$(git -C "${repo_root}" rev-list --count HEAD 2>/dev/null || echo 1)}"
+git_commit="${OPEN_COMPUTER_USE_GIT_COMMIT:-$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)}"
 release_app_bundle_name="Open Computer Use.app"
 development_app_bundle_name="Open Computer Use (Dev).app"
 legacy_app_bundle_name="OpenComputerUse.app"
@@ -234,11 +235,17 @@ bundle_icon_name="OpenComputerUse.icns"
 icon_master_png="${repo_root}/assets/app-icons/open-computer-use-1024.png"
 iconset_build_script="${repo_root}/scripts/build-apple-iconset.sh"
 cursor_reference_source="${repo_root}/assets/cursor/official-software-cursor-window-252.png"
+app_install_script_source="${repo_root}/scripts/ocu-app-install.sh"
 
 bundle_display_name="Open Computer Use"
 bundle_identifier="com.ifuryst.opencomputeruse"
 app_variant="release"
 app_bundle_name="${release_app_bundle_name}"
+
+git_commit_entry=""
+if [[ -n "${git_commit}" ]]; then
+  git_commit_entry="$(printf '  <key>OpenComputerUseGitCommit</key>\n  <string>%s</string>\n' "${git_commit}")"
+fi
 
 if [[ "${configuration}" != "release" ]]; then
   bundle_display_name="Open Computer Use (Dev)"
@@ -297,6 +304,11 @@ if [[ ! -f "${cursor_reference_source}" ]]; then
   exit 1
 fi
 
+if [[ ! -f "${app_install_script_source}" ]]; then
+  echo "Missing app install script: ${app_install_script_source}" >&2
+  exit 1
+fi
+
 icon_work_dir="$(mktemp -d "${TMPDIR:-/tmp}/open-computer-use-icon.XXXXXX")"
 cleanup() {
   if [[ -n "${icon_work_dir:-}" ]]; then
@@ -309,6 +321,10 @@ mkdir -p "${iconset_dir}"
 "${iconset_build_script}" "${icon_master_png}" "${iconset_dir}"
 iconutil -c icns "${iconset_dir}" -o "${resources_dir}/${bundle_icon_name}"
 cp "${cursor_reference_source}" "${resources_dir}/official-software-cursor-window-252.png"
+
+# Bundled before codesign so the install engine ships inside the signature.
+cp "${app_install_script_source}" "${resources_dir}/ocu-app-install.sh"
+chmod 755 "${resources_dir}/ocu-app-install.sh"
 
 cat > "${contents_dir}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -337,7 +353,7 @@ cat > "${contents_dir}/Info.plist" <<PLIST
   <string>${package_version}</string>
   <key>CFBundleVersion</key>
   <string>${bundle_version}</string>
-  <key>LSMinimumSystemVersion</key>
+${git_commit_entry}  <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>LSUIElement</key>
   <true/>

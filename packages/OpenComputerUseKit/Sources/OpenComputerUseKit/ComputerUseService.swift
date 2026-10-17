@@ -639,6 +639,123 @@ public final class ComputerUseService {
         return ToolCallResult.text(text)
     }
 
+    // MARK: - display capture
+
+    /// Captures one complete display through the side-effect-free display
+    /// path (no snapshot cache, no window recovery, no activation). Typed
+    /// capture failures become `isError:true` JSON results; only unexpected
+    /// encoding failures are thrown.
+    public func captureDisplay(displayID: CGDirectDisplayID?) throws -> ToolCallResult {
+        do {
+            let captured = try DisplayCapture.capture(displayID: displayID)
+            return try displayCaptureResult(captured)
+        } catch let error as DisplayCaptureError {
+            return displayCaptureErrorResult(error)
+        }
+    }
+
+    private func displayCaptureResult(_ captured: CapturedDisplay) throws -> ToolCallResult {
+        guard DisplayCoordinateMap.make(nativeBounds: captured.bounds, imageSize: captured.imageSize) != nil else {
+            throw ComputerUseError.message("Display capture produced an empty image for display \(captured.displayID).")
+        }
+
+        let metadata = Self.displayCaptureMetadata(captured: captured)
+
+        let data = try JSONSerialization.data(
+            withJSONObject: metadata,
+            options: [.prettyPrinted, .withoutEscapingSlashes]
+        )
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ComputerUseError.message("Failed to encode capture_display result as JSON.")
+        }
+
+        return ToolCallResult(content: [.text(text), .pngImage(captured.pngData)])
+    }
+
+    private func displayCaptureErrorResult(_ error: DisplayCaptureError) -> ToolCallResult {
+        var payload: [String: Any] = [
+            "code": error.code.rawValue,
+            "message": error.message,
+        ]
+        if !error.availableDisplays.isEmpty {
+            payload["available_displays"] = error.availableDisplays.map(Self.displayJSONObject)
+        }
+
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .withoutEscapingSlashes]
+        ), let text = String(data: data, encoding: .utf8) else {
+            return ToolCallResult.text("\(error.code.rawValue): \(error.message)", isError: true)
+        }
+
+        return ToolCallResult.text(text, isError: true)
+    }
+
+    /// Metadata text block for one display capture: identity, timestamp,
+    /// actual PNG pixel size, Quartz global point bounds, an explicit
+    /// pixel-to-point map, the display list, and nonprompting permission
+    /// observations (Accessibility is reported, never required).
+    static func displayCaptureMetadata(
+        captured: CapturedDisplay,
+        accessibilityTrusted: Bool = AXIsProcessTrusted()
+    ) -> [String: Any] {
+        // Callers validate the map first (see displayCaptureResult); this
+        // falls back to an identity map only to keep the metadata total.
+        let coordinateMap = DisplayCoordinateMap.make(
+            nativeBounds: captured.bounds,
+            imageSize: captured.imageSize
+        ) ?? DisplayCoordinateMap(scale: CGSize(width: 1, height: 1), offset: CGPoint(x: captured.bounds.minX, y: captured.bounds.minY))
+
+        return [
+            "kind": "display",
+            "display_id": Int(captured.displayID),
+            "captured_at": iso8601UTCTimestamp(captured.capturedAt),
+            "image": [
+                "width": Int(captured.imageSize.width),
+                "height": Int(captured.imageSize.height),
+            ],
+            "native": [
+                "unit": "point",
+                "space": "quartz_global_top_left",
+                "x": Double(captured.bounds.minX),
+                "y": Double(captured.bounds.minY),
+                "width": Double(captured.bounds.width),
+                "height": Double(captured.bounds.height),
+            ],
+            "map": [
+                "image_to_native": [
+                    Double(coordinateMap.scale.width),
+                    Double(coordinateMap.scale.height),
+                ],
+                "offset": [
+                    Double(coordinateMap.offset.x),
+                    Double(coordinateMap.offset.y),
+                ],
+            ],
+            "available_displays": captured.availableDisplays.map(displayJSONObject),
+            "permissions": [
+                "screen_recording": true,
+                "accessibility": accessibilityTrusted,
+            ],
+        ]
+    }
+
+    static func displayJSONObject(_ display: AvailableDisplay) -> [String: Any] {
+        [
+            "display_id": Int(display.displayID),
+            "x": Int(display.bounds.minX),
+            "y": Int(display.bounds.minY),
+            "width": Int(display.bounds.width),
+            "height": Int(display.bounds.height),
+        ]
+    }
+
+    static func iso8601UTCTimestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.string(from: date)
+    }
+
     public func getWindowState(
         window: WindowRef,
         includeScreenshot: Bool,

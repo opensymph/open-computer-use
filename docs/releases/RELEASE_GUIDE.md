@@ -23,6 +23,7 @@
 - 本地 stage npm 包目录：`node ./scripts/npm/build-packages.mjs`
 - 本地 publish：`node ./scripts/npm/publish-packages.mjs`
 - CI workflow：`.github/workflows/release.yml`
+- 预发布 App（不发 npm）：`.github/workflows/release-app.yml`，workflow_dispatch 输入 `ref`，产出 `app-build-YYYYMMDD-<sha7>` prerelease，挂 macOS App 三件套
 - 用户可见发布记录：`docs/releases/feature-release-notes.md`
 - GitHub Release 正文：`docs/releases/github/vX.Y.Z.md`
 - GitHub Release 页面：workflow 使用审核过的英文 notes 文件创建或更新，不直接引用 PR 标题自动生成正文。
@@ -132,6 +133,7 @@ workflow 会使用 `docs/releases/github/<tag>.md` 创建新 Release；如果 Re
 - release body 必须与仓库里的目标 notes 文件一致。
 - `What's Changed` 必须列出本次用户可感知的 1-3 个英文变化。
 - 保留 `Full Changelog` 链接。
+- macOS App 三个资产都在：`Open-Computer-Use-macOS.zip`、`SHA256SUMS.txt`、`app-manifest.json`（asset 名固定不带版本号）。
 
 ## Release 失败时怎么查
 
@@ -163,7 +165,7 @@ gh run view -R opensymph/open-computer-use <run-id> --log-failed
 
 ## 当前已知边界
 
-- `Open Computer Use` 的 npm release 产物在没有配置组织级 `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` secrets 时，仍会退回 ad-hoc signing；配置后会先导入 `Developer ID Application` 证书，再按该 identity 统一签名；secrets 缺失时不会阻塞整条 release。
+- macOS App 的 stable 发版路径（`release.yml` → `build-macos-app.yml`）是 fail-closed 的路线 A：没有配置 `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` 或 `APPLE_NOTARY_*` secrets 时，App 构建直接失败，不会退回 ad-hoc signing、也不会跳过公证；打包前还会校验 Developer ID 签名来自批准的 team `DSA846ZFPA` 且 identifier 为 `com.ifuryst.opencomputeruse`，并要求 staple 校验通过。`release-app.yml` 预发布 App 同样要求签名+公证。ad-hoc 签名只用于本地开发构建（`OPEN_COMPUTER_USE_CODESIGN_MODE=adhoc`），不属于任何发布路径。npm 制品本身不含签名逻辑，直接内置该 App 构建产物。
 - `open-computer-use` npm root 包会内置六个 `os-arch` native artifacts，包体积会比 macOS-only 版本更大；release 前要确认 staging 包里包含 `dist/Open Computer Use.app`、`dist/linux/` 和 `dist/windows/`，并确认 launcher 没有声明 `optionalDependencies`。
 
 ## 如果 tag 已经打错了

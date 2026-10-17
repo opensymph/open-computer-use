@@ -213,6 +213,17 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(resolvedOpenComputerUseVersion(bundle: Bundle(for: Self.self)), openComputerUseVersion)
     }
 
+    func testBuildMetadataDescriptionListsBuildAndCommit() {
+        let full = OpenComputerUseBuildMetadata(version: "1.2.0", build: "329", commit: "fb7599c0ffee")
+        XCTAssertEqual(full.descriptionText, "1.2.0 (build 329, commit fb7599c)")
+
+        let buildOnly = OpenComputerUseBuildMetadata(version: "1.2.0", build: "7", commit: nil)
+        XCTAssertEqual(buildOnly.descriptionText, "1.2.0 (build 7)")
+
+        let bare = OpenComputerUseBuildMetadata(version: "1.2.0", build: nil, commit: nil)
+        XCTAssertEqual(bare.descriptionText, "1.2.0")
+    }
+
     func testBoundedScreenshotPNGDataShrinksLargeScreenshots() throws {
         let image = try makeNoisyTestImage(width: 800, height: 600)
         let data = try XCTUnwrap(boundedScreenshotPNGData(
@@ -237,7 +248,7 @@ final class OpenComputerUseKitTests: XCTestCase {
     }
 
     func testToolDefinitionCount() {
-        XCTAssertEqual(ToolDefinitions.all.count, 14)
+        XCTAssertEqual(ToolDefinitions.all.count, 15)
     }
 
     func testReadToolArgumentsAcceptsJSONObject() throws {
@@ -331,7 +342,7 @@ final class OpenComputerUseKitTests: XCTestCase {
     func testMacOSAppAgentProxyDecisionRoutesAutomationCommandsThroughAppBundle() {
         for command in [
             OpenComputerUseCLICommand.mcp,
-            .doctor,
+            .doctor(noUI: false),
             .listApps,
             .snapshot(app: "TextEdit"),
             .call(.single(toolName: "list_apps", argumentsJSON: nil, argumentsFile: nil)),
@@ -377,13 +388,19 @@ final class OpenComputerUseKitTests: XCTestCase {
 
     func testMacOSAppAgentProxyDecisionHonorsDisableAndMissingBundle() {
         XCTAssertFalse(shouldUseMacOSAppAgentProxy(
-            command: .doctor,
+            command: .doctor(noUI: false),
             proxyDisabled: true,
             appBundleAvailable: true,
             runningFromLaunchServicesAppInstance: false
         ))
         XCTAssertFalse(shouldUseMacOSAppAgentProxy(
-            command: .doctor,
+            command: .doctor(noUI: true),
+            proxyDisabled: true,
+            appBundleAvailable: true,
+            runningFromLaunchServicesAppInstance: false
+        ))
+        XCTAssertFalse(shouldUseMacOSAppAgentProxy(
+            command: .doctor(noUI: false),
             proxyDisabled: false,
             appBundleAvailable: false,
             runningFromLaunchServicesAppInstance: false
@@ -666,6 +683,200 @@ final class OpenComputerUseKitTests: XCTestCase {
             scrollPages?["description"] as? String,
             "Number of pages to scroll. Fractional values are supported. Defaults to 1"
         )
+    }
+
+    func testCaptureDisplayToolDefinitionExposesMacOSOnlySchema() throws {
+        let tools = Dictionary(uniqueKeysWithValues: ToolDefinitions.all.map { ($0.name, $0) })
+        let tool = try XCTUnwrap(tools["capture_display"])
+
+        XCTAssertEqual(tool.annotations["readOnlyHint"] as? Bool, true)
+        XCTAssertEqual(tool.annotations["destructiveHint"] as? Bool, false)
+        XCTAssertEqual(tool.inputSchema["additionalProperties"] as? Bool, false)
+        XCTAssertNil(tool.inputSchema["required"])
+
+        let properties = try XCTUnwrap(tool.inputSchema["properties"] as? [String: [String: Any]])
+        XCTAssertEqual(properties.count, 1)
+        XCTAssertEqual(properties["display_id"]?["type"] as? String, "integer")
+        XCTAssertEqual(properties["display_id"]?["minimum"] as? Int, 0)
+        XCTAssertTrue(tool.description.contains("macOS-only"))
+        XCTAssertTrue(tool.description.contains("Quartz global display points"))
+    }
+
+    func testCaptureDisplayDispatcherRejectsMalformedArguments() {
+        let dispatcher = ComputerUseToolDispatcher()
+        let invalidArguments: [[String: Any]] = [
+            ["display_id": true],
+            ["display_id": 2.5],
+            ["display_id": -1],
+            ["display_id": 4_294_967_296],
+            ["display_id": "2"],
+            ["display_id": [1, 2]],
+            ["unexpected": 1],
+        ]
+
+        for arguments in invalidArguments {
+            let result = dispatcher.callToolAsResult(name: "capture_display", arguments: arguments)
+            XCTAssertTrue(result.isError, "expected error for \(arguments)")
+            XCTAssertNotNil(result.primaryText)
+        }
+    }
+
+    func testCaptureDisplayDispatcherReturnsJSONMetadataOrTypedError() throws {
+        let dispatcher = ComputerUseToolDispatcher()
+        let result = dispatcher.callToolAsResult(name: "capture_display", arguments: [:])
+        let text = try XCTUnwrap(result.primaryText)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+
+        if result.isError {
+            XCTAssertNotNil(object["code"])
+            XCTAssertNotNil(object["message"])
+            return
+        }
+
+        // Success is only reachable when the test host itself holds the
+        // Screen Recording grant.
+        XCTAssertEqual(object["kind"] as? String, "display")
+        XCTAssertNotNil(object["display_id"])
+        XCTAssertNotNil(object["captured_at"])
+
+        let image = try XCTUnwrap(object["image"] as? [String: Any])
+        XCTAssertGreaterThan(image["width"] as? Int ?? 0, 0)
+        XCTAssertGreaterThan(image["height"] as? Int ?? 0, 0)
+
+        let native = try XCTUnwrap(object["native"] as? [String: Any])
+        XCTAssertEqual(native["unit"] as? String, "point")
+        XCTAssertEqual(native["space"] as? String, "quartz_global_top_left")
+        XCTAssertGreaterThan(native["width"] as? Double ?? 0, 0)
+
+        let map = try XCTUnwrap(object["map"] as? [String: Any])
+        XCTAssertNotNil(map["image_to_native"])
+        XCTAssertNotNil(map["offset"])
+
+        XCTAssertNotNil(object["available_displays"])
+        let permissions = try XCTUnwrap(object["permissions"] as? [String: Any])
+        XCTAssertEqual(permissions["screen_recording"] as? Bool, true)
+        XCTAssertNotNil(permissions["accessibility"])
+
+        XCTAssertEqual(result.content.count, 2)
+    }
+
+    func testCaptureDisplayMetadataMapsPixelsToQuartzGlobalPoints() throws {
+        let captured = CapturedDisplay(
+            pngData: Data(),
+            displayID: 2,
+            bounds: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            imageSize: CGSize(width: 3024, height: 1964),
+            availableDisplays: [
+                AvailableDisplay(displayID: 2, bounds: CGRect(x: 0, y: 0, width: 1512, height: 982)),
+                AvailableDisplay(displayID: 3, bounds: CGRect(x: -1512, y: 0, width: 1512, height: 982)),
+            ],
+            capturedAt: Date(timeIntervalSince1970: 1_761_225_600)
+        )
+
+        let metadata = ComputerUseService.displayCaptureMetadata(captured: captured, accessibilityTrusted: true)
+
+        XCTAssertEqual(metadata["kind"] as? String, "display")
+        XCTAssertEqual(metadata["display_id"] as? Int, 2)
+
+        let formatter = ISO8601DateFormatter()
+        let parsed = formatter.date(from: try XCTUnwrap(metadata["captured_at"] as? String))
+        XCTAssertEqual(parsed, captured.capturedAt)
+
+        let image = try XCTUnwrap(metadata["image"] as? [String: Any])
+        XCTAssertEqual(image["width"] as? Int, 3024)
+        XCTAssertEqual(image["height"] as? Int, 1964)
+
+        let native = try XCTUnwrap(metadata["native"] as? [String: Any])
+        XCTAssertEqual(native["unit"] as? String, "point")
+        XCTAssertEqual(native["space"] as? String, "quartz_global_top_left")
+        XCTAssertEqual(native["x"] as? Double, 0)
+        XCTAssertEqual(native["y"] as? Double, 0)
+        XCTAssertEqual(native["width"] as? Double, 1512)
+        XCTAssertEqual(native["height"] as? Double, 982)
+
+        let map = try XCTUnwrap(metadata["map"] as? [String: Any])
+        let scale = try XCTUnwrap(map["image_to_native"] as? [Double])
+        XCTAssertEqual(scale.count, 2)
+        XCTAssertEqual(scale[0], 0.5, accuracy: 1e-9)
+        XCTAssertEqual(scale[1], 0.5, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(map["offset"] as? [Double]), [0, 0])
+
+        let available = try XCTUnwrap(metadata["available_displays"] as? [[String: Any]])
+        XCTAssertEqual(available.count, 2)
+        XCTAssertEqual(available[0]["display_id"] as? Int, 2)
+        XCTAssertEqual(available[1]["display_id"] as? Int, 3)
+        XCTAssertEqual(available[1]["x"] as? Int, -1512)
+
+        let permissions = try XCTUnwrap(metadata["permissions"] as? [String: Any])
+        XCTAssertEqual(permissions["screen_recording"] as? Bool, true)
+        XCTAssertEqual(permissions["accessibility"] as? Bool, true)
+    }
+
+    func testDisplayCoordinateMapConvertsRetinaPixelsToPoints() throws {
+        let map = try XCTUnwrap(DisplayCoordinateMap.make(
+            nativeBounds: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            imageSize: CGSize(width: 3024, height: 1964)
+        ))
+
+        XCTAssertEqual(map.scale.width, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(map.scale.height, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(map.offset, .zero)
+        // Continuous pixel-edge positions; pixel centers use (u+0.5, v+0.5).
+        XCTAssertEqual(map.nativePoint(forImagePoint: .zero), .zero)
+        XCTAssertEqual(map.nativePoint(forImagePoint: CGPoint(x: 3024, y: 1964)), CGPoint(x: 1512, y: 982))
+        XCTAssertEqual(map.nativePoint(forImagePoint: CGPoint(x: 10.5, y: 20.5)), CGPoint(x: 5.25, y: 10.25))
+    }
+
+    func testDisplayCoordinateMapKeepsNegativeSecondaryDisplayOrigins() throws {
+        let map = try XCTUnwrap(DisplayCoordinateMap.make(
+            nativeBounds: CGRect(x: -1512, y: 0, width: 1512, height: 982),
+            imageSize: CGSize(width: 1512, height: 982)
+        ))
+
+        XCTAssertEqual(map.scale, CGSize(width: 1, height: 1))
+        XCTAssertEqual(map.offset, CGPoint(x: -1512, y: 0))
+        XCTAssertEqual(map.nativePoint(forImagePoint: CGPoint(x: 100, y: 50)), CGPoint(x: -1412, y: 50))
+        XCTAssertEqual(map.nativePoint(forImagePoint: CGPoint(x: 1512, y: 982)), CGPoint(x: 0, y: 982))
+    }
+
+    func testDisplayCoordinateMapRejectsEmptyImages() {
+        XCTAssertNil(DisplayCoordinateMap.make(nativeBounds: .zero, imageSize: .zero))
+        XCTAssertNil(DisplayCoordinateMap.make(
+            nativeBounds: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            imageSize: .zero
+        ))
+    }
+
+    func testCLIRecognizesDoctorNoUIFlag() throws {
+        XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["doctor"]), .doctor(noUI: false))
+        XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["doctor", "--no-ui"]), .doctor(noUI: true))
+        XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["doctor", "-h"]), .help(command: "doctor"))
+        XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["doctor", "--help"]), .help(command: "doctor"))
+    }
+
+    func testCLIRejectsUnknownDoctorOptions() {
+        XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["doctor", "--verbose"])) { error in
+            XCTAssertEqual((error as? OpenComputerUseCLIError)?.helpCommand, "doctor")
+        }
+        XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["doctor", "positional"]))
+    }
+
+    func testSilentPermissionReportUsesVersionedRuntimeSchema() throws {
+        let report = SilentPermissionReport(accessibilityTrusted: false, screenCaptureGranted: true)
+
+        let object = report.jsonObject
+        XCTAssertEqual(object["kind"] as? String, "doctor")
+        XCTAssertEqual(object["schema_version"] as? Int, SilentPermissionReport.schemaVersion)
+        XCTAssertEqual(object["ui"] as? Bool, false)
+
+        let permissions = try XCTUnwrap(object["permissions"] as? [String: Any])
+        XCTAssertEqual(permissions["accessibility"] as? Bool, false)
+        XCTAssertEqual(permissions["screen_recording"] as? Bool, true)
+
+        let text = try report.jsonText()
+        let reparsed = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        XCTAssertEqual(reparsed["kind"] as? String, "doctor")
+        XCTAssertEqual(reparsed["schema_version"] as? Int, SilentPermissionReport.schemaVersion)
     }
 
     func testDispatcherMissingArgumentsMatchOfficialToolText() {

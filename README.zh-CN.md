@@ -29,6 +29,8 @@
 
 另有五个窗口级工具——`list_windows`、`get_window`、`get_window_state`、`launch_app`、`activate_window`——遵循新的 window2 API，Windows 和 macOS 均可用（Linux 进行中）；macOS 上窗口 id 即 CGWindowID，动作工具同样接受可选 `window` 参数与 `screenshotId` 坐标参数。
 
+macOS 另有一个显示器级工具 `capture_display`：一次性截取一整块显示器（桌面组合、可见窗口、菜单栏、Dock、可见 popover）的全分辨率 PNG，全程不激活、不取消隐藏、不聚焦任何应用。不传 `display_id` 时截取主显示器，结果的 `available_displays` 会列出其余可选 ID。它需要 Screen Recording 授权，返回带 `code`/`message` 的 JSON 错误（`permission_missing`、`display_not_found`、`display_changed`、`capture_timeout`、`capture_failed`、`image_too_large`），metadata 会把 PNG 像素映射到 Quartz 全局显示点坐标（Retina 下图像像素可以大于显示器点数）。与 `get_app_state`/窗口截图不同，它绝不会为了取像素而恢复隐藏或最小化的窗口。
+
 ## 快速开始
 
 ```bash
@@ -103,7 +105,7 @@ npx skills add opensymph/open-computer-use -g -a claude-code --skill open-comput
 
 ### 显示级桌面命令（三平台）
 
-三个运行时提供同一套整屏 CLI 命令（命令名、参数、JSON 输出对齐，详见英文 README 的 "Display-level desktop commands"）：`screenshot` 整屏 PNG、`cursor-position` 指针坐标 JSON、`input` 全局合成输入（每平台独立环境变量门控，默认关闭：Linux `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`、Windows `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1`、macOS `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1`）、`record start/stop/discard/polish/status` 录屏（默认 `--quality demo`；`--polish` / `record polish` 默认 clean-room 帧合成器对齐 polished-renderer：空闲重映射→缩放→镜头畸变→运动模糊→光标 depress/拖影→按键字幕；`--engine ffmpeg` 为旧滤镜路径，可选 `--ripples`；`input` 写入 `<stem>.events.json`）。这些是 CLI-only，不进入官方对齐的 14 个 MCP tool 面。
+三个运行时提供同一套整屏 CLI 命令（命令名、参数、JSON 输出对齐，详见英文 README 的 "Display-level desktop commands"）：`screenshot` 整屏 PNG、`cursor-position` 指针坐标 JSON、`input` 全局合成输入（每平台独立环境变量门控，默认关闭：Linux `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1`、Windows `OPEN_COMPUTER_USE_WINDOWS_ALLOW_FOREGROUND_INPUT=1`、macOS `OPEN_COMPUTER_USE_MACOS_ALLOW_FOREGROUND_INPUT=1`）、`record start/stop/discard/polish/status` 录屏（默认 `--quality demo`；`--polish` / `record polish` 默认 clean-room 帧合成器对齐 polished-renderer：空闲重映射→缩放→镜头畸变→运动模糊→光标 depress/拖影→按键字幕；`--engine ffmpeg` 为旧滤镜路径，可选 `--ripples`；`input` 写入 `<stem>.events.json`）。这些是 CLI-only，不进入跨平台对齐的 MCP tool 面（macOS 的整屏截取能力另以 macOS-only 的 `capture_display` tool 暴露，见上文工具面）。
 
 ## 文档
 

@@ -222,6 +222,17 @@ public enum ToolDefinitions {
                 required: ["window"]
             )
         ),
+        ToolDefinition(
+            name: "capture_display",
+            description: "Capture one complete display — desktop, visible windows, menu bar, Dock, and visible popovers — as a full-resolution PNG screenshot, without activating, unhiding, focusing, or otherwise disturbing any app. With no display_id it captures the main display; pass a display_id from a previous result's available_displays to choose another. Requires the Screen Recording permission. The returned image width/height are PNG pixels and can be larger than the display's point size on Retina displays; the metadata maps PNG pixels to Quartz global display points. This tool never returns hidden or minimized window content. This tool is macOS-only and is part of plugin `Computer Use`.",
+            annotations: readOnlyAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "display_id": nonNegativeIntegerProperty(description: "Optional display ID from a previous capture_display result's available_displays. Defaults to the main display. Display IDs depend on the current session and topology."),
+                ],
+                required: []
+            )
+        ),
     ]
 }
 
@@ -299,6 +310,14 @@ private func booleanProperty(description: String) -> [String: Any] {
 private func integerProperty(description: String) -> [String: Any] {
     [
         "type": "integer",
+        "description": description,
+    ]
+}
+
+private func nonNegativeIntegerProperty(description: String) -> [String: Any] {
+    [
+        "type": "integer",
+        "minimum": 0,
         "description": description,
     ]
 }

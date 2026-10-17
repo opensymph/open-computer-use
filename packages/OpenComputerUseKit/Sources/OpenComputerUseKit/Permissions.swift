@@ -107,6 +107,54 @@ public struct PermissionDiagnostics: Sendable {
     }
 }
 
+/// Non-prompting machine-readable permission probe used by
+/// `open-computer-use doctor --no-ui`. Reports only direct runtime
+/// observations for the current process (`AXIsProcessTrusted()` and
+/// `CGPreflightScreenCaptureAccess()`) — no persisted-TCC overrides, no
+/// access requests, no UI of any kind.
+public struct SilentPermissionReport: Sendable {
+    public static let schemaVersion = 1
+
+    public let accessibilityTrusted: Bool
+    public let screenCaptureGranted: Bool
+
+    public init(accessibilityTrusted: Bool, screenCaptureGranted: Bool) {
+        self.accessibilityTrusted = accessibilityTrusted
+        self.screenCaptureGranted = screenCaptureGranted
+    }
+
+    public static func current() -> SilentPermissionReport {
+        SilentPermissionReport(
+            accessibilityTrusted: AXIsProcessTrusted(),
+            screenCaptureGranted: CGPreflightScreenCaptureAccess()
+        )
+    }
+
+    public var jsonObject: [String: Any] {
+        [
+            "kind": "doctor",
+            "schema_version": Self.schemaVersion,
+            "ui": false,
+            "permissions": [
+                "accessibility": accessibilityTrusted,
+                "screen_recording": screenCaptureGranted,
+            ],
+        ]
+    }
+
+    public func jsonText() throws -> String {
+        let data = try JSONSerialization.data(
+            withJSONObject: jsonObject,
+            options: [.prettyPrinted, .withoutEscapingSlashes]
+        )
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ComputerUseError.message("Failed to encode doctor report as JSON.")
+        }
+
+        return text
+    }
+}
+
 public enum PermissionSupport {
     public static let bundleDisplayName = "Open Computer Use"
     public static let bundleIdentifier = "com.ifuryst.opencomputeruse"
