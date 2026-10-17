@@ -5,7 +5,7 @@ name: release-cli
 # Trigger manually from the Actions tab or via:
 #   gh workflow run release-cli --ref <branch> [-f attach_to_release=<tag>]
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       attach_to_release:
